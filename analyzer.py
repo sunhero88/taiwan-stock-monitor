@@ -7,37 +7,58 @@ from pathlib import Path
 from tqdm import tqdm
 import matplotlib
 
+# 強制使用 Agg 後端以在雲端伺服器運行
 matplotlib.use('Agg')
 
-plt.rcParams['font.sans-serif'] = ['Noto Sans CJK TC', 'Noto Sans CJK JP', 'Microsoft JhengHei', 'sans-serif']
+# 設定字型：解決 GitHub Actions 中文亂碼問題
+plt.rcParams['font.sans-serif'] = [
+    'Noto Sans CJK TC', 
+    'Noto Sans CJK JP', 
+    'Microsoft JhengHei', 
+    'Arial Unicode MS', 
+    'sans-serif'
+]
 plt.rcParams['axes.unicode_minus'] = False
 
+# 分箱參數設定：固定為 -100 到 100
 BIN_SIZE = 10.0
 X_MIN, X_MAX = -100, 100
-BINS = np.arange(X_MIN, X_MAX + 11, BIN_SIZE)
+BINS = np.arange(X_MIN, X_MAX + 1, BIN_SIZE)
 
 def build_company_list(arr_pct, codes, names, bins):
+    """產出 HTML 格式的分箱清單，超過 100% 統一歸類"""
     lines = [f"{'報酬區間':<12} | {'家數(比例)':<14} | 公司清單", "-"*80]
     total = len(arr_pct)
-    clipped_arr = np.clip(arr_pct, -100, 100)
-    counts, edges = np.histogram(clipped_arr, bins=bins)
-
-    for i in range(len(edges)-1):
-        lo, up = edges[i], edges[i+1]
-        lab = f"{int(lo)}%~{int(up)}%"
+    
+    # 處理 -100% 到 100% 的區間
+    for lo in range(int(X_MIN), int(X_MAX), int(BIN_SIZE)):
+        up = lo + 10
+        lab = f"{lo}%~{up}%"
         mask = (arr_pct >= lo) & (arr_pct < up)
-        if i == len(edges) - 2: mask = (arr_pct >= lo) & (arr_pct <= up)
+        
         cnt = int(mask.sum())
         if cnt == 0: continue
+        
         picked_indices = np.where(mask)[0]
         links = [f'<a href="https://www.wantgoo.com/stock/{codes[idx]}/technical-chart" style="text-decoration:none; color:#0366d6;">{codes[idx]}({names[idx]})</a>' for idx in picked_indices]
         lines.append(f"{lab:<12} | {cnt:>4} ({(cnt/total*100):5.1f}%) | {', '.join(links)}")
+
+    # ✅ 特別處理：所有大於等於 100% 的標的統一歸類
+    extreme_mask = (arr_pct >= 100)
+    e_cnt = int(extreme_mask.sum())
+    if e_cnt > 0:
+        e_picked = np.where(extreme_mask)[0]
+        e_links = [f'<a href="https://www.wantgoo.com/stock/{codes[idx]}/technical-chart" style="text-decoration:none; color:#0366d6;">{codes[idx]}({names[idx]})</a>' for e_picked_idx in e_picked]
+        lines.append(f"{' > 100%':<12} | {e_cnt:>4} ({(e_cnt/total*100):5.1f}%) | {', '.join(e_links)}")
+
     return "\n".join(lines)
 
 def run_global_analysis(market_id="tw-share"):
+    print(f"📊 正在啟動 {market_id} 深度矩陣分析...")
     data_path = Path("./data") / market_id / "dayK"
     image_out_dir = Path("./output/images") / market_id
     image_out_dir.mkdir(parents=True, exist_ok=True)
+    
     all_files = list(data_path.glob("*.csv"))
     if not all_files: return [], pd.DataFrame(), {}
 
@@ -63,7 +84,6 @@ def run_global_analysis(market_id="tw-share"):
 
     df_res = pd.DataFrame(results)
     images = []
-    # 這裡調整顏色與標籤
     color_map = {'High': '#28a745', 'Close': '#007bff', 'Low': '#dc3545'}
     
     for p_n, p_z in [('Week', '週'), ('Month', '月'), ('Year', '年')]:
@@ -71,11 +91,13 @@ def run_global_analysis(market_id="tw-share"):
             col = f"{p_n}_{t_n}"
             if col not in df_res.columns: continue
             data = df_res[col].dropna()
+            
             fig, ax = plt.subplots(figsize=(11, 7))
+            # 繪圖時也將數據限制在 -100 到 100 之間，確保最後一根柱子代表「100% 以上」
             counts, edges = np.histogram(np.clip(data.values, X_MIN, X_MAX), bins=BINS)
             bars = ax.bar(edges[:-1], counts, width=9, align='edge', color=color_map[t_n], alpha=0.7, edgecolor='white')
             
-            # ✅ 修復：加上數據標籤
+            # 加上數據標籤
             max_h = counts.max() if len(counts) > 0 else 1
             for bar in bars:
                 h = bar.get_height()
@@ -83,8 +105,8 @@ def run_global_analysis(market_id="tw-share"):
                     ax.text(bar.get_x() + 4.5, h + (max_h * 0.01), f'{int(h)}\n({h/len(data)*100:.1f}%)', 
                             ha='center', va='bottom', fontsize=9, fontweight='bold')
 
-            ax.set_ylim(0, max_h * 1.3) # 預留頂部空間
-            ax.set_title(f"{p_z}K {t_z} 報酬分布", fontsize=18, fontweight='bold')
+            ax.set_ylim(0, max_h * 1.3) 
+            ax.set_title(f"{p_z}K {t_z} 報酬分布 (家數:{len(data)})", fontsize=18, fontweight='bold')
             ax.set_xticks(BINS)
             ax.set_xticklabels([f"{int(x)}%" for x in BINS], rotation=45)
             ax.grid(axis='y', linestyle='--', alpha=0.3)
