@@ -2,18 +2,15 @@ name: Daily Stock Analysis Report
 
 on:
   schedule:
-    # 台北時間週一至週五 17:15 執行 (UTC 09:15)
-    # 確保台股收盤數據已在 Yahoo Finance 更新完畢
+    # 台北時間週一至週五 13:30 執行 (UTC 05:30)
     - cron: '30 5 * * 1-5'
   workflow_dispatch: 
-    # 允許手動從 GitHub 網頁介面觸發
 
 jobs:
   run-analysis:
     runs-on: ubuntu-latest
-
     steps:
-      - name: 📥 檢出程式碼 (Checkout)
+      - name: 📥 檢出程式碼
         uses: actions/checkout@v3
 
       - name: 🐍 設定 Python 環境
@@ -23,16 +20,14 @@ jobs:
 
       - name: 🔤 安裝中文字體與環境相依套件
         run: |
-          # 更新 Ubuntu 軟體庫並安裝 Google Noto 中文字體
+          # 安裝開源中文字體以支援繪圖顯示
           sudo apt-get update
           sudo apt-get install -y fonts-noto-cjk
           
-          # 更新 pip 並安裝 requirements.txt 內的套件
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
       - name: 📊 執行監控分析程式
         env:
-          # 讀取您在 Settings > Secrets 中設定的 RESEND_API_KEY
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
         run: python main.py
