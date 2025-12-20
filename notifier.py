@@ -52,7 +52,7 @@ def send_stock_report(market_name, img_data, report_df, text_reports):
     try:
         resend.Emails.send({
             "from": "StockMonitor <onboarding@resend.dev>",
-            "to": ["您的電子信箱@gmail.com"], # 這裡記得改！
+            "to": ["grissomlin643@gmail.com"], # 這裡記得改！
             "subject": f"🚀 台股全方位監控報告 - {now_str}",
             "html": html_content,
             "attachments": attachments
@@ -60,3 +60,4 @@ def send_stock_report(market_name, img_data, report_df, text_reports):
         print(f"✅ 郵件發送成功！({market_name})")
     except Exception as e:
         print(f"❌ 郵件發送失敗: {e}")
+
