@@ -7,63 +7,38 @@ on:
   workflow_dispatch: 
 
 jobs:
-  # --- 任務 A：美國市場 ---
-  us-market:
-    name: 🇺🇸 US Market Analysis
+  global-market-analysis:
+    name: ${{ matrix.market.emoji }} ${{ matrix.market.name }} Analysis
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-      - name: Environment Setup
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y fonts-noto-cjk
-          python -m pip install --upgrade pip
-          pip install pandas yfinance requests lxml tqdm resend matplotlib numpy
-      - name: Run US Analysis
-        env:
-          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
-        run: python main.py --market us-share
+    strategy:
+      # 設為 false，即使其中一個市場失敗，其他市場也會繼續執行
+      fail-fast: false
+      matrix:
+        market:
+          - { id: "tw-share", name: "Taiwan", emoji: "🇹🇼" }
+          - { id: "us-share", name: "US",     emoji: "🇺🇸" }
+          - { id: "hk-share", name: "HK",     emoji: "🇭🇰" }
+          - { id: "cn-share", name: "China",  emoji: "🇨🇳" }
+          - { id: "jp-share", name: "Japan",  emoji: "🇯🇵" }
+          - { id: "kr-share", name: "Korea",  emoji: "🇰🇷" }
 
-  # --- 任務 B：台灣市場 ---
-  taiwan-market:
-    name: 🇹🇼 Taiwan Market Analysis
-    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-      - name: Environment Setup
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y fonts-noto-cjk
-          python -m pip install --upgrade pip
-          pip install pandas yfinance requests lxml tqdm resend matplotlib numpy
-      - name: Run TW Analysis
-        env:
-          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
-        run: python main.py --market tw-share
 
-  # --- 任務 C：香港市場 (新增) ---
-  hk-market:
-    name: 🇭🇰 HK Market Analysis
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
+          cache: 'pip' # 開啟快取功能以加快重複執行的速度
+
       - name: Environment Setup
         run: |
           sudo apt-get update
           sudo apt-get install -y fonts-noto-cjk
           python -m pip install --upgrade pip
-          # 💡 特別注意：港股下載器需要 xlrd 來解析 .xls 檔案
-          pip install pandas yfinance requests lxml tqdm resend matplotlib numpy xlrd
-      - name: Run HK Analysis
+          # 一次安裝所有市場下載器與分析引擎所需的完整套件包
+          pip install pandas yfinance requests lxml tqdm resend matplotlib numpy xlrd pykrx tokyo-stock-exchange akshare
+
+      - name: Run Market Analysis
         env:
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
-        run: python main.py --market hk-share
+        run: python main.py --market ${{ matrix.market.id }}
