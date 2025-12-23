@@ -1,171 +1,117 @@
 # -*- coding: utf-8 -*-
 import os
+import requests
 import resend
-from datetime import datetime
+from datetime import datetime, timedelta
 
-def send_stock_report(market_name, img_data, report_df, text_reports, stats=None):
-    """
-    發送包含分布圖、智慧技術線圖連結及【數據下載統計】的專業電子郵件
-    支援市場：台灣 (TW), 美國 (US), 香港 (HK), 中國 (CN), 日本 (JP), 韓國 (KR)
-    """
-    # 1. 檢查 API Key
-    api_key = os.environ.get("RESEND_API_KEY")
-    if not api_key:
-        print("❌ 錯誤：找不到環境變數 RESEND_API_KEY，郵件發送中斷。")
-        return
-    resend.api_key = api_key
-
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-    
-    # 2. 判斷市場屬性（智慧識別六大市場）
-    market_upper = market_name.upper()
-    is_us = any(x in market_upper for x in ["美國", "US"])
-    is_hk = any(x in market_upper for x in ["香港", "HK"])
-    is_cn = any(x in market_upper for x in ["中國", "CN"])
-    is_tw = any(x in market_upper for x in ["台灣", "TW"])
-    is_jp = any(x in market_upper for x in ["日本", "JP"])
-    is_kr = any(x in market_upper for x in ["韓國", "KR"])
-
-    # 3. 建立數據健康度儀表板 HTML
-    health_html = ""
-    if stats:
-        total = stats.get("total", 0)
-        success = stats.get("success", 0)
-        # 防止除以零
-        rate = (success / total * 100) if total > 0 else 0
+class StockNotifier:
+    def __init__(self):
+        """
+        初始化通知模組
+        自動從 GitHub Secrets 或環境變數讀取金鑰
+        """
+        self.tg_token = os.getenv("TELEGRAM_BOT_TOKEN")
+        self.tg_chat_id = os.getenv("TELEGRAM_CHAT_ID")
+        self.resend_api_key = os.getenv("RESEND_API_KEY")
         
-        # 顏色邏輯：成功率低於 85% 顯示橘色，低於 70% 顯示紅色
-        status_color = "#27ae60" # 綠色
-        status_text = "✅ 數據完整度優良"
-        if rate < 85:
-            status_color = "#f39c12" # 橘色
-            status_text = "⚠️ 部分數據缺失"
-        if rate < 70:
-            status_color = "#e74c3c" # 紅色
-            status_text = "🚨 數據嚴重缺失 (建議重跑)"
+        if self.resend_api_key:
+            resend.api_key = self.resend_api_key
 
-        health_html = f"""
-        <div style="background-color: #f8f9fa; border: 1px solid #e9ecef; padding: 15px; border-radius: 8px; margin: 20px 0; display: flex; align-items: center;">
-            <div style="flex: 1; text-align: center; border-right: 1px solid #dee2e6;">
-                <div style="font-size: 12px; color: #6c757d; margin-bottom: 5px;">市場標的總數</div>
-                <div style="font-size: 20px; font-weight: bold; color: #2c3e50;">{total}</div>
+    def get_now_time(self):
+        """獲取台北時間 (UTC+8)"""
+        # GitHub Actions 預設是 UTC，手動加 8 小時
+        return (datetime.utcnow() + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
+
+    def send_telegram(self, message):
+        """發送即時訊息到 Telegram"""
+        if not self.tg_token or not self.tg_chat_id:
+            print("⚠️ 缺少 Telegram 設定，跳過發送。")
+            return False
+        
+        # 加入時間戳記在訊息底部
+        ts = self.get_now_time().split(" ")[1] # 取得 HH:MM:SS
+        full_message = f"{message}\n\n🕒 <i>Sent at {ts} (UTC+8)</i>"
+        
+        url = f"https://api.telegram.org/bot{self.tg_token}/sendMessage"
+        payload = {
+            "chat_id": self.tg_chat_id, 
+            "text": full_message, 
+            "parse_mode": "HTML"
+        }
+        try:
+            response = requests.post(url, json=payload, timeout=10)
+            return response.status_code == 200
+        except Exception as e:
+            print(f"❌ Telegram 發送失敗: {e}")
+            return False
+
+    def send_report(self, market, status, count, detail=""):
+        """
+        透過 Resend 發送 Email 專業報表
+        """
+        if not self.resend_api_key:
+            print("⚠️ 缺少 Resend API Key，跳過發送。")
+            return False
+
+        report_time = self.get_now_time()
+        market_name = market.upper()
+        
+        # 根據狀態決定顏色
+        theme_color = "#28a745" if status == "Success" else "#dc3545"
+        status_text = "更新成功" if status == "Success" else "更新失敗"
+
+        subject = f"📊 {market_name} 股市矩陣監控報表 - {status_text}"
+        
+        html_content = f"""
+        <html>
+        <body style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; color: #333; line-height: 1.6;">
+            <div style="max-width: 600px; margin: 20px auto; border: 1px solid #e0e0e0; border-top: 8px solid {theme_color}; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
+                <div style="padding: 20px; background-color: #f8f9fa;">
+                    <h2 style="margin: 0; color: {theme_color};">{market_name} 全方位市場監控報表</h2>
+                    <p style="margin: 5px 0; color: #666; font-size: 14px;">報告生成時間: {report_time} (UTC+8)</p>
+                </div>
+                
+                <div style="padding: 20px;">
+                    <table style="width: 100%; border-collapse: collapse;">
+                        <tr>
+                            <td style="padding: 10px; border-bottom: 1px solid #eee; font-weight: bold;">市場區域</td>
+                            <td style="padding: 10px; border-bottom: 1px solid #eee;">{market_name}</td>
+                        </tr>
+                        <tr>
+                            <td style="padding: 10px; border-bottom: 1px solid #eee; font-weight: bold;">處理狀態</td>
+                            <td style="padding: 10px; border-bottom: 1px solid #eee; color: {theme_color}; font-weight: bold;">{status_text}</td>
+                        </tr>
+                        <tr>
+                            <td style="padding: 10px; border-bottom: 1px solid #eee; font-weight: bold;">成功同步數量</td>
+                            <td style="padding: 10px; border-bottom: 1px solid #eee; font-size: 18px; font-weight: bold;">{count}</td>
+                        </tr>
+                    </table>
+                    
+                    <div style="margin-top: 20px; padding: 15px; background-color: #fff4f4; border-radius: 5px; font-size: 14px; border-left: 4px solid #ccc;">
+                        <strong>詳情備註：</strong><br>
+                        {detail}
+                    </div>
+                </div>
+                
+                <div style="padding: 15px; background-color: #f1f1f1; text-align: center; font-size: 12px; color: #999;">
+                    本郵件由 GitHub Actions 全自動運作系統發送。<br>
+                    如果您收到此郵件，代表您的資料倉儲已完成每日同步任務。
+                </div>
             </div>
-            <div style="flex: 1; text-align: center; border-right: 1px solid #dee2e6;">
-                <div style="font-size: 12px; color: #6c757d; margin-bottom: 5px;">成功下載檔案</div>
-                <div style="font-size: 20px; font-weight: bold; color: {status_color};">{success}</div>
-            </div>
-            <div style="flex: 1; text-align: center; border-right: 1px solid #dee2e6;">
-                <div style="font-size: 12px; color: #6c757d; margin-bottom: 5px;">成功率</div>
-                <div style="font-size: 20px; font-weight: bold; color: {status_color};">{rate:.1f}%</div>
-            </div>
-            <div style="flex: 1.5; text-align: center; padding-left: 10px;">
-                <div style="font-size: 14px; font-weight: bold; color: {status_color};">{status_text}</div>
-            </div>
-        </div>
+        </body>
+        </html>
         """
 
-    # 4. 建立 Top 50 連結區塊邏輯
-    def get_top50_links(df, col_name):
-        if col_name not in df.columns:
-            return "目前無數據"
-        
-        top50 = df.sort_values(by=col_name, ascending=False).head(50)
-        links = []
-        
-        for _, r in top50.iterrows():
-            ticker = str(r["Ticker"])
-            if is_us:
-                url = f"https://stockcharts.com/sc3/ui/?s={ticker}"
-            elif is_hk:
-                clean_code = ticker.replace(".HK", "").strip().zfill(5)
-                url = f"https://www.aastocks.com/tc/stocks/quote/quick-quote.aspx?symbol={clean_code}"
-            elif is_cn:
-                prefix = "sh" if ticker.startswith('6') else "sz"
-                url = f"https://quote.eastmoney.com/{prefix}{ticker}.html"
-            elif is_jp:
-                clean_ticker = ticker if ".T" in ticker.upper() else f"{ticker.split('.')[0]}.T"
-                url = f"https://www.rakuten-sec.co.jp/web/market/search/quote.html?ric={clean_ticker}"
-            elif is_kr:
-                clean_code = ticker.split('.')[0]
-                url = f"https://finance.naver.com/item/main.naver?code={clean_code}"
-            elif is_tw:
-                clean_tkr = ticker.split('.')[0]
-                url = f"https://www.wantgoo.com/stock/{clean_tkr}/technical-chart"
-            else:
-                clean_tkr = ticker.split('.')[0]
-                url = f"https://www.wantgoo.com/stock/{clean_tkr}/technical-chart"
-            
-            display_name = r.get("Full_Name", ticker)
-            links.append(f'<a href="{url}" style="text-decoration:none; color:#0366d6;">{ticker}({display_name})</a>')
-        
-        return " | ".join(links)
-
-    target_site = 'StockCharts' if is_us else 'AASTOCKS' if is_hk else '東方財富' if is_cn else '樂天證券' if is_jp else 'Naver Finance' if is_kr else '玩股網'
-    
-    # 5. 組合 HTML 郵件內容
-    html_content = f"""
-    <div style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; color: #333; max-width: 850px; margin: auto; border: 1px solid #eee; padding: 20px; border-radius: 10px;">
-        <h2 style="color: #2c3e50; border-bottom: 3px solid #3498db; padding-bottom: 10px; margin-bottom: 10px;">
-            🚀 {market_name} 全方位市場監控報表
-        </h2>
-        <p style="color: #7f8c8d; font-size: 14px; margin-bottom: 20px;">報告生成時間: {now_str}</p>
-        
-        {health_html}  <div style="background-color: #fdfefe; border-left: 5px solid #e74c3c; padding: 10px; margin: 20px 0; font-size: 14px;">
-            💡 提示：點擊下方表格中的<b>股票代號</b>，可直接跳轉至 <b>{target_site}</b> 查看即時技術線圖。
-        </div>
-    """
-    
-    # 插入 9 張分布圖
-    for img in img_data:
-        html_content += f"<h3 style='color: #2980b9; margin-top: 30px;'>📍 {img['label']}</h3>"
-        html_content += f'<img src="cid:{img["id"]}" style="width:100%; max-width:800px; border-radius: 5px; box-shadow: 0 4px 8px rgba(0,0,0,0.1);">'
-
-    # 插入分箱清單文字
-    html_content += "<div style='background-color: #f4f7f6; padding: 15px; border-radius: 8px; margin-top: 40px;'>"
-    for period, report in text_reports.items():
-        p_name = {"Week": "週", "Month": "月", "Year": "年"}.get(period, period)
-        html_content += f"<h4 style='color: #16a085; margin-bottom: 5px;'>📊 {p_name}K 報酬分布明細 (含飆股清單)</h4>"
-        html_content += f"<pre style='background-color: #ffffff; padding: 10px; border: 1px solid #ddd; font-size: 12px; white-space: pre-wrap; word-wrap: break-word;'>{report}</pre>"
-    html_content += "</div>"
-
-    # 插入 Top 50 飆股區塊
-    html_content += f"""
-        <hr style="border: 0; border-top: 1px solid #eee; margin: 40px 0;">
-        <h4 style="color: #c0392b;">🔥 本週表現最強動能 Top 50 (點擊跳轉線圖)</h4>
-        <div style="line-height: 2; font-size: 13px; color: #34495e;">
-            {get_top50_links(report_df, 'Week_High')}
-        </div>
-        <p style="margin-top: 50px; font-size: 12px; color: #bdc3c7; text-align: center;">
-            此報表由系統自動生成，僅供研究參考。
-        </p>
-    </div>
-    """
-
-    # 6. 準備附件 (Inline Embedding)
-    attachments = []
-    for img in img_data:
         try:
-            with open(img['path'], "rb") as f:
-                attachments.append({
-                    "content": list(f.read()),
-                    "filename": f"{img['id']}.png",
-                    "content_id": img['id'],
-                    "disposition": "inline"
-                })
+            # 注意: 'from' 必須是 resend 驗證過的網域，或者預設的 onboarding@resend.dev
+            resend.Emails.send({
+                "from": "StockMonitor <onboarding@resend.dev>",
+                "to": "your_email@example.com", # <--- 在這裡填入你的 Email
+                "subject": subject,
+                "html": html_content
+            })
+            print(f"📧 {market_name} 郵件報告發送成功")
+            return True
         except Exception as e:
-            print(f"⚠️ 讀取圖片失敗 {img['path']}: {e}")
-
-    # 7. 執行寄送
-    to_emails = ["grissomlin643@gmail.com"]
-
-    try:
-        resend.Emails.send({
-            "from": "StockMonitor <onboarding@resend.dev>",
-            "to": to_emails,
-            "subject": f"🚀 {market_name} 監控報告 - {now_str}",
-            "html": html_content,
-            "attachments": attachments
-        })
-        print(f"✅ 郵件發送成功！市場：{market_name}")
-    except Exception as e:
-        print(f"❌ 郵件發送失敗 ({market_name}): {e}")
+            print(f"❌ Email 發送失敗: {e}")
+            return False
