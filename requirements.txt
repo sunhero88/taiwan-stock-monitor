@@ -1,20 +1,30 @@
-# --- 基礎數據處理 ---
+# --- 1. 基礎數據架構 ---
 pandas
 numpy
-matplotlib
+openpyxl
+lxml
+html5lib
+requests
+cryptography
+python-dotenv       # 💡 必須補上：讀取 .env 環境變數
 
-# --- 數據獲取 (核心) ---
+# --- 2. 核心下載引擎 ---
 yfinance
 tqdm
-resend
 
-# --- 中國 A 股 ---
-akshare
+# --- 3. 全球六國清單獲取 ---
+akshare             # 中國 A 股
+pykrx               # 韓國股市
+tokyo-stock-exchange # 日本股市
+FinanceDataReader   # 💡 建議補上：日韓股名單備援
 
-# --- 日本股市 (Tokyo Stock Exchange) ---
+# --- 4. Google Drive 雲端同步 ---
+google-api-python-client
+google-auth-httplib2
+google-auth-oauthlib
 
-tokyo-stock-exchange
+# --- 5. 通知系統 ---
+resend              # 💡 必須補上：Email 通報引擎
 
-# --- 韓國股市 (Korea Exchange) ---
-# pykrx 是目前公認最強、最穩定的韓國股市套件
-pykrx
+# --- 6. 數據加工 (Parquet 格式支援) ---
+pyarrow             # 💡 建議補上：Parquet 讀寫支援
