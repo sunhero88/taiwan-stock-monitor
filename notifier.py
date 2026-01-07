@@ -170,19 +170,22 @@ class StockNotifier:
             except Exception as e:
                 print(f"⚠️ 處理圖表附件失敗 {img['id']}: {e}")
 
-        # --- 6. 寄送 Resend 郵件 ---
+        # --- 6. 寄送 Resend 郵件（已修改）---
         try:
+            # 優先讀取 GitHub Secret 中的收件人，若無則直接用你的 Gmail
+            receiver_email = os.getenv("REPORT_RECEIVER_EMAIL", "sunhero88@gmail.com")
+
             resend.Emails.send({
-                "from": "StockMonitor <onboarding@resend.dev>",
-                "to": "grissomlin643@gmail.com",
+                "from": "StockMonitor <report@twstock.cc>",  # 使用你的自訂域名發信
+                "to": receiver_email,                        # 只寄給你
                 "subject": f"🚀 {market_name} 全方位監控報告 - {report_time.split(' ')[0]}",
                 "html": html_content,
                 "attachments": attachments
             })
-            print(f"✅ {market_name} 郵件報告已寄送！")
+            print(f"✅ {market_name} 郵件報告已寄送給 {receiver_email}！")
             
             # --- 7. 發送 Telegram 簡報 ---
-            tg_msg = f"📊 <b>{market_name} 監控報表已送達</b>\n涵蓋率: {success_rate}\n處理樣本: {success_count} 檔"
+            tg_msg = f"📊 <b>{market_name} 監控報表已送達</b>\n收件人: {receiver_email}\n涵蓋率: {success_rate}\n處理樣本: {success_count} 檔"
             self.send_telegram(tg_msg)
             
             return True
