@@ -7,9 +7,11 @@ from tqdm import tqdm
 def download_us_data(market_id):
     # 定義美股監控清單
     tickers = {
-        "AAPL": "Apple", "MSFT": "Microsoft", "GOOGL": "Google",
-        "AMZN": "Amazon", "NVDA": "NVIDIA", "TSLA": "Tesla",
-        "META": "Meta", "QQQ": "QQQ-ETF", "SPY": "SPY-ETF"
+        "AAPL": "Apple",
+        "MSFT": "Microsoft",
+        "NVDA": "NVIDIA",
+        "TSLA": "Tesla",
+        "GOOGL": "Google"
     }
     
     save_dir = Path(f"./data/{market_id}/dayK")
@@ -20,7 +22,7 @@ def download_us_data(market_id):
         try:
             df = yf.download(symbol, period="2y", interval="1d", progress=False)
             if not df.empty:
-                # 💡 關鍵：存檔名改為 "代號_名稱.csv" 以符合 analyzer.py 的解析邏輯
+                # 💡 關鍵：存成 "代號_名稱.csv"
                 df.to_csv(save_dir / f"{symbol}_{name}.csv")
         except Exception as e:
             print(f"❌ {symbol} 下載失敗: {e}")
