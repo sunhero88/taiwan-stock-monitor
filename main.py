@@ -1,68 +1,72 @@
+# -*- coding: utf-8 -*-
 import os
-import argparse
-import importlib
-from openai import OpenAI
+import resend
+from datetime import datetime
+from analyzer import StockAnalyzer  # 確保你的 analyzer.py 已經改好我上次給你的版本
 
-def get_ai_analysis(market_name, summary_text):
-    """呼叫 OpenAI API 產出分析報告"""
-    api_key = os.getenv("OPENAI_API_KEY")
+def send_resend_email(report_html, market_name):
+    """
+    使用 Resend API 發送郵件
+    """
+    # 從 GitHub Secrets 讀取你貼上的 re_ 開頭字串
+    api_key = os.environ.get('EMAIL_PASS') 
     if not api_key:
-        return "（未提供 AI 分析報告：找不到金鑰）"
-    try:
-        client = OpenAI(api_key=api_key)
-        prompt = f"你是一位股市分析師，請簡短分析 {market_name} 數據：\n{summary_text}"
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[{"role": "user", "content": prompt}]
-        )
-        return response.choices[0].message.content
-    except Exception as e:
-        return f"（AI 分析出錯: {e}）"
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--market', type=str, required=True)
-    args = parser.parse_args()
-    market_id = args.market
-
-    # 1. 執行下載 (對接 downloader_tw.py 等)
-    module_name = f"downloader_{market_id.split('-')[0]}"
-    try:
-        print(f"正在執行原始下載模組: {module_name}.py")
-        downloader_mod = importlib.import_module(module_name)
-        downloader_mod.main() 
-    except Exception as e:
-        print(f"下載失敗: {e}")
-
-    # 2. 執行分析 (對接 analyzer.py)
-    try:
-        print("正在執行原始分析流程...")
-        import analyzer
-        # 直接使用模組內的 run 函式，避開類別導入錯誤
-        result = analyzer.run(market_id)
-        
-        if isinstance(result, tuple):
-            matrix_data, summary_text = result[0], result[1]
-        else:
-            matrix_data, summary_text = result, str(result)
-    except Exception as e:
-        print(f"分析失敗: {e}")
+        print("❌ 錯誤：找不到 EMAIL_PASS (Resend API Key) 環境變數")
         return
 
-    # 3. 執行 AI 分析
-    ai_report = get_ai_analysis(market_id, summary_text)
+    resend.api_key = api_key
+    today = datetime.now().strftime('%Y-%m-%d')
+    
+    # 寄件人必須是你驗證過的域名
+    from_email = "Stock Monitor <report@twstock.cc>"
+    # 收件人請改為你的 Gmail (或維持從環境變數讀取)
+    to_email = os.environ.get('EMAIL_USER') 
 
-    # 4. 執行發信 (對接 notifier.py)
+    params = {
+        "from": from_email,
+        "to": [to_email],
+        "subject": f"📈 {market_name} 股市分析報告 - {today}",
+        "html": report_html
+    }
+
     try:
-        print("正在執行原始通知流程...")
-        import notifier
-        # 將 AI 報告與原始矩陣數據合併
-        full_report = f"{matrix_data}\n\n🤖 AI 智能分析：\n{ai_report}"
-        # 調用模組內的 send 函式
-        notifier.send(market_id, full_report)
-        print(f"✅ {market_id} 任務執行完畢，郵件已發送。")
+        print(f"🚀 正在發送 {market_name} 報告至 {to_email}...")
+        r = resend.Emails.send(params)
+        print(f"✅ 郵件發送成功！ID: {r['id']}")
     except Exception as e:
-        print(f"通知發送失敗: {e}")
+        print(f"❌ 郵件發送失敗：{str(e)}")
+
+def main():
+    # 定義要分析的市場
+    markets = {
+        "tw-share": "台股",
+        "us-share": "美股",
+        "hk-share": "港股"
+    }
+
+    analyzer = StockAnalyzer()
+
+    for m_id, m_name in markets.items():
+        try:
+            # 執行分析 (這會呼叫你 analyzer.py 中的邏輯)
+            images, df_res, text_reports = analyzer.run(m_id)
+
+            if df_res.empty:
+                print(f"⚠️ {m_name} 無數據可分析，跳過。")
+                continue
+
+            # 組合簡單的 HTML 內容
+            # 注意：Resend 免費版暫不支持直接傳送多張大圖附件，建議先發送文字報表
+            report_content = f"<h2>{m_name} 今日行情總覽 ({datetime.now().strftime('%Y-%m-%d')})</h2>"
+            for period, table in text_reports.items():
+                report_content += f"<h3>{period} 區間分布</h3><pre>{table}</pre><hr>"
+
+            # 執行發信
+            send_resend_email(report_content, m_name)
+
+        except Exception as e:
+            print(f"❌ 處理 {m_name} 時發生崩潰: {str(e)}")
 
 if __name__ == "__main__":
     main()
+
