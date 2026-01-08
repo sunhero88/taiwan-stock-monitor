@@ -2,26 +2,38 @@ name: Global Market Monitor Parallel
 
 on:
   schedule:
+    # 每個工作日台灣時間下午 6:30 執行 (UTC 10:30)
     - cron: '30 10 * * 1-5'
   workflow_dispatch:
     inputs:
       market_choice:
-        description: 'Select Market'
+        description: 'Select Market to Run'
         required: true
         default: 'all'
         type: choice
-        options: [all, tw-share, us-share, hk-share, cn-share, jp-share, kr-share]
+        options:
+          - all
+          - tw-share
+          - us-share
+          - hk-share
+          - cn-share
+          - jp-share
+          - kr-share
 
 jobs:
   global-market-analysis:
+    # 根據矩陣設定，自動顯示不同國家的國旗與名稱
     name: ${{ matrix.market.emoji }} ${{ matrix.market.name }} Analysis
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         market:
+          # 定義市場 ID、名稱、圖示以及對應的下載器後綴
           - { id: "tw-share", name: "Taiwan", emoji: "🇹🇼", suffix: "tw" }
           - { id: "us-share", name: "US",     emoji: "🇺🇸", suffix: "us" }
+          # 如果有其他市場的下載器，可以依照此格式繼續增加
+          # - { id: "hk-share", name: "HK",     emoji: "🇭🇰", suffix: "hk" }
 
     steps:
       - name: Checkout Code
@@ -35,16 +47,28 @@ jobs:
 
       - name: Environment Setup
         run: |
+          sudo apt-get update
+          sudo apt-get install -y fonts-noto-cjk
           python -m pip install --upgrade pip
-          pip install pandas yfinance requests lxml tqdm resend matplotlib numpy
+          # 安裝所有必要的套件，包含發信用 resend 與數據下載用 yfinance
+          pip install pandas yfinance requests lxml tqdm resend matplotlib numpy xlrd pykrx tokyo-stock-exchange akshare openai
 
       - name: Download and Run Market Analysis
+        # 邏輯：排程執行、手動全選、或手動選中該市場時觸發
+        if: |
+          github.event_name == 'schedule' || 
+          github.event.inputs.market_choice == 'all' || 
+          github.event.inputs.market_choice == matrix.market.id
         env:
-          # 💡 重要：確保這些 Secret 在 GitHub Settings 中已設定
-          EMAIL_USER: ${{ secrets.EMAIL_USER }} 
-          EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
+          # 將 GitHub Secrets 傳遞給 Python 程式碼
+          EMAIL_USER: ${{ secrets.EMAIL_USER }}   # 收件人 Gmail
+          EMAIL_PASS: ${{ secrets.EMAIL_PASS }}   # Resend API Key (re_...)
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
-          # 1. 執行下載
+          # 1. 下載數據：呼叫對應的 downloader_*.py 並傳入 --market 參數
+          echo "🚀 Starting data download for ${{ matrix.market.name }}..."
           python "downloader_${{ matrix.market.suffix }}.py" --market ${{ matrix.market.id }}
-          # 2. 執行分析與發信
+          
+          # 2. 數據分析與發信：執行主程式
+          echo "📊 Running analysis and sending report..."
           python main.py --market ${{ matrix.market.id }}
