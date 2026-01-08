@@ -4,8 +4,7 @@ import yfinance as yf
 from pathlib import Path
 from tqdm import tqdm
 
-def download_us_data(market_id):
-    # 定義美股監控清單
+def download_data(market_id):
     tickers = {
         "AAPL": "Apple",
         "MSFT": "Microsoft",
@@ -13,16 +12,15 @@ def download_us_data(market_id):
         "TSLA": "Tesla",
         "GOOGL": "Google"
     }
-    
     save_dir = Path(f"./data/{market_id}/dayK")
     save_dir.mkdir(parents=True, exist_ok=True)
     
-    print(f"📥 開始下載 {market_id} 美股數據...")
+    print(f"📥 開始下載 {market_id} 數據...")
     for symbol, name in tqdm(tickers.items()):
         try:
             df = yf.download(symbol, period="2y", interval="1d", progress=False)
             if not df.empty:
-                # 💡 關鍵：存成 "代號_名稱.csv"
+                # 這裡的檔名格式：AAPL_Apple.csv
                 df.to_csv(save_dir / f"{symbol}_{name}.csv")
         except Exception as e:
             print(f"❌ {symbol} 下載失敗: {e}")
@@ -31,5 +29,5 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--market', required=True)
     args = parser.parse_args()
-    download_us_data(args.market)
+    download_data(args.market)
     print("✅ 美股數據下載完成。")
