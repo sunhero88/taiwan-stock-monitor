@@ -1,76 +1,75 @@
-# -*- coding: utf-8 -*-
 import os
-import resend
 import argparse
-from datetime import datetime
-from analyzer import StockAnalyzer 
+import importlib
+from pathlib import Path
+from openai import OpenAI
 
-def send_resend_email(report_html, market_name):
-    """ 使用 Resend API 透過自訂域名發送郵件 """
-    # 讀取 GitHub Secrets
-    api_key = os.environ.get('EMAIL_PASS') 
-    to_email = os.environ.get('EMAIL_USER') 
-
-    if not api_key or not to_email:
-        print(f"❌ 錯誤：找不到環境變數 EMAIL_PASS 或 EMAIL_USER")
-        return
-
-    resend.api_key = api_key
-    today = datetime.now().strftime('%Y-%m-%d')
-    
-    # 注意：寄件人必須是您在 Resend 驗證過的域名
-    params = {
-        "from": "Stock Monitor <report@twstock.cc>",
-        "to": [to_email],
-        "subject": f"📈 {market_name} 股市分析報告 - {today}",
-        "html": report_html
-    }
-
+def get_ai_analysis(market_name, summary_text):
+    """呼叫 OpenAI API 產出分析報告"""
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return "（未提供 AI 分析報告：找不到金鑰）"
     try:
-        print(f"🚀 正在發送 {market_name} 報告至 {to_email}...")
-        r = resend.Emails.send(params)
-        print(f"✅ 郵件發送成功！ID: {r['id']}")
+        client = OpenAI(api_key=api_key)
+        prompt = f"你是一位股市分析師，請簡短分析 {market_name} 數據：\n{summary_text}"
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return response.choices[0].message.content
     except Exception as e:
-        print(f"❌ 郵件發送失敗：{str(e)}")
+        return f"（AI 分析出錯: {e}）"
 
 def main():
-    # 接收來自 YAML 的 --market 參數
     parser = argparse.ArgumentParser()
-    parser.add_argument('--market', default='tw-share')
+    parser.add_argument('--market', type=str, required=True)
     args = parser.parse_args()
+    market_id = args.market
 
-    market_map = {
-        "tw-share": "台股", "us-share": "美股", "hk-share": "港股",
-        "cn-share": "陸股", "jp-share": "日股", "kr-share": "韓股"
-    }
-    
-    m_id = args.market
-    m_name = market_map.get(m_id, m_id)
+    # 💡 強制建立資料夾，確保路徑存在
+    Path(f"data/{market_id}/dayK").mkdir(parents=True, exist_ok=True)
 
-    # 實例化分析類別 (確保 analyzer.py 末尾有定義 class StockAnalyzer)
-    analyzer = StockAnalyzer()
+    # 1. 執行下載 (對接 downloader_tw.py 等)
+    module_name = f"downloader_{market_id.split('-')[0]}"
     try:
-        images, df_res, text_reports = analyzer.run(m_id)
-
-        if df_res.empty:
-            print(f"⚠️ {m_name} 數據夾為空或分析失敗，跳過發信。")
-            return
-
-        # 組合 HTML 內容
-        report_content = f"<h2>{m_name} 市場分析報告 ({datetime.now().strftime('%Y-%m-%d')})</h2>"
-        for period, table in text_reports.items():
-            report_content += f"<h3>{period} 區間分布 (收盤價)</h3>"
-            report_content += f"<pre style='background:#f9f9f9; padding:15px; border-left:5px solid #007bff; font-family:monospace;'>{table}</pre>"
-            report_content += "<hr>"
-
-        # 呼叫發信函式
-        send_resend_email(report_content, m_name)
-
+        print(f"📡 步驟 1. 下載數據: {module_name}.py")
+        downloader_mod = importlib.import_module(module_name)
+        downloader_mod.main() 
     except Exception as e:
-        print(f"❌ 處理 {m_id} 時發生異常: {str(e)}")
+        print(f"❌ 下載失敗: {e}")
+
+    # 2. 執行分析 (對接 analyzer.py)
+    try:
+        print("📊 步驟 2. 執行深度矩陣分析...")
+        import analyzer
+        # 調用模組內的 run 函式
+        result = analyzer.run(market_id)
+        
+        if isinstance(result, tuple):
+            matrix_data, summary_text = result[0], result[1]
+        else:
+            matrix_data, summary_text = result, str(result)
+            
+        # 如果數據真的為空，在 Log 中印出警告但不要停止
+        if not summary_text or len(summary_text) < 10:
+             print("⚠️ 警告：分析結果似乎為空，請檢查 data 資料夾。")
+    except Exception as e:
+        print(f"❌ 分析階段崩潰: {e}")
+        return
+
+    # 3. 執行 AI 智能分析
+    ai_report = get_ai_analysis(market_id, summary_text)
+
+    # 4. 執行發信 (對接 notifier.py)
+    try:
+        print("📧 步驟 3. 正在發送通知郵件...")
+        import notifier
+        # 即使數據不完美，也嘗試發送包含 AI 分析的內容
+        full_report = f"{matrix_data}\n\n🤖 AI 智能分析報告：\n{ai_report}"
+        notifier.send(market_id, full_report)
+        print(f"✅ {market_id} 任務執行完畢，郵件已發送。")
+    except Exception as e:
+        print(f"❌ 通知發送失敗: {e}")
 
 if __name__ == "__main__":
     main()
-
-
-
