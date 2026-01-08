@@ -4,8 +4,8 @@ import yfinance as yf
 from pathlib import Path
 from tqdm import tqdm
 
-def download_tw_data(market_id):
-    # 定義台股監控清單 (格式: 代號: 名稱)
+def download_data(market_id):
+    # 定義代號與名稱（必須有底線分隔）
     tickers = {
         "2330.TW": "台積電",
         "2317.TW": "鴻海",
@@ -13,7 +13,6 @@ def download_tw_data(market_id):
         "2308.TW": "台達電",
         "2382.TW": "廣達"
     }
-    
     save_dir = Path(f"./data/{market_id}/dayK")
     save_dir.mkdir(parents=True, exist_ok=True)
     
@@ -22,7 +21,7 @@ def download_tw_data(market_id):
         try:
             df = yf.download(symbol, period="2y", interval="1d", progress=False)
             if not df.empty:
-                # 💡 關鍵：存成 "代號_名稱.csv"，例如 "2330.TW_台積電.csv"
+                # 這裡的檔名格式是關鍵：2330.TW_台積電.csv
                 df.to_csv(save_dir / f"{symbol}_{name}.csv")
         except Exception as e:
             print(f"❌ {symbol} 下載失敗: {e}")
@@ -31,5 +30,5 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--market', required=True)
     args = parser.parse_args()
-    download_tw_data(args.market)
+    download_data(args.market)
     print("✅ 台股數據下載完成。")
