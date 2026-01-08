@@ -2,6 +2,7 @@ name: Global Market Monitor Parallel
 
 on:
   schedule:
+    # 每個工作日台灣時間下午 6:30 執行 (UTC 10:30)
     - cron: '30 10 * * 1-5'
   workflow_dispatch:
     inputs:
@@ -27,12 +28,12 @@ jobs:
       fail-fast: false
       matrix:
         market:
-          - { id: "tw-share", name: "Taiwan", emoji: "🇹🇼" }
-          - { id: "us-share", name: "US",     emoji: "🇺🇸" }
-          - { id: "hk-share", name: "HK",     emoji: "🇭🇰" }
-          - { id: "cn-share", name: "China",  emoji: "🇨🇳" }
-          - { id: "jp-share", name: "Japan",  emoji: "🇯🇵" }
-          - { id: "kr-share", name: "Korea",  emoji: "🇰🇷" }
+          - { id: "tw-share", name: "Taiwan", emoji: "🇹🇼", suffix: "tw" }
+          - { id: "us-share", name: "US",     emoji: "🇺🇸", suffix: "us" }
+          - { id: "hk-share", name: "HK",     emoji: "🇭🇰", suffix: "hk" }
+          - { id: "cn-share", name: "China",  emoji: "🇨🇳", suffix: "cn" }
+          - { id: "jp-share", name: "Japan",  emoji: "🇯🇵", suffix: "jp" }
+          - { id: "kr-share", name: "Korea",  emoji: "🇰🇷", suffix: "kr" }
 
     steps:
       - name: Checkout Code
@@ -51,10 +52,23 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas yfinance requests lxml tqdm resend matplotlib numpy xlrd pykrx tokyo-stock-exchange akshare openai
 
-      - name: Run Market Analysis
+      - name: Download and Run Market Analysis
+        # 只有在手動選擇該市場或選擇 'all' 時才會執行
+        if: |
+          github.event_name == 'schedule' || 
+          github.event.inputs.market_choice == 'all' || 
+          github.event.inputs.market_choice == matrix.market.id
         env:
-          # 💡 這裡必須對應 main.py 讀取的變數名稱
-          EMAIL_USER: ${{ secrets.EMAIL_USER }}   # 收件人 Gmail
-          EMAIL_PASS: ${{ secrets.EMAIL_PASS }}   # Resend API Key (re_...)
+          # 對接 GitHub Secrets 讓 Python 能讀取 API Key 與收件信箱
+          EMAIL_USER: ${{ secrets.EMAIL_USER }}
+          EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-        run: python main.py --market ${{ matrix.market.id }}
+        run: |
+          # 1. 先執行下載器，確保 data 資料夾內有 CSV 檔案
+          # 檔案名稱會自動對應，例如：downloader_tw.py
+          echo "🚀 Starting data download for ${{ matrix.market.name }}..."
+          python "downloader_${{ matrix.market.suffix }}.py"
+          
+          # 2. 執行主分析程式並發送郵件
+          echo "📊 Running analysis and sending report..."
+          python main.py --market ${{ matrix.market.id }}
