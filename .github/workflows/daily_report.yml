@@ -10,14 +10,7 @@ on:
         required: true
         default: 'all'
         type: choice
-        options:
-          - all
-          - tw-share
-          - us-share
-          - hk-share
-          - cn-share
-          - jp-share
-          - kr-share
+        options: [all, tw-share, us-share, hk-share, cn-share, jp-share, kr-share]
 
 jobs:
   global-market-analysis:
@@ -29,10 +22,6 @@ jobs:
         market:
           - { id: "tw-share", name: "Taiwan", emoji: "🇹🇼", suffix: "tw" }
           - { id: "us-share", name: "US",     emoji: "🇺🇸", suffix: "us" }
-          - { id: "hk-share", name: "HK",     emoji: "🇭🇰", suffix: "hk" }
-          - { id: "cn-share", name: "China",  emoji: "🇨🇳", suffix: "cn" }
-          - { id: "jp-share", name: "Japan",  emoji: "🇯🇵", suffix: "jp" }
-          - { id: "kr-share", name: "Korea",  emoji: "🇰🇷", suffix: "kr" }
 
     steps:
       - name: Checkout Code
@@ -46,25 +35,16 @@ jobs:
 
       - name: Environment Setup
         run: |
-          sudo apt-get update
-          sudo apt-get install -y fonts-noto-cjk
           python -m pip install --upgrade pip
-          pip install pandas yfinance requests lxml tqdm resend matplotlib numpy xlrd pykrx tokyo-stock-exchange akshare openai
+          pip install pandas yfinance requests lxml tqdm resend matplotlib numpy
 
       - name: Download and Run Market Analysis
-        if: |
-          github.event_name == 'schedule' || 
-          github.event.inputs.market_choice == 'all' || 
-          github.event.inputs.market_choice == matrix.market.id
         env:
-          EMAIL_USER: ${{ secrets.EMAIL_USER }}
+          # 💡 重要：確保這些 Secret 在 GitHub Settings 中已設定
+          EMAIL_USER: ${{ secrets.EMAIL_USER }} 
           EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
-          # 1. 執行下載器並補上必要的 --market 參數
-          echo "🚀 Starting data download for ${{ matrix.market.name }}..."
+          # 1. 執行下載
           python "downloader_${{ matrix.market.suffix }}.py" --market ${{ matrix.market.id }}
-          
           # 2. 執行分析與發信
-          echo "📊 Running analysis and sending report..."
           python main.py --market ${{ matrix.market.id }}
