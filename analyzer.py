@@ -26,39 +26,26 @@ def get_market_url(market_id, ticker):
     m_id = market_id.lower()
     
     if m_id == "us-share":
-        # 🇺🇸 美股連結：StockCharts
         return f"https://stockcharts.com/sc3/ui/?s={ticker}"
-    
     elif m_id == "hk-share":
-        # 🇭🇰 港股連結：AASTOCKS (補足5位數)
         clean_code = ticker.replace(".HK", "").strip().zfill(5)
         return f"https://www.aastocks.com/tc/stocks/quote/stocktrend.aspx?symbol={clean_code}"
-
     elif m_id == "cn-share":
-        # 🇨🇳 中國 A 股連結：東方財富 (識別 sh/sz)
         prefix = "sh" if ticker.startswith('6') else "sz"
         return f"https://quote.eastmoney.com/{prefix}{ticker}.html"
-
     elif m_id == "jp-share":
-        # 🇯🇵 日本連結：樂天證券 (Rakuten Securities)
-        # 格式範例：7203.T
         clean_ticker = ticker if ".T" in ticker.upper() else f"{ticker.split('.')[0]}.T"
         return f"https://www.rakuten-sec.co.jp/web/market/search/quote.html?ric={clean_ticker}"
-
     elif m_id == "kr-share":
-        # 🇰🇷 韓國連結：Naver Finance
-        # 邏輯：Naver 僅接受純數字代碼，去除 .KS 或 .KQ
         clean_code = ticker.split('.')[0]
         return f"https://finance.naver.com/item/main.naver?code={clean_code}"
-
     else:
-        # 🇹🇼 台股連結：玩股網
         clean_ticker = ticker.split('.')[0]
         return f"https://www.wantgoo.com/stock/{clean_ticker}/technical-chart"
 
 def build_company_list(arr_pct, codes, names, bins, market_id):
     """
-    產出 HTML 格式的分箱清單，支援動態超連結與飆股高亮
+    產出 HTML 格式的分箱清單
     """
     lines = [f"{'報酬區間':<12} | {'家數(比例)':<14} | 公司清單", "-"*80]
     total = len(arr_pct)
@@ -88,7 +75,6 @@ def build_company_list(arr_pct, codes, names, bins, market_id):
         for idx in sorted_e:
             url = get_market_url(market_id, codes[idx])
             e_links.append(f'<a href="{url}" style="text-decoration:none; color:red; font-weight:bold;">{codes[idx]}({names[idx]}:{arr_pct[idx]:.0f}%)</a>')
-        
         lines.append(f"{' > 100%':<12} | {e_cnt:>4} ({(e_cnt/total*100):5.1f}%) | {', '.join(e_links)}")
 
     return "\n".join(lines)
@@ -117,22 +103,15 @@ def run_global_analysis(market_id="tw-share"):
             df.columns = [c.lower() for c in df.columns]
             close, high, low = df['close'].values, df['high'].values, df['low'].values
             
-            # 解析代號與名稱
             stem = f.name.replace(".csv", "")
-            
-            # 多國檔名解析策略
             if market_id in ["hk-share", "jp-share", "kr-share"]:
-                # 港日韓多為單一代號格式 (如 7203.T.csv 或 005930.KS.csv)
-                tkr = stem
-                nm = stem
+                tkr, nm = stem, stem
             elif "_" in stem:
-                # 台、美、中 (如 AAPL_Apple.csv 或 600519_貴州茅台.csv)
                 tkr, nm = stem.split('_', 1)
             else:
                 tkr, nm = stem, stem
                 
             row = {'Ticker': tkr, 'Full_Name': nm}
-            
             periods = [('Week', 5), ('Month', 20), ('Year', 250)]
             for p_name, days in periods:
                 if len(close) <= days: continue
@@ -147,7 +126,6 @@ def run_global_analysis(market_id="tw-share"):
     df_res = pd.DataFrame(results)
     if df_res.empty: return [], df_res, {}
 
-    # --- 繪圖邏輯 ---
     images = []
     color_map = {'High': '#28a745', 'Close': '#007bff', 'Low': '#dc3545'}
     EXTREME_COLOR = '#FF4500' 
@@ -163,25 +141,20 @@ def run_global_analysis(market_id="tw-share"):
             clipped_data = np.clip(data.values, X_MIN, X_MAX + BIN_SIZE)
             counts, edges = np.histogram(clipped_data, bins=plot_bins)
             
-            ax.bar(edges[:-2], counts[:-1], width=9, align='edge', 
-                   color=color_map[t_n], alpha=0.7, edgecolor='white')
-            ax.bar(edges[-2], counts[-1], width=9, align='edge', 
-                   color=EXTREME_COLOR, alpha=0.9, edgecolor='black', linewidth=1.5)
+            ax.bar(edges[:-2], counts[:-1], width=9, align='edge', color=color_map[t_n], alpha=0.7, edgecolor='white')
+            ax.bar(edges[-2], counts[-1], width=9, align='edge', color=EXTREME_COLOR, alpha=0.9, edgecolor='black', linewidth=1.5)
             
             max_h = counts.max() if len(counts) > 0 else 1
             for i, h in enumerate(counts):
                 if h > 0:
                     x_pos = edges[i] + 4.5
                     is_extreme = (i == len(counts) - 1)
-                    ax.text(x_pos, h + (max_h * 0.02), f'{int(h)}\n({h/len(data)*100:.1f}%)', 
-                            ha='center', va='bottom', fontsize=9, fontweight='bold', 
-                            color='red' if is_extreme else 'black')
+                    ax.text(x_pos, h + (max_h * 0.02), f'{int(h)}\n({h/len(data)*100:.1f}%)', ha='center', va='bottom', fontsize=9, fontweight='bold', color='red' if is_extreme else 'black')
 
             ax.set_ylim(0, max_h * 1.4) 
             ax.set_title(f"【{market_label}】{p_z}K {t_z} 報酬分布 (樣本:{len(data)})", fontsize=18, fontweight='bold')
             ax.set_xticks(plot_bins)
-            x_labels = [f"{int(x)}%" for x in BINS] + [f">{int(X_MAX)}%"]
-            ax.set_xticklabels(x_labels, rotation=45)
+            ax.set_xticklabels([f"{int(x)}%" for x in BINS] + [f">{int(X_MAX)}%"], rotation=45)
             ax.grid(axis='y', linestyle='--', alpha=0.3)
             plt.tight_layout()
             
@@ -192,8 +165,16 @@ def run_global_analysis(market_id="tw-share"):
 
     text_reports = {}
     for p_n in ['Week', 'Month', 'Year']:
-        col = f'{p_n}_High'
+        col = f'{p_n}_Close'
         if col in df_res.columns:
-            text_reports[p_n] = build_company_list(df_res[col].values, df_res['Ticker'].tolist(), df_res['Full_Name'].tolist(), BINS, market_id)
-    
+            text_reports[p_n] = build_company_list(df_res[col].values, df_res['Ticker'].values, df_res['Full_Name'].values, BINS, market_id)
+
     return images, df_res, text_reports
+
+# --- 對接 GitHub Actions (main.py) 的接口 ---
+class StockAnalyzer:
+    def run(self, market_id):
+        return run_global_analysis(market_id)
+
+def run(market_id):
+    return run_global_analysis(market_id)
