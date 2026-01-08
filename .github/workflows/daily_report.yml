@@ -1,35 +1,75 @@
-# -*- coding: utf-8 -*-
-import argparse
-import yfinance as yf
-from pathlib import Path
-from tqdm import tqdm
+name: Global Market Monitor Parallel
 
-def download_tw_data(market_id):
-    # 定義台股監控清單 (格式: 代號: 名稱)
-    tickers = {
-        "2330.TW": "台積電",
-        "2317.TW": "鴻海",
-        "2454.TW": "聯發科",
-        "2308.TW": "台達電",
-        "2382.TW": "廣達"
-    }
-    
-    save_dir = Path(f"./data/{market_id}/dayK")
-    save_dir.mkdir(parents=True, exist_ok=True)
-    
-    print(f"📥 開始下載 {market_id} 數據...")
-    for symbol, name in tqdm(tickers.items()):
-        try:
-            df = yf.download(symbol, period="2y", interval="1d", progress=False)
-            if not df.empty:
-                # 💡 關鍵：存成 "代號_名稱.csv"，例如 "2330.TW_台積電.csv"
-                df.to_csv(save_dir / f"{symbol}_{name}.csv")
-        except Exception as e:
-            print(f"❌ {symbol} 下載失敗: {e}")
+on:
+  schedule:
+    # 每個工作日台灣時間下午 6:30 執行 (UTC 10:30)
+    - cron: '30 10 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      market_choice:
+        description: '選擇要執行的市場 (Select Market)'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - tw-share
+          - us-share
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--market', required=True)
-    args = parser.parse_args()
-    download_tw_data(args.market)
-    print("✅ 台股數據下載完成。")
+jobs:
+  global-market-analysis:
+    name: ${{ matrix.market.emoji }} ${{ matrix.market.name }} 分析
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        market:
+          # suffix 必須對應你的檔名：downloader_tw.py / downloader_us.py
+          - { id: "tw-share", name: "Taiwan", emoji: "🇹🇼", suffix: "tw" }
+          - { id: "us-share", name: "US",     emoji: "🇺🇸", suffix: "us" }
+
+    steps:
+      - name: 檢出代碼 (Checkout Code)
+        uses: actions/checkout@v4
+
+      - name: 設定 Python 環境 (Set up Python)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: 安裝必要套件 (Environment Setup)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fonts-noto-cjk
+          python -m pip install --upgrade pip
+          # 一次性安裝所有數據分析與發信用套件
+          pip install pandas yfinance requests lxml tqdm resend matplotlib numpy openai
+
+      - name: 執行下載、分析與發信 (Download & Run)
+        # 邏輯：只有在排程觸發、全選、或選中特定市場時才執行
+        if: |
+          github.event_name == 'schedule' || 
+          github.event.inputs.market_choice == 'all' || 
+          github.event.inputs.market_choice == matrix.market.id
+        env:
+          # 這裡必須對應 GitHub Settings > Secrets 裡的名稱
+          EMAIL_USER: ${{ secrets.EMAIL_USER }}   # 你的收件 Gmail
+          EMAIL_PASS: ${{ secrets.EMAIL_PASS }}   # Resend 的 re_ 開頭 API Key
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          # 1. 下載數據 (補上 --market 參數，確保 downloader 知道要存到哪)
+          echo "📥 正在下載 ${{ matrix.market.name }} 數據..."
+          python "downloader_${{ matrix.market.suffix }}.py" --market ${{ matrix.market.id }}
+          
+          # 2. 執行分析並發信 (這裡會去 data/${{ matrix.market.id }}/dayK 找 CSV)
+          echo "📊 正在分析 ${{ matrix.market.name }} 並發送郵件..."
+          python main.py --market ${{ matrix.market.id }}
+
+      - name: 上傳分析數據 (選填：除錯用)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: market-data-${{ matrix.market.id }}
+          path: data/${{ matrix.market.id }}/dayK/*.csv
+          retention-days: 1
