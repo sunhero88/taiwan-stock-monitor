@@ -2,7 +2,6 @@ name: Global Market Monitor Parallel
 
 on:
   schedule:
-    # 每個工作日台灣時間下午 6:30 執行 (UTC 10:30)
     - cron: '30 10 * * 1-5'
   workflow_dispatch:
     inputs:
@@ -53,22 +52,19 @@ jobs:
           pip install pandas yfinance requests lxml tqdm resend matplotlib numpy xlrd pykrx tokyo-stock-exchange akshare openai
 
       - name: Download and Run Market Analysis
-        # 只有在手動選擇該市場或選擇 'all' 時才會執行
         if: |
           github.event_name == 'schedule' || 
           github.event.inputs.market_choice == 'all' || 
           github.event.inputs.market_choice == matrix.market.id
         env:
-          # 對接 GitHub Secrets 讓 Python 能讀取 API Key 與收件信箱
           EMAIL_USER: ${{ secrets.EMAIL_USER }}
           EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
-          # 1. 先執行下載器，確保 data 資料夾內有 CSV 檔案
-          # 檔案名稱會自動對應，例如：downloader_tw.py
+          # 1. 執行下載器並補上必要的 --market 參數
           echo "🚀 Starting data download for ${{ matrix.market.name }}..."
-          python "downloader_${{ matrix.market.suffix }}.py"
+          python "downloader_${{ matrix.market.suffix }}.py" --market ${{ matrix.market.id }}
           
-          # 2. 執行主分析程式並發送郵件
+          # 2. 執行分析與發信
           echo "📊 Running analysis and sending report..."
           python main.py --market ${{ matrix.market.id }}
