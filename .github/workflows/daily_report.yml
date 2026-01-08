@@ -35,50 +35,26 @@ jobs:
           - { id: "kr-share", name: "Korea",  emoji: "🇰🇷" }
 
     steps:
-      - name: Check if market should run
-        id: check_run
-        run: |
-          echo "Checking if ${{ matrix.market.id }} should run..."
-        if: |
-          github.event_name == 'schedule' || 
-          github.event.inputs.market_choice == 'all' || 
-          github.event.inputs.market_choice == matrix.market.id
-
       - name: Checkout Code
-        if: steps.check_run.outcome == 'success'
         uses: actions/checkout@v4
 
       - name: Set up Python
-        if: steps.check_run.outcome == 'success'
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
           cache: 'pip'
 
-      - name: Cache Stock Data
-        if: steps.check_run.outcome == 'success'
-        uses: actions/cache@v4
-        with:
-          path: |
-            data/${{ matrix.market.id }}/dayK
-            data/${{ matrix.market.id }}/lists
-          key: ${{ runner.os }}-stock-${{ matrix.market.id }}-${{ github.run_id }}
-          restore-keys: |
-            ${{ runner.os }}-stock-${{ matrix.market.id }}-
-
       - name: Environment Setup
-        if: steps.check_run.outcome == 'success'
         run: |
           sudo apt-get update
           sudo apt-get install -y fonts-noto-cjk
           python -m pip install --upgrade pip
-          # 💡 關鍵變更 1：在安裝清單最後加入 openai 套件
           pip install pandas yfinance requests lxml tqdm resend matplotlib numpy xlrd pykrx tokyo-stock-exchange akshare openai
 
       - name: Run Market Analysis
-        if: steps.check_run.outcome == 'success'
         env:
-          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
-          # 💡 關鍵變更 2：將你在 Secrets 設定的 OpenAI 金鑰傳遞給 Python
+          # 💡 這裡必須對應 main.py 讀取的變數名稱
+          EMAIL_USER: ${{ secrets.EMAIL_USER }}   # 收件人 Gmail
+          EMAIL_PASS: ${{ secrets.EMAIL_PASS }}   # Resend API Key (re_...)
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: python main.py --market ${{ matrix.market.id }}
