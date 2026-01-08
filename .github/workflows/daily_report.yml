@@ -1,57 +1,35 @@
-name: Global Market Monitor Parallel
+# -*- coding: utf-8 -*-
+import argparse
+import yfinance as yf
+from pathlib import Path
+from tqdm import tqdm
 
-on:
-  schedule:
-    - cron: '30 10 * * 1-5'
-  workflow_dispatch:
-    inputs:
-      market_choice:
-        description: 'Select Market'
-        required: true
-        default: 'all'
-        type: choice
-        options: [all, tw-share, us-share]
+def download_tw_data(market_id):
+    # 定義台股監控清單 (格式: 代號: 名稱)
+    tickers = {
+        "2330.TW": "台積電",
+        "2317.TW": "鴻海",
+        "2454.TW": "聯發科",
+        "2308.TW": "台達電",
+        "2382.TW": "廣達"
+    }
+    
+    save_dir = Path(f"./data/{market_id}/dayK")
+    save_dir.mkdir(parents=True, exist_ok=True)
+    
+    print(f"📥 開始下載 {market_id} 數據...")
+    for symbol, name in tqdm(tickers.items()):
+        try:
+            df = yf.download(symbol, period="2y", interval="1d", progress=False)
+            if not df.empty:
+                # 💡 關鍵：存成 "代號_名稱.csv"，例如 "2330.TW_台積電.csv"
+                df.to_csv(save_dir / f"{symbol}_{name}.csv")
+        except Exception as e:
+            print(f"❌ {symbol} 下載失敗: {e}")
 
-jobs:
-  global-market-analysis:
-    name: ${{ matrix.market.emoji }} ${{ matrix.market.name }} Analysis
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        market:
-          - { id: "tw-share", name: "Taiwan", emoji: "🇹🇼", suffix: "tw" }
-          - { id: "us-share", name: "US",     emoji: "🇺🇸", suffix: "us" }
-
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-          cache: 'pip'
-
-      - name: Environment Setup
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y fonts-noto-cjk
-          python -m pip install --upgrade pip
-          pip install pandas yfinance requests lxml tqdm resend matplotlib numpy openai
-
-      - name: Download and Run Market Analysis
-        if: |
-          github.event_name == 'schedule' || 
-          github.event.inputs.market_choice == 'all' || 
-          github.event.inputs.market_choice == matrix.market.id
-        env:
-          EMAIL_USER: ${{ secrets.EMAIL_USER }}   # 收件 Gmail
-          EMAIL_PASS: ${{ secrets.EMAIL_PASS }}   # Resend API Key (re_...)
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-        run: |
-          # 1. 執行對應市場的下載器
-          python "downloader_${{ matrix.market.suffix }}.py" --market ${{ matrix.market.id }}
-          
-          # 2. 執行分析與發信
-          python main.py --market ${{ matrix.market.id }}
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--market', required=True)
+    args = parser.parse_args()
+    download_tw_data(args.market)
+    print("✅ 台股數據下載完成。")
