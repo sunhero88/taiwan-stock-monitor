@@ -1,7 +1,7 @@
 name: Global Market Monitor Parallel
 
 on:
-  workflow_dispatch: # 手動觸發測試
+  workflow_dispatch: # 手動觸發
   schedule:
     - cron: '30 8 * * *' # 每日台北時間 16:30 執行
 
@@ -25,7 +25,7 @@ jobs:
         uses: actions/checkout@v3
 
       - name: Set up Python
-        uses: actions/setup-python@v4 # 修正: 使用 setup-python 確保環境獨立
+        uses: actions/setup-python@v4
         with:
           python-version: '3.10'
 
@@ -43,12 +43,12 @@ jobs:
           pip install pandas numpy requests yfinance matplotlib tqdm akshare resend openai
 
       - name: Run Market Analysis
-        # 💡 將 Secret 正確注入環境變數，名稱須與 main.py 一致
+        # 💡 這裡將 Secrets 注入環境變數，名稱必須與 notifier.py 一致
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
           REPORT_RECEIVER_EMAIL: ${{ secrets.REPORT_RECEIVER_EMAIL }}
-        # 💡 簡化指令：讓 main.py 內部處理模組導入與數據下載
+        # 💡 核心修正：只執行 main.py，讓它內部的 importlib 去啟動下載器
         run: python main.py --market ${{ matrix.market.id }}
 
       - name: Post Cache Stock Data
