@@ -1,9 +1,9 @@
 name: Global Market Monitor Parallel
 
 on:
-  workflow_dispatch: # 手動觸發
+  workflow_dispatch:
   schedule:
-    - cron: '30 8 * * *' # 每日台北時間 16:30 執行
+    - cron: '30 8 * * *'
 
 jobs:
   global-market-analysis:
@@ -43,12 +43,10 @@ jobs:
           pip install pandas numpy requests yfinance matplotlib tqdm akshare resend openai
 
       - name: Run Market Analysis
-        # 💡 這裡將 Secrets 正確對接到程式碼讀取的變數名稱
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
           REPORT_RECEIVER_EMAIL: ${{ secrets.REPORT_RECEIVER_EMAIL }}
-        # 💡 簡化執行指令：讓 main.py 內部處理下載與分析
         run: python main.py --market ${{ matrix.market.id }}
 
       - name: Post Cache Stock Data
