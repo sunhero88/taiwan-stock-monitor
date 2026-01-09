@@ -2,6 +2,7 @@ import os
 import argparse
 import importlib
 import subprocess
+from pathlib import Path
 from openai import OpenAI
 
 def get_ai_analysis(market_name, text_reports):
@@ -26,13 +27,16 @@ def main():
     args = parser.parse_args()
     market_id = args.market
 
-    # 1. 執行數據下載 (修正參數傳遞問題)
+    # 💡 強制建立資料夾，確保下載與分析的路徑一致
+    Path(f"data/{market_id}/dayK").mkdir(parents=True, exist_ok=True)
+
+    # 1. 執行數據下載
     module_prefix = market_id.split('-')[0]
     module_name = f"downloader_{module_prefix}"
     print(f"📡 正在準備下載 {market_id} 數據...")
     
     try:
-        # 強制使用 subprocess 傳遞 --market 參數，解決 downloader_tw.py 的參數要求
+        # 使用 subprocess 並傳遞市場參數
         subprocess.run(["python", f"{module_name}.py", "--market", market_id], check=True)
         print(f"✅ {market_id} 數據下載成功")
     except Exception as e:
@@ -41,10 +45,13 @@ def main():
     # 2. 執行分析器
     try:
         import analyzer
+        print(f"📊 正在啟動 {market_id.upper()} 深度矩陣分析...")
+        # 調用分析器入口
         images, df_res, text_reports = analyzer.run(market_id)
         
-        if df_res is None or df_res.empty:
-            print(f"⚠️ {market_id} 分析數據為空，無法產出報告。")
+        # 檢查數據內容
+        if df_res is None or (hasattr(df_res, 'empty') and df_res.empty):
+            print(f"⚠️ {market_id} 分析數據為空，請檢查 data/{market_id}/dayK 是否有 CSV 檔案。")
             return
 
         # 3. 獲取 AI 分析
