@@ -35,6 +35,7 @@ jobs:
           pip install pandas numpy requests yfinance matplotlib tqdm akshare resend openai
 
       - name: Run Market Analysis
+        # 💡 將 Secret 對接到程式碼讀取的名稱
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
