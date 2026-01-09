@@ -21,9 +21,9 @@ def get_ai_analysis(market_name, text_reports):
         )
         return response.choices[0].message.content
     except Exception as e:
-        # 💡 針對額度用盡提供友善提示
+        # 💡 針對 image_f1b064.png 顯示的 Quota Exceeded 提供友善提示
         if "insufficient_quota" in str(e):
-            return "（AI 分析失敗：OpenAI API 額度已用盡，請檢查帳單設定）"
+            return "（AI 分析失敗：OpenAI API 額度已用盡，請至 OpenAI 官網充值）"
         return f"（AI 分析失敗: {e}）"
 
 def main():
@@ -42,7 +42,7 @@ def main():
     print(f"📡 正在準備下載 {market_id} 數據...")
     
     try:
-        # 使用 subprocess 並傳遞市場參數，確保執行環境獨立
+        # 使用 subprocess 並傳遞參數，確保 downloader_tw.py 獲得 --market
         subprocess.run(["python", f"{module_name}.py", "--market", market_id], check=True)
         print(f"✅ {market_id} 數據下載成功")
     except Exception as e:
@@ -52,13 +52,13 @@ def main():
     try:
         import analyzer
         print(f"📊 正在啟動 {market_id.upper()} 深度矩陣分析...")
-        # 調用分析器入口，回傳 (images, df_res, text_reports)
+        # 調用分析器入口
         images, df_res, text_reports = analyzer.run(market_id)
         
-        # 檢查數據內容是否真的存在
+        # 💡 檢查 CSV 檔案是否真的存在，解決 image_f36e9e.png 的空數據問題
         csv_count = len(list(base_data_path.glob("*.csv")))
         if csv_count == 0:
-            print(f"❌ 嚴重錯誤：data/{market_id}/dayK 目錄內沒有 CSV 檔案，請檢查下載器。")
+            print(f"❌ 錯誤：{base_data_path} 目錄內找不到 CSV 數據。")
             return
 
         if df_res is None or (hasattr(df_res, 'empty') and df_res.empty):
@@ -78,10 +78,10 @@ def main():
             report_df=df_res,
             text_reports=text_reports
         )
-        print(f"✅ {market_id} 監控報告處理完成，郵件已寄送！")
+        print(f"✅ {market_id} 任務完成，郵件已寄送！")
         
     except Exception as e:
-        print(f"❌ 分析或寄送過程發生錯誤: {e}")
+        print(f"❌ 分析或通知過程發生錯誤: {e}")
 
 if __name__ == "__main__":
     main()
