@@ -1,6 +1,5 @@
 import os
 import argparse
-import importlib
 import subprocess
 from pathlib import Path
 from openai import OpenAI
@@ -9,10 +8,7 @@ def get_ai_analysis(market_name, text_reports):
     """呼叫 OpenAI API 產出分析報告"""
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key: return "（未提供 AI 分析報告：找不到金鑰）"
-    
-    # 組合文字摘要給 AI 參考
     summary = "\n".join([f"[{k}]\n{v[:500]}" for k, v in text_reports.items()])
-    
     try:
         client = OpenAI(api_key=api_key)
         response = client.chat.completions.create(
@@ -21,9 +17,8 @@ def get_ai_analysis(market_name, text_reports):
         )
         return response.choices[0].message.content
     except Exception as e:
-        # 💡 針對 image_f1b064.png 顯示的 Quota Exceeded 提供友善提示
         if "insufficient_quota" in str(e):
-            return "（AI 分析失敗：OpenAI API 額度已用盡，請至 OpenAI 官網充值）"
+            return "（AI 分析失敗：OpenAI API 額度已用盡，請至官網充值）"
         return f"（AI 分析失敗: {e}）"
 
 def main():
@@ -32,56 +27,46 @@ def main():
     args = parser.parse_args()
     market_id = args.market
 
-    # 💡 強制建立資料夾，確保下載與分析的路徑一致
-    base_data_path = Path("data") / market_id / "dayK"
-    base_data_path.mkdir(parents=True, exist_ok=True)
+    # 💡 關鍵修復：手動建立絕對路徑資料夾
+    work_dir = Path(__file__).parent.absolute()
+    data_path = work_dir / "data" / market_id / "dayK"
+    data_path.mkdir(parents=True, exist_ok=True)
 
-    # 1. 執行數據下載
+    # 1. 執行下載 (確保傳遞絕對路徑作為參數，如果下載器支援)
     module_prefix = market_id.split('-')[0]
     module_name = f"downloader_{module_prefix}"
-    print(f"📡 正在準備下載 {market_id} 數據...")
+    print(f"📡 啟動下載器: {module_name}.py")
     
     try:
-        # 使用 subprocess 並傳遞參數，確保 downloader_tw.py 獲得 --market
-        subprocess.run(["python", f"{module_name}.py", "--market", market_id], check=True)
-        print(f"✅ {market_id} 數據下載成功")
+        # 強制在根目錄執行下載腳本
+        subprocess.run(["python", f"{module_name}.py", "--market", market_id], cwd=work_dir, check=True)
     except Exception as e:
-        print(f"⚠️ 下載階段警告: {e}")
+        print(f"⚠️ 下載警告: {e}")
 
-    # 2. 執行分析器
+    # 2. 執行分析
     try:
         import analyzer
-        print(f"📊 正在啟動 {market_id.upper()} 深度矩陣分析...")
-        # 調用分析器入口
+        # 💡 在分析前列印路徑內容，確認檔案真的在那裡
+        files = list(data_path.glob("*.csv"))
+        print(f"🔍 路徑檢查: {data_path} 內有 {len(files)} 個檔案")
+        
         images, df_res, text_reports = analyzer.run(market_id)
         
-        # 💡 檢查 CSV 檔案是否真的存在，解決 image_f36e9e.png 的空數據問題
-        csv_count = len(list(base_data_path.glob("*.csv")))
-        if csv_count == 0:
-            print(f"❌ 錯誤：{base_data_path} 目錄內找不到 CSV 數據。")
-            return
-
         if df_res is None or (hasattr(df_res, 'empty') and df_res.empty):
-            print(f"⚠️ {market_id} 分析數據為空，無法產出報告。")
+            print(f"❌ 警告: 即使下載成功，分析器仍讀取不到數據。")
             return
 
-        # 3. 獲取 AI 分析並塞入報告
+        # 3. AI 與發信
         ai_result = get_ai_analysis(market_id, text_reports)
         text_reports["🤖 AI 智能分析報告"] = ai_result
 
-        # 4. 發送郵件 (對接 StockNotifier)
         from notifier import StockNotifier
         notifier_inst = StockNotifier()
-        notifier_inst.send_stock_report(
-            market_name=market_id.upper(),
-            img_data=images,
-            report_df=df_res,
-            text_reports=text_reports
-        )
-        print(f"✅ {market_id} 任務完成，郵件已寄送！")
+        notifier_inst.send_stock_report(market_id.upper(), images, df_res, text_reports)
+        print(f"✅ {market_id} 任務全線完成！")
         
     except Exception as e:
-        print(f"❌ 分析或通知過程發生錯誤: {e}")
+        print(f"❌ 發生錯誤: {e}")
 
 if __name__ == "__main__":
     main()
