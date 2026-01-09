@@ -1,56 +1,58 @@
 name: Global Market Monitor Parallel
 
 on:
+  workflow_dispatch: # 手動觸發
   schedule:
-    - cron: '30 10 * * 1-5'
-  workflow_dispatch:
-    inputs:
-      market_choice:
-        description: '選擇市場'
-        required: true
-        default: 'all'
-        type: choice
-        options: [all, tw-share, us-share]
+    - cron: '30 8 * * *' # 每日 UTC 08:30 (台北時間 16:30)
 
 jobs:
   global-market-analysis:
-    name: ${{ matrix.market.emoji }} ${{ matrix.market.name }} Analysis
+    name: ${{ matrix.market.name }} Analysis
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         market:
-          - { id: "tw-share", name: "Taiwan", emoji: "🇹🇼", suffix: "tw" }
-          - { id: "us-share", name: "US",     emoji: "🇺🇸", suffix: "us" }
+          - { id: 'tw-share', name: 'TW Taiwan' }
+          - { id: 'us-share', name: 'US US' }
+          - { id: 'hk-share', name: 'HK HK' }
+          - { id: 'cn-share', name: 'CN China' }
+          - { id: 'jp-share', name: 'JP Japan' }
+          - { id: 'kr-share', name: 'KR Korea' }
 
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v3
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/checkout@v3
         with:
           python-version: '3.10'
-          cache: 'pip'
+
+      - name: Cache Stock Data
+        uses: actions/cache@v3
+        with:
+          path: data/${{ matrix.market.id }}/dayK
+          key: stock-data-${{ matrix.market.id }}-${{ github.run_id }}
+          restore-keys: |
+            stock-data-${{ matrix.market.id }}-
 
       - name: Environment Setup
         run: |
           python -m pip install --upgrade pip
-          pip install pandas yfinance requests lxml tqdm resend matplotlib numpy openai
+          pip install pandas numpy requests yfinance matplotlib tqdm akshare resend openai
 
-      - name: Download and Run Market Analysis
-        if: |
-          github.event_name == 'schedule' || 
-          github.event.inputs.market_choice == 'all' || 
-          github.event.inputs.market_choice == matrix.market.id
+      - name: Run Market Analysis
+        # 💡 這裡將 GitHub Secrets 注入為環境變數，讓程式抓得到金鑰
         env:
-          # 💡 確認 GitHub Secrets 裡的名稱與這裡一致
-          EMAIL_USER: ${{ secrets.EMAIL_USER }}   
-          EMAIL_PASS: ${{ secrets.EMAIL_PASS }}   # 這裡應為 re_ 開頭的 Resend Key
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-        run: |
-          # 1. 下載 (會執行 downloader_tw.py 或 downloader_us.py)
-          python "downloader_${{ matrix.market.suffix }}.py" --market ${{ matrix.market.id }}
-          
-          # 2. 分析與發信 (會讀取剛下載好的 CSV)
-          python main.py --market ${{ matrix.market.id }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          REPORT_RECEIVER_EMAIL: ${{ secrets.REPORT_RECEIVER_EMAIL }}
+        run: python main.py --market ${{ matrix.market.id }}
+
+      - name: Post Cache Stock Data
+        if: always()
+        uses: actions/cache/save@v3
+        with:
+          path: data/${{ matrix.market.id }}/dayK
+          key: stock-data-${{ matrix.market.id }}-${{ github.run_id }}
