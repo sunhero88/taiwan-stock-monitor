@@ -21,9 +21,9 @@ def get_ai_analysis(market_name, text_reports):
         )
         return response.choices[0].message.content
     except Exception as e:
-        # 針對額度用盡提供友善提示
+        # 💡 針對 image_f1b064.png 顯示的 Quota Exceeded 提供友善提示
         if "insufficient_quota" in str(e):
-            return "（AI 分析失敗：OpenAI API 額度已用盡，請檢查帳單設定）"
+            return "（AI 分析失敗：OpenAI API 額度已用盡，請至 OpenAI 官網充值）"
         return f"（AI 分析失敗: {e}）"
 
 def main():
@@ -32,7 +32,7 @@ def main():
     args = parser.parse_args()
     market_id = args.market
 
-    # 💡 強制建立資料夾，確保下載與分析的路徑一致
+    # 💡 關鍵路徑設定：確保 data/tw-share/dayK 存在
     base_data_path = Path("data") / market_id / "dayK"
     base_data_path.mkdir(parents=True, exist_ok=True)
 
@@ -55,17 +55,17 @@ def main():
         # 調用分析器入口，回傳 (images, df_res, text_reports)
         images, df_res, text_reports = analyzer.run(market_id)
         
-        # 檢查數據內容是否真的存在
+        # 💡 檢查 CSV 檔案是否真的存在，解決 image_f36e9e.png 的空數據問題
         csv_count = len(list(base_data_path.glob("*.csv")))
         if csv_count == 0:
-            print(f"❌ 嚴重錯誤：data/{market_id}/dayK 目錄內沒有 CSV 檔案，請檢查下載器。")
+            print(f"❌ 錯誤：{base_data_path} 目錄內找不到 CSV，請確認 downloader_tw.py 的存檔路徑。")
             return
 
         if df_res is None or (hasattr(df_res, 'empty') and df_res.empty):
             print(f"⚠️ {market_id} 分析數據為空，無法產出報告。")
             return
 
-        # 3. 獲取 AI 分析並塞入報告
+        # 3. 獲取 AI 分析
         ai_result = get_ai_analysis(market_id, text_reports)
         text_reports["🤖 AI 智能分析報告"] = ai_result
 
@@ -78,7 +78,7 @@ def main():
             report_df=df_res,
             text_reports=text_reports
         )
-        print(f"✅ {market_id} 監控報告處理完成，郵件已寄送！")
+        print(f"✅ {market_id} 監控報告處理完成，郵件已發送！")
         
     except Exception as e:
         print(f"❌ 分析或寄送過程發生錯誤: {e}")
