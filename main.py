@@ -26,35 +26,32 @@ def main():
     args = parser.parse_args()
     market_id = args.market
 
-    # 1. 執行下載 (修正 AttributeError)
-    module_name = f"downloader_{market_id.split('-')[0]}"
+    # 1. 執行數據下載 (修正參數傳遞問題)
+    module_prefix = market_id.split('-')[0]
+    module_name = f"downloader_{module_prefix}"
+    print(f"📡 正在準備下載 {market_id} 數據...")
+    
     try:
-        print(f"📡 正在啟動下載模組: {module_name}")
-        # 嘗試導入並尋找 main()，若失敗則直接用系統指令執行檔案
-        try:
-            mod = importlib.import_module(module_name)
-            if hasattr(mod, 'main'):
-                mod.main()
-            else:
-                subprocess.run(["python", f"{module_name}.py"], check=True)
-        except:
-            subprocess.run(["python", f"{module_name}.py"], check=True)
+        # 強制使用 subprocess 傳遞 --market 參數，解決 downloader_tw.py 的參數要求
+        subprocess.run(["python", f"{module_name}.py", "--market", market_id], check=True)
+        print(f"✅ {market_id} 數據下載成功")
     except Exception as e:
         print(f"⚠️ 下載階段警告: {e}")
 
-    # 2. 執行分析
+    # 2. 執行分析器
     try:
         import analyzer
         images, df_res, text_reports = analyzer.run(market_id)
-        if df_res.empty:
-            print("⚠️ 分析數據為空，無法產出報告。")
+        
+        if df_res is None or df_res.empty:
+            print(f"⚠️ {market_id} 分析數據為空，無法產出報告。")
             return
 
         # 3. 獲取 AI 分析
-        ai_report = get_ai_analysis(market_id, text_reports)
-        text_reports["🤖 AI 智能分析報告"] = ai_report
+        ai_result = get_ai_analysis(market_id, text_reports)
+        text_reports["🤖 AI 智能分析報告"] = ai_result
 
-        # 4. 發信 (對接 StockNotifier)
+        # 4. 發送郵件 (對接 StockNotifier)
         from notifier import StockNotifier
         notifier_inst = StockNotifier()
         notifier_inst.send_stock_report(
@@ -63,9 +60,10 @@ def main():
             report_df=df_res,
             text_reports=text_reports
         )
-        print(f"✅ {market_id} 任務全線完成！")
+        print(f"✅ {market_id} 監控報告處理完成！")
+        
     except Exception as e:
-        print(f"❌ 分析或通知失敗: {e}")
+        print(f"❌ 分析或寄送過程發生錯誤: {e}")
 
 if __name__ == "__main__":
     main()
