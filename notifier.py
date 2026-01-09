@@ -25,7 +25,6 @@ class StockNotifier:
         if not self.tg_token or not self.tg_chat_id:
             return False
         
-        # 取得簡短時間戳
         ts = self.get_now_time_str().split(" ")[1]
         full_message = f"{message}\n\n🕒 <i>Sent at {ts} (UTC+8)</i>"
         
@@ -44,11 +43,9 @@ class StockNotifier:
 
     def send_stock_report(self, market_name, img_data, report_df, text_reports, stats=None):
         """
-        🚀 專業版更新：整合智慧下載統計、六國專業平台跳轉
-        支援：將下載器 (Downloader) 的統計結果完美呈現於 HTML 報表頂端
+        🚀 專業版更新：整合 AI 智能分析區塊與下載統計
         """
-        # 🟢 Debug 訊息：方便在終端機確認 main.py 傳進來的數值
-        print(f"DEBUG: notifier 正在處理 {market_name} 報告 (Stats: {stats})")
+        print(f"DEBUG: notifier 正在處理 {market_name} 報告 (包含 AI 內容檢索)")
 
         if not self.resend_api_key:
             print("⚠️ 缺少 Resend API Key，無法寄信。")
@@ -56,40 +53,33 @@ class StockNotifier:
 
         report_time = self.get_now_time_str()
         
-        # --- 1. 處理下載統計數據 (防止 0 或 None 導致報表崩潰) ---
-        if stats is None:
-            stats = {}
-
-        # 應收標的：優先從 stats 拿，拿不到就看 report_df
+        # --- 1. 處理下載統計數據 ---
+        if stats is None: stats = {}
         total_count = stats.get('total', len(report_df))
-        # 成功家數
         success_count = stats.get('success', len(report_df))
         
-        # 計算今日覆蓋率 (百分比)
         try:
-            total_val = int(total_count)
-            success_val = int(success_count)
-            if total_val > 0:
-                success_rate = f"{(success_val / total_val) * 100:.1f}%"
+            if int(total_count) > 0:
+                success_rate = f"{(int(success_count) / int(total_count)) * 100:.1f}%"
             else:
-                success_rate = "0.0% (清單獲取異常)"
+                success_rate = "0.0%"
         except:
             success_rate = "N/A"
 
         # --- 💡 智慧匹配平台跳轉連結 ---
         m_id = market_name.lower()
-        if "us" in m_id or "美國" in market_name:
-            p_name, p_url = "StockCharts", "https://stockcharts.com/"
-        elif "hk" in m_id or "香港" in market_name:
-            p_name, p_url = "AASTOCKS 阿思達克", "http://www.aastocks.com/"
-        elif "cn" in m_id or "中國" in market_name:
-            p_name, p_url = "東方財富網 (EastMoney)", "https://www.eastmoney.com/"
-        elif "jp" in m_id or "日本" in market_name:
-            p_name, p_url = "樂天證券 (Rakuten)", "https://www.rakuten-sec.co.jp/"
-        elif "kr" in m_id or "韓國" in market_name:
-            p_name, p_url = "Naver Finance", "https://finance.naver.com/"
-        else:
-            p_name, p_url = "玩股網 (WantGoo)", "https://www.wantgoo.com/"
+        platforms = {
+            "us": ("StockCharts", "https://stockcharts.com/"),
+            "hk": ("AASTOCKS 阿思達克", "http://www.aastocks.com/"),
+            "cn": ("東方財富網 (EastMoney)", "https://www.eastmoney.com/"),
+            "jp": ("樂天證券 (Rakuten)", "https://www.rakuten-sec.co.jp/"),
+            "kr": ("Naver Finance", "https://finance.naver.com/")
+        }
+        p_name, p_url = ("玩股網 (WantGoo)", "https://www.wantgoo.com/")
+        for k, v in platforms.items():
+            if k in m_id:
+                p_name, p_url = v
+                break
 
         # --- 2. 構建 HTML 內容 ---
         html_content = f"""
@@ -105,7 +95,7 @@ class StockNotifier:
                         <div style="font-size: 18px; font-weight: bold;">{total_count}</div>
                     </div>
                     <div style="flex: 1; border-left: 1px solid #eee; border-right: 1px solid #eee;">
-                        <div style="font-size: 12px; color: #888;">更新成功(含快取)</div>
+                        <div style="font-size: 12px; color: #888;">更新成功</div>
                         <div style="font-size: 18px; font-weight: bold; color: #28a745;">{success_count}</div>
                     </div>
                     <div style="flex: 1;">
@@ -113,15 +103,22 @@ class StockNotifier:
                         <div style="font-size: 18px; font-weight: bold; color: #1a73e8;">{success_rate}</div>
                     </div>
                 </div>
+        """
 
+        # --- 💡 核心新增：AI 專業分析區塊 ---
+        ai_report = text_reports.get("🤖 AI 智能分析報告", "（系統分析中，請稍候...）")
+        html_content += f"""
+                <div style="margin: 25px 0; padding: 20px; background-color: #e3f2fd; border-left: 8px solid #1a73e8; border-radius: 6px;">
+                    <h3 style="margin-top: 0; color: #0d47a1; font-size: 18px;">🤖 AI 專業盤勢分析</h3>
+                    <div style="font-size: 15px; color: #1565c0; white-space: pre-wrap; line-height: 1.8;">{ai_report}</div>
+                </div>
+                
                 <p style="background-color: #fff9db; padding: 12px; border-left: 4px solid #fcc419; font-size: 14px; color: #666; margin: 20px 0;">
-                    💡 <b>提示：</b>下方的數據報表若包含股票代號，可至  
-                    <a href="{p_url}" target="_blank" style="color: #e67e22; text-decoration: none; font-weight: bold;">{p_name}</a> 
-                    查看該市場之即時技術線圖。
+                    💡 <b>提示：</b>下方的數據報表可配合 <a href="{p_url}" target="_blank" style="color: #e67e22; text-decoration: none; font-weight: bold;">{p_name}</a> 查看。
                 </p>
         """
 
-        # --- 3. 插入九張分析矩陣圖表 ---
+        # --- 3. 插入分析矩陣圖表 ---
         html_content += "<div style='margin-top: 30px;'>"
         for img in img_data:
             html_content += f"""
@@ -135,25 +132,26 @@ class StockNotifier:
         # --- 4. 插入文字報酬分布明細 ---
         html_content += "<div style='margin-top: 20px;'>"
         for period, report in text_reports.items():
+            if "AI" in period: continue # 跳過 AI 文字，因為上面已經印過了
             p_name_zh = {"Week": "週", "Month": "月", "Year": "年"}.get(period, period)
             html_content += f"""
             <div style="margin-bottom: 20px;">
-                <h4 style="color: #16a085; margin-bottom: 8px;">📊 {p_name_zh} K線 最高-進攻 報酬分布明細</h4>
+                <h4 style="color: #16a085; margin-bottom: 8px;">📊 {p_name_zh} K線 報酬分布明細</h4>
                 <pre style="background-color: #2d3436; color: #dfe6e9; padding: 15px; border-radius: 5px; font-size: 12px; white-space: pre-wrap; font-family: 'Courier New', monospace;">{report}</pre>
             </div>
             """
         html_content += "</div>"
 
         html_content += """
-                <p style="margin-top: 40px; font-size: 11px; color: #999; text-align: center; border-top: 1px solid #eee; padding-top: 20px;">
-                    此郵件由 Global Stock Monitor 系統自動發送。數據僅供參考，不構成投資建議。
-                </p>
-            </div>
-        </body>
-        </html>
+                    <p style="margin-top: 40px; font-size: 11px; color: #999; text-align: center; border-top: 1px solid #eee; padding-top: 20px;">
+                        此郵件由 Global Stock Monitor 系統自動發送。數據僅供參考。
+                    </p>
+                </div>
+            </body>
+            </html>
         """
 
-        # --- 5. 處理附件 (Inline Embedding) ---
+        # --- 5. 處理附件 ---
         attachments = []
         for img in img_data:
             try:
@@ -165,29 +163,24 @@ class StockNotifier:
                             "content_id": img['id'],
                             "disposition": "inline"
                         })
-                else:
-                    print(f"⚠️ 圖表檔案不存在: {img['path']}")
             except Exception as e:
-                print(f"⚠️ 處理圖表附件失敗 {img['id']}: {e}")
+                print(f"⚠️ 圖表處理失敗 {img['id']}: {e}")
 
-        # --- 6. 寄送 Resend 郵件（已修改）---
+        # --- 6. 寄送 Resend 郵件 ---
         try:
-            # 優先讀取 GitHub Secret 中的收件人，若無則直接用你的 Gmail
             receiver_email = os.getenv("REPORT_RECEIVER_EMAIL", "sunhero88@gmail.com")
-
             resend.Emails.send({
-                "from": "StockMonitor <report@twstock.cc>",  # 使用你的自訂域名發信
-                "to": receiver_email,                        # 只寄給你
+                "from": "StockMonitor <report@twstock.cc>",
+                "to": receiver_email,
                 "subject": f"🚀 {market_name} 全方位監控報告 - {report_time.split(' ')[0]}",
                 "html": html_content,
                 "attachments": attachments
             })
-            print(f"✅ {market_name} 郵件報告已寄送給 {receiver_email}！")
+            print(f"✅ {market_name} 郵件報告已寄送！")
             
             # --- 7. 發送 Telegram 簡報 ---
-            tg_msg = f"📊 <b>{market_name} 監控報表已送達</b>\n收件人: {receiver_email}\n涵蓋率: {success_rate}\n處理樣本: {success_count} 檔"
+            tg_msg = f"📊 <b>{market_name} 監控報表已送達</b>\n涵蓋率: {success_rate}\n樣本數: {success_count} 檔"
             self.send_telegram(tg_msg)
-            
             return True
         except Exception as e:
             print(f"❌ 寄送失敗: {e}")
