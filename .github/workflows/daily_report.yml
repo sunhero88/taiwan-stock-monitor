@@ -43,12 +43,12 @@ jobs:
           pip install pandas numpy requests yfinance matplotlib tqdm akshare resend openai
 
       - name: Run Market Analysis
-        # 💡 這裡將 Secrets 注入環境變數，名稱必須與 notifier.py 一致
+        # 💡 這裡將 Secrets 正確對接到程式碼讀取的變數名稱
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
           REPORT_RECEIVER_EMAIL: ${{ secrets.REPORT_RECEIVER_EMAIL }}
-        # 💡 核心修正：只執行 main.py，讓它內部的 importlib 去啟動下載器
+        # 💡 簡化執行指令：讓 main.py 內部處理下載與分析
         run: python main.py --market ${{ matrix.market.id }}
 
       - name: Post Cache Stock Data
