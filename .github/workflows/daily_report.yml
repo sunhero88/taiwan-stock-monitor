@@ -1,38 +1,30 @@
 name: Global Market Monitor
 
-# 設定觸發條件
 on:
-  workflow_dispatch: # 允許手動點擊執行（測試用）
-  schedule:
-    - cron: '30 8 * * *' # 每日台北時間 16:30 自動執行
+  workflow_dispatch:
 
 jobs:
   market-analysis:
     runs-on: ubuntu-latest
     
     steps:
-      # 1. 下載您的程式碼
       - name: Checkout Code
         uses: actions/checkout@v3
 
-      # 2. 設定 Python 環境
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.10'
 
-      # 3. 安裝必要套件 (包含分析與發信所需的所有庫)
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
           pip install pandas numpy requests yfinance matplotlib tqdm akshare resend openai
 
-      # 4. 執行主程式
       - name: Run Stock Analysis
-        # 💡 這裡是最關鍵的：將 GitHub Secrets 轉換為程式讀得到的環境變數
+        # 💡 確保 env 的縮進與 run 對齊，且變數名稱完全正確
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
           REPORT_RECEIVER_EMAIL: ${{ secrets.REPORT_RECEIVER_EMAIL }}
-        # 💡 執行 main.py，並指定分析台股 (tw-share)
         run: python main.py --market tw-share
