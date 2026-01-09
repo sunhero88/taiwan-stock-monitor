@@ -29,14 +29,6 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Cache Stock Data
-        uses: actions/cache@v3
-        with:
-          path: data/${{ matrix.market.id }}/dayK
-          key: stock-data-${{ matrix.market.id }}-${{ github.run_id }}
-          restore-keys: |
-            stock-data-${{ matrix.market.id }}-
-
       - name: Environment Setup
         run: |
           python -m pip install --upgrade pip
@@ -48,10 +40,3 @@ jobs:
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
           REPORT_RECEIVER_EMAIL: ${{ secrets.REPORT_RECEIVER_EMAIL }}
         run: python main.py --market ${{ matrix.market.id }}
-
-      - name: Post Cache Stock Data
-        if: always()
-        uses: actions/cache/save@v3
-        with:
-          path: data/${{ matrix.market.id }}/dayK
-          key: stock-data-${{ matrix.market.id }}-${{ github.run_id }}
