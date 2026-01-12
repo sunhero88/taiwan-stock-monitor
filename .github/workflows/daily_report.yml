@@ -1,12 +1,9 @@
 name: Global Market Monitor
-
 on:
   workflow_dispatch:
-
 jobs:
   market-analysis:
     runs-on: ubuntu-latest
-    
     steps:
       - name: Checkout Code
         uses: actions/checkout@v3
@@ -22,7 +19,6 @@ jobs:
           pip install pandas numpy requests yfinance matplotlib tqdm akshare resend openai
 
       - name: Run Stock Analysis
-        # 💡 確保 env 的縮進與 run 對齊，且變數名稱完全正確
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
