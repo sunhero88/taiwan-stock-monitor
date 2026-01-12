@@ -2,21 +2,22 @@
 import argparse, yfinance as yf
 from pathlib import Path
 from tqdm import tqdm
+import pandas as pd
 
 def download_tw_data(market_id):
-    # 擴充標的至您感興趣的權值股
     tickers = {"2330.TW": "台積電", "2317.TW": "鴻海", "2454.TW": "聯發科", "2308.TW": "台達電", "2382.TW": "廣達"}
     save_dir = Path(__file__).parent.absolute() / "data" / market_id / "dayK"
     save_dir.mkdir(parents=True, exist_ok=True)
     
     for symbol, name in tqdm(tickers.items()):
         try:
+            # 💡 使用最保險的下載參數
             df = yf.download(symbol, period="2y", interval="1d", progress=False, auto_adjust=True)
             if not df.empty:
                 df = df.reset_index()
-                # 💡 強制平坦化 MultiIndex，防止 analyzer 讀不到 'Close'
-                if isinstance(df.columns, yf.utils.multi_index.pd.MultiIndex) or hasattr(df.columns, 'levels'):
-                    df.columns = [c[0] if isinstance(c, tuple) and c[0] else c for c in df.columns]
+                # 💡 修正點：改用更通用的方式平坦化表頭，避開 yf.utils.multi_index 報錯
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = [c[0] for c in df.columns]
                 
                 df.to_csv(save_dir / f"{symbol}_{name}.csv", index=False)
         except Exception as e:
