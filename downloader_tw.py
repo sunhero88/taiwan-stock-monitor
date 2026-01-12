@@ -8,14 +8,13 @@ def download_tw_data(market_id):
     save_dir = Path(__file__).parent.absolute() / "data" / market_id / "dayK"
     save_dir.mkdir(parents=True, exist_ok=True)
     
-    print(f"📥 開始下載 {market_id} 數據到: {save_dir}")
     for symbol, name in tqdm(tickers.items()):
         try:
-            # 使用 auto_adjust 獲得已校正價格
+            # 使用 auto_adjust 獲得正確價格
             df = yf.download(symbol, period="2y", interval="1d", progress=False, auto_adjust=True)
             if not df.empty:
                 df = df.reset_index()
-                # 💡 關鍵修正：若 yfinance 產生 MultiIndex，強制取第一層，防止分析器失敗
+                # 💡 強制平坦化 yfinance 的 MultiIndex 表頭，確保 analyzer 能讀取
                 if hasattr(df.columns, 'levels'):
                     df.columns = [c[0] if isinstance(c, tuple) and c[0] else c for c in df.columns]
                 
@@ -28,3 +27,4 @@ if __name__ == "__main__":
     parser.add_argument('--market', required=True)
     args = parser.parse_args()
     download_tw_data(args.market)
+
