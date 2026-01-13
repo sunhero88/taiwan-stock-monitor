@@ -4,52 +4,42 @@ import numpy as np
 import matplotlib.pyplot as plt
 import os
 
-def run(market_id):
-    data_path = f"data_{market_id}.csv"
-    if not os.path.exists(data_path): return [], None, {}
+def predator_logic_engine(today_df, g_df):
+    """V14.0 Predator 核心邏輯引擎：將數據轉化為戰略判斷"""
+    # 提取關鍵變數
+    twd = g_df[g_df['Symbol'] == 'USD_TWD']
+    twd_chg = twd['Change'].values[0] if not twd.empty else 0
+    twd_val = twd['Value'].values[0] if not twd.empty else 0
+    
+    sox = g_df[g_df['Symbol'] == 'SOX_Semiconductor']
+    sox_chg = sox['Change'].values[0] if not sox.empty else 0
+    
+    tsm = g_df[g_df['Symbol'] == 'TSM_ADR']
+    tsm_chg = tsm['Change'].values[0] if not tsm.empty else 0
 
-    try:
-        # 主數據讀取
-        df = pd.read_csv(data_path)
-        df['Date'] = pd.to_datetime(df['Date'])
-        df = df.sort_values(['Symbol', 'Date'])
-        latest_date = df['Date'].max()
-        today_df = df[df['Date'] == latest_date].copy()
+    # 開始 V14.0 核心判讀
+    insight = "【V14.0 Predator 智能系統核心研判】\n"
+    
+    # 1. 宏觀資金流向分析
+    if twd_chg > 0.1:
+        insight += f"🔴 警訊：台幣匯率({twd_val})急貶，外資提款壓力劇增，慎防權值股虛拉掩護出貨。\n"
+    elif twd_chg < -0.1:
+        insight += f"🟢 強勢：台幣匯率({twd_val})強升，資金大舉匯入，大盤具備推升動能。\n"
+    else:
+        insight += f"⚪ 平穩：匯率維持 {twd_val} 高位震盪，當前為內資盤主導。\n"
 
-        text_reports = {}
-
-        # --- 全球背景分析 (含匯率) ---
-        global_msg = "🌍 【全球市場連動監控】\n"
-        summary_file = "global_market_summary.csv"
-        if os.path.exists(summary_file):
-            try:
-                # 💡 使用 on_bad_lines='skip' 防止 CSV 格式錯誤導致崩潰
-                g_df = pd.read_csv(summary_file, on_bad_lines='skip')
-                for _, row in g_df.iterrows():
-                    if str(row['Symbol']) == "USD_TWD":
-                        status = "🔴 貶值" if row['Change'] > 0 else "🟢 升值"
-                        global_msg += f"💱 台幣匯率: {row['Value']} ({status} {row['Change']:+.2f}%)\n"
-                    else:
-                        icon = "🟢" if row['Change'] > 0 else "🔴"
-                        global_msg += f"{icon} {row['Symbol']}: {row['Change']:+.2f}%\n"
-            except:
-                global_msg += "⚠ 領先指標數據格式異常，請檢查 CSV。\n"
-        
-        text_reports["00_全球市場背景"] = global_msg
-
-        # --- 績效榜單與爆量偵測 (維持穩定邏輯) ---
-        df['Vol_MA20'] = df.groupby('Symbol')['Volume'].transform(lambda x: x.rolling(20).mean())
-        # ... (其餘績效排行榜邏輯維持不變) ...
-        
-        # 繪圖
-        image_paths = []
-        plt.figure(figsize=(10, 5))
-        plt.hist(np.random.normal(0, 1, 100), bins=20, color='skyblue')
-        plt.title(f"Sentiment - {latest_date.strftime('%Y-%m-%d')}")
-        plt.savefig(f"dist_{market_id}.png")
-        plt.close()
-        image_paths.append({"id": "dist_chart", "label": "市場漲跌分佈", "path": f"dist_{market_id}.png"})
-
-        return image_paths, today_df, text_reports
-    except Exception as e:
-        return [], None, {"錯誤": f"分析中斷: {str(e)}"}
+    # 2. 跨市場連動背離偵測
+    if sox_chg > 1.0 and tsm_chg > 1.0:
+        insight += "📈 共振：美股半導體與台積電ADR強勢齊揚，今日電子族群具備攻擊力道。\n"
+    elif sox_chg < -1.0 and tsm_chg < -1.0:
+        insight += "📉 肅殺：美股指標集體走弱，今日建議嚴守停損，切勿盲目接刀。\n"
+    
+    # 3. 籌碼穿透判斷
+    main_force_stocks = today_df[today_df['Vol_Ratio'] > 1.5]
+    if len(main_force_stocks) >= 3:
+        insight += f"🔥 籌碼：偵測到 {len(main_force_stocks)} 檔標的出現[主力進攻]信號，市場攻擊慾望強烈。\n"
+    
+    # 4. 終極策略建議
+    insight += "\n🛡️ [Predator 策略執行指令]\n"
+    if twd_chg > 0 and sox_chg < 0:
+        insight += ">> 盤勢背離！執行「防禦性撤退」，持倉水位降至30%
