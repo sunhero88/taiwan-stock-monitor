@@ -1,13 +1,18 @@
+# --- 基礎與網頁框架 ---
 streamlit
 streamlit-autorefresh
 pandas
 numpy
 matplotlib
+
+# --- 數據獲取與 API ---
 yfinance
 tqdm
 resend
-akshare
-pykrx
 beautifulsoup4
 requests
 flask
+
+# --- 亞洲市場套件 ---
+akshare
+pykrx
