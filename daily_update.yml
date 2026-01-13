@@ -1,9 +1,10 @@
 name: Predator Daily Auto-Update
+
 on:
   schedule:
-    - cron: '30 0 * * *' # 台北 08:30
-    - cron: '30 8 * * *' # 台北 16:30
-  workflow_dispatch:
+    - cron: '30 0 * * *' # 台北 08:30 (盤前)
+    - cron: '30 8 * * *' # 台北 16:30 (盤後)
+  workflow_dispatch: # 保留手動按鈕，方便隨時測試
 
 jobs:
   market-analysis:
@@ -19,15 +20,20 @@ jobs:
 
       - name: Install Dependencies
         run: |
+          python -m pip install --upgrade pip
+          # 這裡必須安裝所有程式碼用到的套件，否則會報錯
           pip install streamlit pandas yfinance matplotlib requests beautifulsoup4 flask
 
       - name: Run Stock Analysis
-        run: python main.py --market tw-share
-
-      - name: Commit and Push
         run: |
+          # 執行數據抓取與分析
+          python main.py --mode auto
+        
+      - name: Commit and Push changes
+        run: |
+          # 將跑出來的最新數據 (global_market_summary.csv) 存回 GitHub
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
-          git add global_market_summary.csv || echo "No changes"
-          git commit -m "Auto-update market data" || echo "No changes"
+          git add global_market_summary.csv || echo "No changes to add"
+          git commit -m "Auto-update market data [skip ci]" || echo "No changes to commit"
           git push
