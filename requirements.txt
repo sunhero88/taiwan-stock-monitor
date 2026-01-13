@@ -1,20 +1,13 @@
-# --- 基礎數據處理 ---
+streamlit
+streamlit-autorefresh
 pandas
 numpy
 matplotlib
-
-# --- 數據獲取 (核心) ---
 yfinance
 tqdm
 resend
-
-# --- 中國 A 股 ---
 akshare
-
-# --- 日本股市 (Tokyo Stock Exchange) ---
-
-tokyo-stock-exchange
-
-# --- 韓國股市 (Korea Exchange) ---
-# pykrx 是目前公認最強、最穩定的韓國股市套件
 pykrx
+beautifulsoup4
+requests
+flask
