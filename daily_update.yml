@@ -1,0 +1,15 @@
+name: Predator Daily Auto-Update
+on:
+  schedule:
+    - cron: '30 0 * * *' # 台北 08:30 (盤前)
+    - cron: '30 8 * * *' # 台北 16:30 (盤後)
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Set up Python
+        run: pip install streamlit pandas yfinance matplotlib requests beautifulsoup4
+      - name: Run Update
+        run: python main.py --mode auto
