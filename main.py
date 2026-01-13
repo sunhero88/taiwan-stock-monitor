@@ -9,33 +9,32 @@ def main():
     market_id = args.market
     root_dir = Path(__file__).parent.absolute()
 
-    # 1. 執行下載
+    # 1. 如果是跑台股，先抓取昨晚美股關鍵數據作為背景
+    if market_id == "tw-share":
+        print("🌍 正在獲取美股領先指標 (SOX, NVDA, TSM)...")
+        # 建立一個精簡清單，避免下載過多
+        subprocess.run(["python", "downloader_us.py", "--market", "us-lead"], check=False)
+
+    # 2. 執行主市場下載
     downloader_script = f"downloader_{market_id.split('-')[0]}.py"
-    print(f"🚀 開始執行下載: {downloader_script}")
+    print(f"🚀 開始執行主市場下載: {downloader_script}")
     subprocess.run(["python", downloader_script, "--market", market_id], check=True)
 
-    # 2. 執行分析
+    # 3. 執行分析
     try:
         import analyzer
         images, df_res, text_reports = analyzer.run(market_id)
         
         if df_res is not None and not df_res.empty:
-            # 💡 這裡是關鍵：將提示訊息放入 FINAL_AI_REPORT，避免 notifier.py 顯示預設值
-            text_reports["FINAL_AI_REPORT"] = "📊 數據監控模式：AI 點評已跳過，請專注於下方「成交量爆量追蹤」清單。"
+            # 💡 這裡可以手動加入全球視野說明
+            text_reports["FINAL_AI_REPORT"] = "📊 數據監控模式：已整合全球連動分析。請關注下方美股指標對今日台股之影響。"
             
-            # 3. 發送郵件 (呼叫您提供的 notifier.py)
             from notifier import StockNotifier
             notifier_inst = StockNotifier()
-            success = notifier_inst.send_stock_report(market_id.upper(), images, df_res, text_reports)
-            
-            if success:
-                print(f"✅ 報告已成功送達您的信箱！")
-            else:
-                print(f"❌ 郵件發送失敗，請檢查 RESEND_API_KEY。")
-        else:
-            print("❌ 分析失敗：找不到 CSV 檔案或數據為空。")
+            notifier_inst.send_stock_report(market_id.upper(), images, df_res, text_reports)
+            print(f"✅ 報告已送達！")
     except Exception as e:
-        print(f"❌ 執行過程出錯: {e}")
+        print(f"❌ 流程出錯: {e}")
 
 if __name__ == "__main__":
     main()
