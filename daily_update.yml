@@ -2,17 +2,13 @@ name: Predator Daily Auto-Update
 
 on:
   schedule:
-    # 台北時間 08:30 (UTC 00:30)
-    - cron: '30 0 * * *'
-    # 台北時間 16:30 (UTC 08:30)
-    - cron: '30 8 * * *'
-  workflow_dispatch: # 允許手動點擊 Actions 執行測試
+    - cron: '30 0 * * *' # 台北 08:30
+    - cron: '30 8 * * *' # 台北 16:30
+  workflow_dispatch:
 
 jobs:
   market-analysis:
     runs-on: ubuntu-latest
-    
-    # 給予寫入權限，確保能更新 CSV 檔案
     permissions:
       contents: write
       
@@ -28,19 +24,21 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          # 強制讀取 requirements.txt，確保所有套件同步安裝
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          # 取消判斷，強制安裝！如果不成功，這裡會直接變紅燈
+          pip install streamlit streamlit-autorefresh pandas yfinance matplotlib requests beautifulsoup4 flask akshare pykrx
+          # 備援：同時安裝 requirements.txt 內的剩餘項目
+          pip install -r requirements.txt
 
       - name: Run Stock Analysis
         run: |
-          # 執行主分析程式
+          # 檢查環境中是否真的有 streamlit
+          python -c "import streamlit; print('Streamlit version:', streamlit.__version__)"
           python main.py
         
       - name: Commit and Push changes
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
-          # 如果程式有產生新的數據檔案，將其存回儲存庫
-          git add *.csv || echo "No CSV files to add"
-          git commit -m "Auto-update market data [skip ci]" || echo "No changes to commit"
+          git add *.csv || echo "No CSV files"
+          git commit -m "Auto-update market data [skip ci]" || echo "No changes"
           git push
