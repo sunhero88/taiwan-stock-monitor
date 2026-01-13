@@ -1,106 +1,105 @@
 # -*- coding: utf-8 -*-
 import streamlit as st
 import pandas as pd
-import yfinance as yf
-import requests
-from bs4 import BeautifulSoup
-import datetime
+import subprocess
+import sys
+import os
 from pathlib import Path
-import time
+import datetime
 
-# 設定頁面
-st.set_page_config(page_title="宇宙第一股市智能分析", layout="wide")
+# 1. 頁面配置
+st.set_page_config(
+    page_title="Predator 戰略指揮中心 V14.0",
+    page_icon="🦅",
+    layout="wide"
+)
 
+# 定義根目錄與數據檔案路徑
 root_dir = Path(__file__).parent.absolute()
+data_file = root_dir / "global_market_summary.csv"
 
-# 標題
-st.title("宇宙第一股市智能分析系統 V12.3")
-st.markdown("**全自動版 - 打開即時更新數據 + 報告**（雲端部署中，無需執行命令）")
+# 2. 側邊欄：監控與資產
+st.sidebar.title("🦅 系統監控")
+if data_file.exists():
+    mtime = datetime.datetime.fromtimestamp(data_file.stat().st_mtime)
+    st.sidebar.success(f"📡 數據同步：{mtime.strftime('%Y-%m-%d %H:%M:%S')}")
+else:
+    st.sidebar.warning("📡 待同步：請執行分析或等待自動化任務")
 
-# 側邊欄選擇市場
-market_options = ["tw", "us", "jp", "hk", "kr"]
-market = st.sidebar.selectbox("選擇市場", market_options, index=0, help="選擇要分析的市場")
+st.sidebar.markdown("---")
+st.sidebar.subheader("💰 帳戶資產")
+con_asset = st.sidebar.number_input("保守帳戶 (TWD)", value=1200000)
+adv_asset = st.sidebar.number_input("冒進帳戶 (TWD)", value=1650000)
+st.sidebar.metric("總資產水位", f"{con_asset + adv_asset:,}")
 
-# ──────────────────────────────
-# 即時數據抓取函式（取代 downloader.py）
-@st.cache_data(ttl=300)  # 每 5 分鐘自動更新一次
-def fetch_latest_data(market='tw'):
-    data = {"status": "success", "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+# 3. 主頁面標題
+st.title("🦅 宇宙第一股市智能分析系統 V14.0")
+st.markdown("**雲端自動化版** | 核心邏輯：Predator V14.0 (高盛策略分析師模式)")
 
-    if market == 'tw':
-        # 台股大盤指數
-        twii = yf.Ticker("^TWII")
-        hist = twii.history(period="1d")
-        if not hist.empty:
-            data['twii_price'] = round(hist['Close'].iloc[-1], 2)
-            data['twii_change'] = round(hist['Close'].pct_change().iloc[-1] * 100, 2)
-        else:
-            data['twii_price'] = "抓取失敗"
-            data['twii_change'] = "N/A"
+# 4. 功能按鈕區
+col1, col2, col3 = st.columns(3)
+with col1:
+    if st.button("🔄 立即更新即時數據 (盤中)"):
+        with st.status("正在抓取全球數據...", expanded=False) as status:
+            subprocess.run([sys.executable, "downloader_us.py"], cwd=root_dir)
+            subprocess.run([sys.executable, "downloader_asia.py"], cwd=root_dir)
+            status.update(label="✅ 數據抓取完成", state="complete")
+            st.rerun()
 
-        # 簡單模擬三大法人（未來可加真實爬蟲）
-        data['foreign_net'] = "外資買超 85 億（模擬）"
-        data['trust_net'] = "投信買超 12 億（模擬）"
-        data['dealer_net'] = "自營商買超 45 億（模擬）"
-
-    return data
-
-# ──────────────────────────────
-# 自動生成報告函式（網頁載入即跑）
-def auto_generate_report():
-    with st.spinner("自動抓取最新數據與生成報告..."):
-        latest_data = fetch_latest_data(market)
-        st.subheader("即時數據概覽")
-        st.json(latest_data)
-
-        try:
-            import analyzer
-            images, df_res, text_reports, red_flags = analyzer.run(market)
-
-            st.subheader("智能分析報告")
-            st.text_area("文字報告", text_reports, height=400)
-            
-            if df_res is not None:
-                st.dataframe(df_res)
-            
-            if images:
-                for img in images:
-                    st.image(img, width=600)
-
-            st.subheader("紅旗自動偵測")
-            if red_flags:
-                for flag in red_flags:
-                    st.error(f"⚠️ {flag}")
-            else:
-                st.success("目前無紅旗觸發")
-
-            # 自動存檔
-            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            report_path = root_dir / f"report_auto_{timestamp}.txt"
-            with open(report_path, "w", encoding="utf-8") as f:
-                f.write(text_reports)
-            st.success(f"自動報告已存檔：{report_path.name}")
-
-        except Exception as e:
-            st.error(f"自動分析中斷：{e}")
-
-# 網頁載入時自動執行一次
-if 'auto_run' not in st.session_state:
-    auto_generate_report()
-    st.session_state.auto_run = True
-
-# 自動每 5 分鐘重新載入一次（可調整秒數）
-if 'last_refresh' not in st.session_state:
-    st.session_state.last_refresh = time.time()
-
-if time.time() - st.session_state.last_refresh > 300:  # 300 秒 = 5 分鐘
-    st.rerun()
-    st.session_state.last_refresh = time.time()
-
-# 手動刷新按鈕（可選）
-if st.button("手動刷新最新報告"):
-    auto_generate_report()
-
-# 頁尾說明
+# 5. 數據呈現與 AI 橋樑
 st.markdown("---")
-st.caption("系統開啟即自動抓取最新數據與生成報告，每 5 分鐘自動刷新。僅供個人參考，不構成投資建議。")
+
+try:
+    # 呼叫您的分析模組
+    import analyzer
+    # 預設分析台股上市櫃
+    images, df_res, text_reports = analyzer.run('tw-share')
+    
+    # 佈局分兩欄
+    left_col, right_col = st.columns([6, 4])
+    
+    with left_col:
+        st.subheader("🤖 Predator 智能戰略判讀")
+        # 顯示分析報告文字
+        ai_report = text_reports.get("FINAL_AI_REPORT", "分析引擎運算中...")
+        st.info(ai_report)
+        
+        # --- 關鍵：數據介入區塊 (給 Gemini 讀取用) ---
+        st.subheader("📋 複製給 Predator Gem (數據介入)")
+        # 這裡彙整 AI 需要的關鍵字，確保它不會讀錯數據
+        market_context = text_reports.get("00_全球市場背景", "未取得背景")
+        top_stocks = text_reports.get("📊 今日個股績效榜", "未取得榜單")
+        
+        copy_text = f"""【Predator 數據介入報告】
+時間：{datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}
+市場：台股上市櫃
+領先指標：{market_context}
+強勢標的：{top_stocks}
+系統結論：{ai_report}"""
+        
+        st.code(copy_text, language="markdown")
+        
+        if images:
+            st.image(images[0]["path"], use_container_width=True)
+
+    with right_col:
+        st.subheader("🎯 關鍵監控標的 (TOP 10)")
+        if df_res is not None:
+            # 格式化表格
+            display_df = df_res[['Symbol', 'Close', 'Return', 'Vol_Ratio']].head(10)
+            st.dataframe(
+                display_df.style.format({'Return': '{:+.2f}%', 'Vol_Ratio': '{:.2f}x'})
+                .background_gradient(subset=['Return'], cmap='RdYlGn'),
+                height=500
+            )
+
+except Exception as e:
+    st.error(f"⚠️ 核心分析模組載入失敗：{e}")
+    st.info("請確保 analyzer.py 與相關 downloader 檔案已上傳至 GitHub 同一目錄下。")
+
+# 6. 自動化定時刷新 (維持網頁活躍狀態)
+from streamlit_autorefresh import st_autorefresh
+st_autorefresh(interval=15 * 60 * 1000, key="auto_refresh") # 每15分鐘自動刷新
+
+st.markdown("---")
+st.caption(f"Predator V14.0 指令集已就緒 | 目前時間: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
