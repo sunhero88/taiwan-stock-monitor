@@ -21,21 +21,22 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Install Dependencies
+      - name: 🚀 強制環境對齊與安裝
         run: |
+          # 1. 強制升級 pip 並在「當前路徑」安裝所有套件
           python -m pip install --upgrade pip
-          # 取消判斷，強制安裝！如果不成功，這裡會直接變紅燈
-          pip install streamlit streamlit-autorefresh pandas yfinance matplotlib requests beautifulsoup4 flask akshare pykrx
-          # 備援：同時安裝 requirements.txt 內的剩餘項目
-          pip install -r requirements.txt
+          python -m pip install streamlit streamlit-autorefresh pandas yfinance matplotlib requests beautifulsoup4 flask akshare pykrx
+          
+          # 2. 萬一環境隔離，我們強制把安裝路徑印出來檢查
+          python -c "import streamlit; print('✅ Streamlit 安裝成功，版本:', streamlit.__version__)"
 
-      - name: Run Stock Analysis
+      - name: 🦅 執行分析程式
         run: |
-          # 檢查環境中是否真的有 streamlit
-          python -c "import streamlit; print('Streamlit version:', streamlit.__version__)"
+          # 使用 python -m streamlit 或直接 python 執行
+          # 這裡我們用 python 直接跑，確保它抓到剛才安裝的套件
           python main.py
         
-      - name: Commit and Push changes
+      - name: 📦 更新數據至雲端
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
