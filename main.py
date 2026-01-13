@@ -30,7 +30,7 @@ st.sidebar.markdown("---")
 st.sidebar.subheader("💰 帳戶資產")
 con_asset = st.sidebar.number_input("保守帳戶 (TWD)", value=1200000)
 adv_asset = st.sidebar.number_input("冒進帳戶 (TWD)", value=1650000)
-st.sidebar.metric("總資產水位", f"{con_asset + adv_asset:,}")
+st.sidebar.metric("總資產水位", f"{(con_asset + adv_asset):,}")
 
 # 3. 主頁面標題
 st.title("🦅 宇宙第一股市智能分析系統 V14.0")
@@ -65,8 +65,6 @@ try:
         st.info(ai_report)
         
         # --- 關鍵：數據介入區塊 (給 Gemini 讀取用) ---
-        st.subheader("📋 複製給 Predator Gem (數據介入)")
-        # 這裡彙整 AI 需要的關鍵字，確保它不會讀錯數據
         market_context = text_reports.get("00_全球市場背景", "未取得背景")
         top_stocks = text_reports.get("📊 今日個股績效榜", "未取得榜單")
         
@@ -77,6 +75,7 @@ try:
 強勢標的：{top_stocks}
 系統結論：{ai_report}"""
         
+        st.subheader("📋 複製給 Predator Gem (數據介入)")
         st.code(copy_text, language="markdown")
         
         if images:
@@ -85,7 +84,10 @@ try:
     with right_col:
         st.subheader("🎯 關鍵監控標的 (TOP 10)")
         if df_res is not None:
-            # 格式化表格
+            # --- 🚀 關鍵修正：實體化儲存 CSV (供 GitHub Action 抓取) ---
+            df_res.to_csv(data_file, index=False, encoding='utf-8-sig')
+            
+            # 格式化表格顯示
             display_df = df_res[['Symbol', 'Close', 'Return', 'Vol_Ratio']].head(10)
             st.dataframe(
                 display_df.style.format({'Return': '{:+.2f}%', 'Vol_Ratio': '{:.2f}x'})
@@ -99,7 +101,7 @@ except Exception as e:
 
 # 6. 自動化定時刷新 (維持網頁活躍狀態)
 from streamlit_autorefresh import st_autorefresh
-st_autorefresh(interval=15 * 60 * 1000, key="auto_refresh") # 每15分鐘自動刷新
+st_autorefresh(interval=15 * 60 * 1000, key="auto_refresh") 
 
 st.markdown("---")
 st.caption(f"Predator V14.0 指令集已就緒 | 目前時間: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
