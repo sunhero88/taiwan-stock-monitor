@@ -9,31 +9,34 @@ def main():
     market_id = args.market
     root_dir = Path(__file__).parent.absolute()
     
-    # 清理舊摘要檔
-    if (root_dir / "global_market_summary.csv").exists():
-        os.remove(root_dir / "global_market_summary.csv")
+    # 1. 數據預處理：清理舊摘要
+    summary_file = root_dir / "global_market_summary.csv"
+    if summary_file.exists(): os.remove(summary_file)
 
-    print("🚀 啟動全球多市場分析系統...")
+    print("🚀 V14.0 Predator 智能監控系統啟動...")
 
-    # 1. 執行全球指標下載 (順序：美股 -> 亞太)
+    # 2. 全球數據介入 (美、日、台幣)
     subprocess.run([sys.executable, "downloader_us.py"], cwd=root_dir, check=False)
     subprocess.run([sys.executable, "downloader_asia.py"], cwd=root_dir, check=False)
 
-    # 2. 執行主市場台股下載
+    # 3. 主市場數據獲取
     downloader_tw = f"downloader_{market_id.split('-')[0]}.py"
     subprocess.run([sys.executable, downloader_tw, "--market", market_id], cwd=root_dir, check=True)
 
-    # 3. 分析與通知
+    # 4. 智能分析與自動寫入判讀
     try:
         import analyzer
         images, df_res, text_reports = analyzer.run(market_id)
+        
         if df_res is not None:
-            text_reports["FINAL_AI_REPORT"] = "📊 數據連動模式：已整合美日股與台幣匯率數據，並啟動籌碼主力偵測。"
+            # 這裡的 FINAL_AI_REPORT 已由 analyzer.predator_logic_engine 動態生成
             from notifier import StockNotifier
-            StockNotifier().send_stock_report(market_id.upper(), images, df_res, text_reports)
-            print("✅ 報告發送完畢！")
+            notifier_inst = StockNotifier()
+            success = notifier_inst.send_stock_report(market_id.upper(), images, df_res, text_reports)
+            if success:
+                print("✅ 智能投資報告已成功寫入並發送！")
     except Exception as e:
-        print(f"❌ 流程執行異常: {e}")
+        print(f"❌ 智能分析中斷: {e}")
 
 if __name__ == "__main__":
     main()
