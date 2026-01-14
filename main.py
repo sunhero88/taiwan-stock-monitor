@@ -1,61 +1,56 @@
 # -*- coding: utf-8 -*-
 import streamlit as st
 import pandas as pd
-import datetime
+import sys
+import argparse
 from pathlib import Path
+import analyzer
+from notifier import StockNotifier
 
-# 1. 頁面配置
-st.set_page_config(page_title="Predator 戰略指揮中心 V14.0", page_icon="🦅", layout="wide")
+# 設定路徑
+root_dir = Path(__file__).parent.absolute()
 
-# 2. 側邊欄
-st.sidebar.title("🦅 系統狀態")
-st.sidebar.success(f"📡 數據即時同步中\n更新時間: {datetime.datetime.now().strftime('%H:%M:%S')}")
+def run_core_logic(market_id="tw-share"):
+    """核心執行邏輯：下載 -> 分析 -> 準備報告"""
+    # 這裡呼叫你原本的 downloader 與 analyzer
+    images, df_res, text_reports = analyzer.run(market_id)
+    return images, df_res, text_reports
 
-# 3. 數據引擎
-def get_data():
-    try:
-        import analyzer
-        # 取得分析結果
-        results = analyzer.run('tw-share')
-        if results and len(results) >= 3:
-            return results[0], results[1], results[2]
-    except Exception as e:
-        st.error(f"數據抓取異常: {e}")
-    return None, None, {}
+# --- CLI 模式 (給 GitHub Actions 運行) ---
+def run_cli():
+    print("🚀 啟動 V14.0 Predator 雲端分析...")
+    images, df_res, text_reports = run_core_logic()
+    # 執行郵件通知
+    notifier = StockNotifier()
+    notifier.send_stock_report("TW-SHARE", images, df_res, text_reports)
+    print("✅ 分析完成並已發送報告！")
 
-images, df_res, text_reports = get_data()
-
-# 4. 主畫面佈局
-st.title("🦅 宇宙第一股市智能分析系統 V14.0")
-
-col1, col2 = st.columns([1, 1])
-
-with col1:
-    st.subheader("🤖 Predator 智能戰略判讀")
-    report = text_reports.get("FINAL_AI_REPORT", "正在初始化分析引擎...") if isinstance(text_reports, dict) else str(text_reports)
-    st.info(report)
+# --- Streamlit 網頁模式 (給本地電腦運行) ---
+def run_web():
+    st.set_page_config(page_title="Predator 戰略指揮中心 V14.0", layout="wide")
+    st.title("🦅 Predator 戰略指揮中心 V14.0")
     
-    # 數據介入區塊
-    st.subheader("📋 複製給 Predator Gem (數據介入)")
-    copy_text = f"【Predator 數據介入】\n時間：{datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}\n大盤點位：30105.04\n結論：{report[:100]}..."
-    st.code(copy_text, language="markdown")
+    market = st.sidebar.selectbox("選擇市場", ["tw-share", "us"])
+    
+    if st.button("🔥 生成即時分析報告"):
+        with st.spinner("正在介入數據並判讀技術指標..."):
+            images, df_res, text_reports = run_core_logic(market)
+            
+            # 顯示判讀標籤與位階
+            st.subheader("🤖 Predator 智能判讀")
+            st.code(text_reports.get("📊 今日個股績效榜", ""), language="markdown")
+            
+            if df_res is not None:
+                st.dataframe(df_res.style.highlight_max(axis=0, subset=['Return']))
+            
+            # 提供一鍵複製給 Gem 的區塊
+            st.subheader("📋 複製給 Predator Gem")
+            copy_msg = f"市場：{market}\n數據報告：\n{text_reports.get('📊 今日個股績效榜', '')}"
+            st.text_area("請將下方內容貼入 Gem", copy_msg, height=200)
 
-with col2:
-    st.subheader("🎯 關鍵監控標的 (TOP 10)")
-    # 強制檢查 df_res 是否具備個股特徵
-    if df_res is not None and not df_res.empty:
-        # 如果發現這是法人統計表，則嘗試尋找其他數據源或給予提示
-        if '法人類別' in df_res.columns:
-            st.warning("⚠️ 目前接收到的是【法人統計數據】，請檢查 analyzer.py 是否有篩選個股清單。")
-            st.table(df_res)
-        else:
-            # 顯示個股清單
-            st.dataframe(df_res.head(10), use_container_width=True)
+# --- 主程式進入點 ---
+if __name__ == "__main__":
+    if "--cli" in sys.argv:
+        run_cli()
     else:
-        st.info("💡 正在等待個股篩選結果...")
-
-# 5. 底部顯示法人統計 (若有)
-if isinstance(text_reports, dict) and "三大法人買賣超" in str(text_reports):
-    st.divider()
-    st.subheader("📊 全球市場籌碼背景")
-    st.write(text_reports.get("三大法人買賣超", "暫無法人細節"))
+        run_web()
