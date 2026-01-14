@@ -1,91 +1,79 @@
 # -*- coding: utf-8 -*-
 import pandas as pd
-import yfinance as yf
-import datetime
 import numpy as np
+import os
+from pathlib import Path
 
-def run(market_type='tw-share'):
+def run(market_id="tw-share"):
     """
-    Predator V14.0 終極分析引擎 (全球聯動補強版)
-    回傳格式: (images, df_top_stocks, text_reports)
+    V14.0 Predator 核心分析引擎
+    整合指標：量增比、20MA位階、K線實體力道
     """
-    images = []
-    text_reports = {}
-    
     try:
-        # --- 1. 全球風險訊號抓取 (Global Risk Signals) ---
-        # 抓取台幣、日圓、VIX、費半、NVDA、台積電ADR
-        tickers = {
-            "TWD": "TWD=X",       # 台幣匯率
-            "VIX": "^VIX",        # 美股恐慌指數
-            "SOX": "^SOX",        # 費城半導體
-            "NVDA": "NVDA",       # AI 領跑者
-            "TSM_ADR": "TSM",     # 台積電 ADR
-            "JPY": "JPY=X"        # 日圓 (流動性指標)
-        }
+        # 1. 讀取數據 (假設 downloader 產出名為 raw_data_{market}.csv)
+        data_path = Path(f"raw_data_{market_id}.csv")
+        if not data_path.exists():
+            return None, None, {"Error": "找不到原始數據檔案，請先執行下載器。"}
+
+        df = pd.read_csv(data_path)
         
-        # 抓取過去 5 天數據以計算「速率 (Velocity)」
-        global_data = yf.download(list(tickers.values()), period="5d", interval="1d")['Close']
+        # 確保欄位名稱正確 (Open, High, Low, Close, Volume)
+        # 計算技術指標
         
-        # --- 2. 核心指標計算 (依據 V14.0 守則) ---
-        # (1) 台幣 3 日貶值速率 (Rule #8)
-        twd_recent = global_data[tickers["TWD"]]
-        twd_velocity = ((twd_recent.iloc[-1] - twd_recent.iloc[-3]) / twd_recent.iloc[-3]) * 100
-        fx_status = "🔴 劇貶 (警告)" if twd_velocity > 1.0 else "🟢 穩定"
+        # A. 計算報酬率與量能比
+        df['Return'] = df['Close'].pct_change() * 100
+        df['Vol_MA20'] = df['Volume'].rolling(window=20).mean()
+        df['Vol_Ratio'] = df['Volume'] / df['Vol_MA20']
+        
+        # B. 【新增】計算 20MA 位階 (乖離率)
+        # 判斷股價相對於月線的位置
+        df['MA20'] = df['Close'].rolling(window=20).mean()
+        df['MA_Bias'] = ((df['Close'] - df['MA20']) / df['MA20']) * 100
+        
+        # C. 【新增】計算 K 線實體力道 (K-Body Ratio)
+        # 判斷是真突破還是留長上影線的出貨
+        df['K_High_Low'] = df['High'] - df['Low']
+        df['K_Real_Body'] = abs(df['Close'] - df['Open'])
+        # 避免除以零
+        df['Body_Power'] = (df['K_Real_Body'] / df['K_High_Low']).replace([np.inf, -np.inf], 0).fillna(0) * 100
 
-        # (2) VIX 單日斜率 (Risk Control)
-        vix_recent = global_data[tickers["VIX"]]
-        vix_slope = ((vix_recent.iloc[-1] - vix_recent.iloc[-2]) / vix_recent.iloc[-2]) * 100
-        vix_status = "⚠️ 飆升" if vix_slope > 10.0 else "✅ 正常"
+        # 2. 定義 Predator 標籤邏輯
+        def get_predator_tag(row):
+            tags = []
+            # 量能核心：量增 1.5 倍且上漲
+            if row['Vol_Ratio'] >= 1.5 and row['Return'] > 1.5:
+                tags.append("🔥主力進攻")
+            
+            # 位階判斷
+            if row['MA_Bias'] < 3 and row['Return'] > 0:
+                tags.append("🛡️低位起漲")
+            elif row['MA_Bias'] > 15:
+                tags.append("⚠️高檔過熱")
+                
+            # 力道判斷
+            if row['Body_Power'] > 70 and row['Return'] > 2:
+                tags.append("⚡真突破")
+            elif row['Body_Power'] < 30 and row['Vol_Ratio'] > 2:
+                tags.append("❌假突破/壓力")
+                
+            return " ".join(tags) if tags else "○ 盤整"
 
-        # (3) AI 領先指標連動
-        sox_change = ((global_data[tickers["SOX"]].iloc[-1] - global_data[tickers["SOX"]].iloc[-2]) / global_data[tickers["SOX"]].iloc[-2]) * 100
-        nvda_change = ((global_data[tickers["NVDA"]].iloc[-1] - global_data[tickers["NVDA"]].iloc[-2]) / global_data[tickers["NVDA"]].iloc[-2]) * 100
+        df['Predator_Tag'] = df.apply(get_predator_tag, axis=1)
 
-        # --- 3. 建立全球背景報告 (Phase 0) ---
-        global_report = pd.DataFrame({
-            '監控指標': ['台幣匯率', 'VIX 指數', '費城半導體', 'NVIDIA', '台積電ADR'],
-            '最新數值': [f"{twd_recent.iloc[-1]:.2f}", f"{vix_recent.iloc[-1]:.2f}", 
-                         f"{global_data[tickers['SOX']].iloc[-1]:.0f}", f"{global_data[tickers['NVDA']].iloc[-1]:.1f}",
-                         f"{global_data[tickers['TSM_ADR']].iloc[-1]:.1f}"],
-            '動態斜率': [f"{twd_velocity:+.2f}% (3D)", f"{vix_slope:+.1f}% (1D)", 
-                         f"{sox_change:+.1f}%", f"{nvda_change:+.1f}%", "-"],
-            '風險狀態': [fx_status, vix_status, "-", "-", "-"]
-        })
-        text_reports["00_全球風險預警"] = global_report
-
-        # --- 4. 建立法人統計表 (模擬數據，實務可對接證交所 API) ---
-        # 假設今日數據：外資買超 60.43 億
-        df_institutional = pd.DataFrame({
-            '法人類別': ['外資及陸資', '投信', '自營商', '合計'],
-            '買賣超(億)': [60.43, 11.81, 1.55, 73.79]
-        })
-        text_reports["三大法人買賣超"] = df_institutional
-
-        # --- 5. 執行 Predator 個股篩選邏輯 ---
-        # 這裡模擬篩選出的 TOP 10 (實務上這裡會是你的選股算法)
-        stock_data = {
-            'Symbol': ['6669.TW', '2330.TW', '3711.TW', '2454.TW', '2317.TW', '2382.TW', '3231.TW', '2308.TW', '3037.TW', '2376.TW'],
-            'Name': ['緯穎', '台積電', '日月光', '聯發科', '鴻海', '廣達', '緯創', '台達電', '欣興', '技嘉'],
-            'Close': [2450.0, 1105.0, 165.0, 1280.0, 215.0, 315.0, 125.0, 412.0, 185.0, 320.0],
-            'Return': [6.8, 3.5, 1.5, 2.8, 1.2, 4.2, 5.1, 0.5, -0.5, 2.1],
-            'Vol_Ratio': [4.2, 1.2, 1.3, 1.5, 0.8, 2.5, 3.1, 0.9, 1.1, 2.8]
+        # 3. 篩選今日最新數據 (最後一列)
+        latest_df = df.iloc[-50:].copy() # 取最近 50 筆做展示
+        
+        # 4. 產出文字報告 (餵入 Gem 用)
+        top_picks = df[df['Vol_Ratio'] > 1.5].sort_values('Return', ascending=False).head(5)
+        
+        report_text = {
+            "FINAL_AI_REPORT": f"偵測到 {len(top_picks)} 檔具備主力介入跡象。",
+            "📊 今日個股績效榜": top_picks[['Symbol', 'Close', 'Return', 'Predator_Tag']].to_string(index=False),
+            "💡 戰略建議": "優先關注 [🛡️低位起漲] 且 [🔥主力進攻] 雙標籤個股。"
         }
-        df_top_stocks = pd.DataFrame(stock_data)
 
-        # --- 6. AI 戰略總結內容 ---
-        market_idx = 30105.04
-        text_reports["FINAL_AI_REPORT"] = f"""
-        ### Predator V14.0 戰略評估 (2026-01-14)
-        1. **大盤位階**：站穩 {market_idx} 點，費半連動 {sox_change:+.1f}%。
-        2. **匯率風險**：台幣 3 日變化 {twd_velocity:+.2f}%，{fx_status}。
-        3. **量能核心**：緯穎 (6669) 出現 {df_top_stocks.iloc[0]['Vol_Ratio']}x 爆發量。
-        4. **戰術建議**：符合 Rule #7 右側交易，但須監控 VIX {vix_status}。
-        """
+        # 5. 返回給 Streamlit (images 目前設為空，可自行加入 matplotlib 繪圖)
+        return [], df, report_text
 
     except Exception as e:
-        print(f"Error in analyzer: {e}")
-        df_top_stocks = pd.DataFrame()
-        text_reports["FINAL_AI_REPORT"] = f"分析引擎故障: {str(e)}"
-
-    return images, df_top_stocks, text_reports
+        return None, None, {"Error": f"分析引擎中斷: {str(e)}"}
