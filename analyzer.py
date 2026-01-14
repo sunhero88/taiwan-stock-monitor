@@ -3,6 +3,9 @@ import pandas as pd
 import numpy as np
 
 def run_analysis(df):
+    """
+    V14.0 Predator 智能分析引擎 - 盤中即時動能版
+    """
     try:
         if df is None or df.empty:
             return pd.DataFrame(), "⚠️ 數據源中斷"
@@ -24,37 +27,50 @@ def run_analysis(df):
             latest['Vol_Ratio'] = latest['Volume'] / vol_ma20 if vol_ma20 > 0 else 0
             latest['Return'] = (latest['Close'] / group['Close'].iloc[-2] - 1) * 100
             
-            # --- 籌碼指標 (FinMind 來源) ---
+            # --- 籌碼/動能指標 (自動切換) ---
             inst_net = latest.get('Inst_Net', 0)
             
-            # 格式化顯示：滿 1000 股顯示 k，否則顯示張數
-            # 處理 0 的狀況 (無數據或剛好為0)
+            # 如果沒有法人數據 (盤中或被擋)，則計算「即時主力動能」
+            # 公式：(收盤-開盤)/(最高-最低) * 成交量 * 0.3 (係數)
             if inst_net == 0:
-                 latest['Inst_Status'] = "⚪無/待更新"
-            elif abs(inst_net) >= 1000:
-                val_k = round(inst_net / 1000, 1) # 換算成千張 (k)
-                latest['Inst_Status'] = f"🔴+{val_k}k" if inst_net > 0 else f"🔵{val_k}k"
+                h_l_range = latest['High'] - latest['Low']
+                if h_l_range > 0:
+                    # 估算淨買盤 (Volume Force)
+                    est_force = latest['Volume'] * ((latest['Close'] - latest['Open']) / h_l_range) * 0.5
+                else:
+                    est_force = 0
+                
+                # 標示為 ⚡ (估算)
+                val_k = round(est_force / 1000, 1)
+                latest['Inst_Status'] = f"⚡🔴+{val_k}k" if est_force > 0 else f"⚡🔵{val_k}k"
+                score_feed = est_force
             else:
-                # 不足 1 張 (少見，但也處理)
-                latest['Inst_Status'] = f"🔴+{int(inst_net)}" if inst_net > 0 else f"🔵{int(inst_net)}"
-            
+                # 使用真實法人數據
+                val_k = round(inst_net / 1000, 1)
+                latest['Inst_Status'] = f"🔴+{val_k}k" if inst_net > 0 else f"🔵{val_k}k"
+                score_feed = inst_net
+
             # --- 智能評分 ---
-            inst_score = min(25, max(0, inst_net / 1000 * 5)) if inst_net > 0 else 0
+            # 動能/籌碼加分
+            chip_score = min(25, max(0, score_feed / 1000 * 5)) if score_feed > 0 else 0
             
             score = (min(latest['Vol_Ratio'] * 12, 40) + 
                      max(0, (12 - abs(latest['MA_Bias'])) * 2.5) + 
-                     inst_score)
+                     chip_score)
             latest['Score'] = score
             
             # --- 戰術標籤 ---
             tags = []
             if latest['Vol_Ratio'] > 1.5: tags.append("🔥主力")
             if -2.0 < latest['MA_Bias'] < 3.5: tags.append("🛡️起漲")
-            if inst_net > 2000000: tags.append("🏦法人大買") # 2000張以上
-            elif inst_net > 0: tags.append("🏦法人")
+            
+            # 判斷是「法人」還是「預估主力」
+            if inst_net != 0:
+                if inst_net > 0: tags.append("🏦法人")
+            else:
+                if score_feed > 0: tags.append("⚡主力") # 盤中動能強
             
             latest['Predator_Tag'] = " ".join(tags) if tags else "○觀察"
-            
             results.append(latest)
 
         if not results:
