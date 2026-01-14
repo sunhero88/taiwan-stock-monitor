@@ -1,12 +1,12 @@
-name: Predator Daily Analysis
+name: Predator Daily Analysis V14.0
 
 on:
   schedule:
-    # GitHub 使用 UTC 時間 (台北時間 - 8小時)
-    - cron: '30 0 * * 1-5' # 台北 08:30 (UTC 00:30) - 盤前領先指標與策略
-    - cron: '0 3 * * 1-5'  # 台北 11:00 (UTC 03:00) - 盤中量能爆發標的抓取
-    - cron: '30 8 * * 1-5' # 台北 16:30 (UTC 08:30) - 盤後完整技術指標判讀
-  workflow_dispatch:      # 保持手動觸發功能，讓你隨時想看就能點
+    # 台北時間 (UTC+8)
+    - cron: '30 0 * * 1-5' # 台北 08:30 (盤前美股/匯率)
+    - cron: '0 3 * * 1-5'  # 台北 11:00 (盤中即時爆量)
+    - cron: '30 8 * * 1-5' # 台北 16:30 (盤後技術結算)
+  workflow_dispatch:      # 允許手動觸發
 
 jobs:
   build:
@@ -23,12 +23,12 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          # 確保安裝所有必要套件，包含微調後需要的 streamlit
+          # 補齊所有套件，包含微調後需要的 streamlit
           pip install pandas yfinance numpy requests beautifulsoup4 streamlit resend matplotlib
 
       - name: Run Predator Analysis
         env:
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
         run: |
-          # 執行時加入 --cli 參數，確保在 GitHub 伺服器環境順利運作
+          # 雲端執行必須帶上 --cli 參數，避免卡死在 Web 介面
           python main.py --cli
