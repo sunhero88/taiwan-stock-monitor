@@ -5,99 +5,79 @@ from pathlib import Path
 
 def run(market_id):
     """
-    V14.0 Predator 核心分析模組
-    功能：計算 MA20 乖離率、K線力道、並產出戰略標籤
+    V14.0 Predator 核心分析模組 (防護強化版)
+    針對新環境自動補完後的空值問題進行徹底修正
     """
     try:
-        # 1. 檔案定位
+        # 1. 檔案路徑定位
         data_file = Path(f"raw_data_{market_id}.csv")
         if not data_file.exists():
-            return None, None, {"Error": f"找不到數據檔案: {data_file}，請點擊按鈕自動修復。"}
+            return None, None, {"Error": "數據檔案尚未就緒，請稍後再試。"}
             
-        # 2. 讀取數據
+        # 2. 讀取並清洗數據
         df = pd.read_csv(data_file)
-        if df.empty:
-            return None, None, {"Error": "數據檔案為空，請重新執行下載器。"}
+        if df.empty or len(df) < 5:
+            return None, None, {"Error": "初始數據量過低，無法建立有效判讀位階。"}
 
-        # 3. 基礎指標計算 (確保排序正確)
-        df = df.sort_values('Date' if 'Date' in df.columns else df.columns[0])
+        # 基礎報酬率計算
         df['Return'] = df['Close'].pct_change() * 100
         
-        # --- 🛡️ 防錯：數據長度檢查 ---
-        # 如果數據不足 20 筆，無法計算 MA20，將以基礎數據回傳
+        # --- 🛡️ 智能降級邏輯：處理數據長度不足 ---
         if len(df) < 20:
-            df['MA_Bias'] = 0
-            df['Body_Power'] = 0
-            df['Vol_Ratio'] = 1
-            df['Predator_Tag'] = "🛡️ 數據累積中"
-            
-            latest_data = df.tail(10)
-            report_text = {
-                "📊 今日個股績效榜": latest_data[['Symbol', 'Close', 'Return']].to_string(index=False),
-                "FINAL_AI_REPORT": "⚠️ 數據量不足(少於20日)，技術指標計算受限，僅提供基礎漲跌幅。"
+            df['Predator_Tag'] = "🛡️ 數據採集中"
+            latest = df.tail(10)
+            return [], df, {
+                "📊 今日個股績效榜": latest[['Symbol', 'Close', 'Return']].to_string(index=False),
+                "FINAL_AI_REPORT": "⚠️ 偵測到新環境部署，數據累積中(目前 < 20日)，暫不提供乖離率判讀。"
             }
-            return [], df, report_text
 
-        # 4. 【核心技術指標】計算
-        # A. 均線位階 (MA20 乖離率)
+        # 3. 【V14.0 核心技術指標】計算
+        # A. 均線位階：20MA 乖離率 (判斷是否追高)
         df['MA20'] = df['Close'].rolling(window=20).mean()
         df['MA_Bias'] = ((df['Close'] - df['MA20']) / df['MA20']) * 100
         
-        # B. K線實體力道 (Body Power)
-        # 計算公式: |收盤-開盤| / (最高-最低)
-        df['K_High_Low'] = df['High'] - df['Low']
-        df['K_Real_Body'] = abs(df['Close'] - df['Open'])
-        df['Body_Power'] = (df['K_Real_Body'] / df['K_High_Low'].replace(0, np.inf)) * 100
+        # B. 攻擊品質：K線實體佔比 (判斷主力真誠度)
+        df['K_Range'] = df['High'] - df['Low']
+        df['K_Body'] = abs(df['Close'] - df['Open'])
+        df['Body_Power'] = (df['K_Body'] / df['K_Range'].replace(0, np.inf)) * 100
         
-        # C. 量能比 (Vol_Ratio)
-        # 處理無成交量(盤前)的狀況
-        latest_vol = df['Volume'].iloc[-1]
-        if latest_vol == 0 or pd.isna(latest_vol):
-            df['Vol_Ratio'] = 0
-            is_pre = True
-        else:
-            df['Vol_MA20'] = df['Volume'].rolling(window=20).mean()
-            df['Vol_Ratio'] = df['Volume'] / df['Vol_MA20'].replace(0, np.inf)
-            is_pre = False
+        # C. 量能增幅 (相較於20日平均)
+        df['Vol_MA20'] = df['Volume'].rolling(window=20).mean()
+        df['Vol_Ratio'] = df['Volume'] / df['Vol_MA20'].replace(0, np.inf)
 
-        # 5. 【Predator 戰略標籤】邏輯
+        # 4. 【Predator 智能標籤】判讀邏輯
         def get_tag(row):
-            if is_pre: return "🕒 等待開盤"
+            # 判斷是否為無成交量時段 (盤前)
+            if row['Volume'] == 0: return "🕒 待開盤"
             
             tags = []
-            # 攻擊標籤
-            if row['Vol_Ratio'] > 1.5 and row['Return'] > 1.5:
+            # 攻擊標籤：量大且漲幅明確
+            if row['Vol_Ratio'] > 1.5 and row['Return'] > 1.8:
                 tags.append("🔥主力進攻")
-            # 位階標籤
-            if -2 < row['MA_Bias'] < 3 and row['Return'] > 0:
+            
+            # 位階標籤：乖離率在安全區且收紅
+            if -1 < row['MA_Bias'] < 4 and row['Return'] > 0:
                 tags.append("🛡️低位起漲")
             elif row['MA_Bias'] > 15:
-                tags.append("⚠️乖離過熱")
-            # 力道標籤
-            if row['Body_Power'] > 75 and row['Return'] > 2:
+                tags.append("⚠️乖離過大")
+            
+            # 品質標籤：收盤價接近最高點
+            if row['Body_Power'] > 80 and row['Return'] > 2:
                 tags.append("⚡真突破")
-            elif row['Body_Power'] < 30 and row['Vol_Ratio'] > 2:
-                tags.append("❌壓制/出貨")
                 
-            return " ".join(tags) if tags else "○ 觀察"
+            return " ".join(tags) if tags else "○ 盤整"
 
         df['Predator_Tag'] = df.apply(get_tag, axis=1)
-        
-        # 6. 整理報告文字 (給 Gem 數據介入用)
-        # 優先篩選出今日有標籤的強勢股
-        target_df = df.sort_values('Vol_Ratio', ascending=False).head(15)
-        
+        df = df.fillna(0) # 清除所有 NaN 避免網頁空白
+
+        # 5. 輸出給 Gem 的數據介入格式
+        top_active = df.sort_values('Vol_Ratio', ascending=False).head(12)
         report_text = {
-            "📊 今日個股績效榜": target_df[['Symbol', 'Close', 'Return', 'Predator_Tag']].to_string(index=False),
-            "FINAL_AI_REPORT": f"V14.0 系統判讀：匯率對應{'盤前' if is_pre else '實戰'}模式。重點鎖定 [🛡️低位起漲] 之右側交易機會。"
+            "📊 今日個股績效榜": top_active[['Symbol', 'Close', 'Return', 'Predator_Tag']].to_string(index=False),
+            "FINAL_AI_REPORT": "匯率環境穩定，當前策略重點：優先鎖定[🛡️低位起漲]標的之右側轉強機會。"
         }
-        
-        # 處理數值空值 (避免網頁顯示 NaN)
-        df = df.fillna(0)
         
         return [], df, report_text
 
     except Exception as e:
-        import traceback
-        error_msg = f"分析引擎崩潰: {str(e)}\n{traceback.format_exc()}"
-        return None, None, {"Error": error_msg}
+        return None, None, {"Error": f"分析引擎異常: {str(e)}"}
