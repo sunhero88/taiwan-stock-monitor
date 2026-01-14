@@ -5,82 +5,130 @@ import yfinance as yf
 import requests
 import analyzer
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 import pytz
 
 TW_TZ = pytz.timezone('Asia/Taipei')
 
-# --- 1. 抓取全球指數 ---
-def fetch_global_indices():
-    """抓取 大盤、道瓊、那指、費半"""
+# --- 1. 抓取詳細指數數據 (含開高低收) ---
+def fetch_detailed_indices():
+    """
+    抓取詳細的大盤、櫃買、美股指數數據
+    包含: 現價, 漲跌, 幅度, 開盤, 最高, 最低, 昨收
+    """
+    # 定義要抓取的指數代碼
+    # 註: Yahoo Finance 對台股類股指數支援不穩，故以龍頭股或ETF做參考，
+    # 這裡我們主要抓取 加權、櫃買(嘗試 ^TWOII)、道瓊、費半
     tickers = {
-        "^TWII": "台股加權",
-        "^DJI": "道瓊工業",
-        "^IXIC": "那斯達克",
-        "^SOX": "費城半導體"
+        "^TWII": "🇹🇼 加權指數",
+        "^TWOII": "🇹🇼 櫃買指數", # 櫃買有時會抓不到
+        "^SOX": "🇺🇸 費城半導體",
+        "^DJI": "🇺🇸 道瓊工業"
     }
+    
+    data_list = []
+    
     try:
-        # 下載最近 2 天數據以計算漲跌
-        data = yf.download(list(tickers.keys()), period="5d", progress=False)
-        indices_info = {}
+        # 下載數據
+        raw_data = yf.download(list(tickers.keys()), period="5d", progress=False)
         
         for ticker, name in tickers.items():
-            # 處理 MultiIndex
             try:
-                hist = data['Close'][ticker].dropna()
-                if len(hist) >= 2:
-                    price = hist.iloc[-1]
-                    prev = hist.iloc[-2]
-                    change = price - prev
-                    pct = (change / prev) * 100
-                    
-                    indices_info[ticker] = {
-                        "Name": name,
-                        "Price": f"{price:,.0f}",
-                        "Change": change,
-                        "Pct": pct,
-                        "Color": "off" if change == 0 else ("inverse" if change < 0 else "normal") # 配合 st.metric 顏色
-                    }
-            except:
-                continue
-        return indices_info
-    except:
-        return {}
+                # 處理 MultiIndex 結構
+                df = raw_data.xs(ticker, axis=1, level=1) if isinstance(raw_data.columns, pd.MultiIndex) else raw_data
+                
+                # 針對單一 ticker 再次確認
+                if ticker not in raw_data.columns.levels[0]:
+                     # 有時 download 會失敗，這裡做容錯
+                     pass
 
-# --- 2. 抓取大盤總籌碼 (全市場) ---
-def fetch_market_total_inst():
-    """抓取全市場法人買賣超金額 (億元)"""
+                # 提取該指數的 OHLC
+                # 注意：yfinance 的結構有時是 (Price, Ticker) 有時是 (Ticker, Price)
+                # 這裡使用更穩健的單一提取法
+                stock = yf.Ticker(ticker)
+                hist = stock.history(period="5d")
+                
+                if not hist.empty:
+                    latest = hist.iloc[-1]
+                    prev = hist.iloc[-2]
+                    
+                    price = latest['Close']
+                    change = price - prev['Close']
+                    pct = (change / prev['Close']) * 100
+                    
+                    # 構建資料列
+                    data_list.append({
+                        "指數名稱": name,
+                        "現價": f"{price:,.0f}",
+                        "漲跌": f"{change:+.2f}",
+                        "幅度": f"{pct:+.2f}%",
+                        "開盤": f"{latest['Open']:,.0f}",
+                        "最高": f"{latest['High']:,.0f}",
+                        "最低": f"{latest['Low']:,.0f}",
+                        "昨收": f"{prev['Close']:,.0f}",
+                        # 成交金額通常 Yahoo 只有 Volume (股數)，這邊先留著，下面用 FinMind 補強
+                        "成交量": f"{latest['Volume']/1000000:.1f}M" if latest['Volume'] > 0 else "-" 
+                    })
+            except Exception as e:
+                # 抓不到就填空值，不報錯
+                data_list.append({
+                    "指數名稱": name, "現價": "-", "漲跌": "-", "幅度": "-", 
+                    "開盤": "-", "最高": "-", "最低": "-", "昨收": "-"
+                })
+                continue
+                
+    except Exception as e:
+        st.error(f"指數數據獲取異常: {e}")
+        
+    return pd.DataFrame(data_list)
+
+# --- 2. 抓取大盤總成交金額 (FinMind) ---
+def fetch_market_amount():
+    """抓取加權與櫃買的真實成交金額 (億元)"""
     now = datetime.now(TW_TZ)
-    # 盤中同樣無法取得，回傳 None
+    if now.hour < 9: return "開盤前"
+    
+    # 這裡我們用簡單的估算或 API，FinMind 盤後才有準確金額
+    # 盤中我們先回傳 "統計中"
     if now.hour < 15:
-        return "⚡盤中統計中..."
+        return "⚡ 盤中統計中"
         
     date_str = now.strftime('%Y-%m-%d')
     url = "https://api.finmindtrade.com/api/v4/data"
-    params = {
-        "dataset": "TaiwanStockTotalInstitutionalInvestors",
-        "date": date_str
-    }
+    params = { "dataset": "TaiwanStockPrice", "data_id": "TAIEX", "date": date_str }
+    
+    try:
+        r = requests.get(url, params=params, timeout=5)
+        data = r.json()
+        if data.get('msg') == 'success' and data.get('data'):
+            # FinMind TAIEX 的成交金額單位是元
+            amount = data['data'][0]['Trading_Money']
+            return f"{amount / 100000000:.0f} 億"
+    except:
+        pass
+    return "待更新"
+
+# --- 3. 抓取全市場法人 (維持原樣) ---
+def fetch_market_total_inst():
+    now = datetime.now(TW_TZ)
+    if now.hour < 15: return "⚡盤中動能觀測"
+    date_str = now.strftime('%Y-%m-%d')
+    url = "https://api.finmindtrade.com/api/v4/data"
+    params = { "dataset": "TaiwanStockTotalInstitutionalInvestors", "date": date_str }
     try:
         r = requests.get(url, params=params, timeout=5)
         data = r.json()
         if data.get('msg') == 'success' and data.get('data'):
             df = pd.DataFrame(data['data'])
-            # 加總買賣超 (單位：元) -> 轉為億元
-            total_buy = df['buy'].sum()
-            total_sell = df['sell'].sum()
-            net = (total_buy - total_sell) / 100000000 # 億
-            
+            net = (df['buy'].sum() - df['sell'].sum()) / 100000000
             return f"🔴+{net:.1f}億" if net > 0 else f"🔵{net:.1f}億"
-    except:
-        pass
-    return "⚡待更新"
+    except: pass
+    return "待更新"
 
-# --- 3. 抓取個股籌碼 (保留原本邏輯) ---
+# --- 4. 抓取個股與籌碼 (維持原樣) ---
 def fetch_inst_data_finmind_stock():
     now = datetime.now(TW_TZ)
-    if now.hour < 15: return pd.DataFrame() # 盤中回傳空
-
+    if now.hour < 15: return pd.DataFrame()
     date_str = now.strftime('%Y-%m-%d')
     url = "https://api.finmindtrade.com/api/v4/data"
     params = { "dataset": "TaiwanStockInstitutionalInvestorsBuySell", "date": date_str }
@@ -103,13 +151,8 @@ def fetch_market_data(m_id):
         "us": ["AAPL", "NVDA", "TSLA", "MSFT", "GOOGL", "AMD", "META", "AMZN"]
     }
     symbols = targets.get(m_id, targets["tw-share"])
-    
-    # 1. 抓取即時價量
     raw_data = yf.download(symbols, period="2mo", interval="1d", group_by='ticker', progress=False)
-    
-    # 2. 抓取個股真實籌碼 (15:00後)
     inst_df = fetch_inst_data_finmind_stock() if m_id == "tw-share" else pd.DataFrame()
-    
     all_res = []
     for s in symbols:
         if s in raw_data.columns.levels[0]:
@@ -122,70 +165,82 @@ def fetch_market_data(m_id):
             all_res.append(s_df)
     return pd.concat(all_res) if all_res else pd.DataFrame()
 
-# --- Streamlit UI 介面 ---
+# --- UI 介面 ---
 st.set_page_config(page_title="Predator V14.0", layout="wide")
 
-st.title("🦅 Predator 指揮中心 V14.0 (宏觀戰情版)")
+st.title("🦅 Predator 指揮中心 V14.0 (宏觀全景版)")
 market = st.sidebar.selectbox("市場介入", ["tw-share", "us"])
 
 if st.button("🔥 啟動全域掃描與分析"):
-    with st.spinner("🚀 正在連線全球交易所獲取指數、籌碼與個股動能..."):
+    with st.spinner("🚀 正在連線交易所獲取全景行情..."):
         
-        # A. 獲取宏觀數據
-        indices = fetch_global_indices()
-        market_inst_total = fetch_market_total_inst() if market == "tw-share" else "N/A"
+        # 1. 獲取宏觀指數 (詳細版)
+        indices_df = fetch_detailed_indices()
+        total_amount = fetch_market_amount()
+        total_inst = fetch_market_total_inst()
         
-        # B. 獲取個股數據
+        # 2. 獲取個股
         full_df = fetch_market_data(market)
         
+        # 顯示宏觀戰情室
+        st.subheader("🌍 宏觀戰情室 (Market Overview)")
+        
+        # 顯示大盤資金概況
+        c1, c2 = st.columns(2)
+        c1.metric("💰 大盤成交金額", total_amount)
+        c2.metric("🏦 全市場法人動向", total_inst)
+        
+        # 顯示詳細指數表格 (比照 Yahoo 股市)
+        if not indices_df.empty:
+            # 針對漲跌欄位做顏色處理 (UI 美化)
+            def color_change(val):
+                if isinstance(val, str) and '+' in val:
+                    return 'color: #ff4b4b' # 紅色 (漲)
+                elif isinstance(val, str) and '-' in val:
+                    return 'color: #00c853' # 綠色 (跌)
+                return ''
+            
+            st.dataframe(
+                indices_df.style.applymap(color_change, subset=['漲跌', '幅度']),
+                use_container_width=True,
+                hide_index=True
+            )
+        else:
+            st.warning("指數數據暫時無法取得")
+            
+        st.divider()
+
         if not full_df.empty:
             top_10, report_text = analyzer.run_analysis(full_df)
-            macro_analysis = analyzer.analyze_market_trend(indices, market_inst_total)
             
-            # --- 1. 顯示宏觀指標 (Metrics) ---
-            st.subheader("🌍 宏觀戰情室")
-            col1, col2, col3, col4, col5 = st.columns(5)
-            
-            # 顯示指數卡片
-            def show_metric(col, key, label):
-                item = indices.get(key)
-                if item:
-                    col.metric(label, item['Price'], f"{item['Change']:.2f} ({item['Pct']:.2f}%)")
-                else:
-                    col.metric(label, "Loading...", "0.00")
+            # 生成宏觀分析文字
+            macro_text = analyzer.analyze_market_trend(
+                # 這裡簡單轉換 indices_df 給 analyzer 使用
+                {row['指數名稱']: {'Change': float(row['漲跌']), 'Pct': float(row['幅度'].strip('%'))} 
+                 for _, row in indices_df.iterrows() if row['漲跌'] != '-'}, 
+                total_inst
+            )
 
-            show_metric(col1, "^TWII", "🇹🇼 台股加權")
-            show_metric(col2, "^DJI", "🇺🇸 道瓊工業")
-            show_metric(col3, "^SOX", "🇺🇸 費城半導體") # 對台股最重要
+            st.success("✅ 全域分析完成")
             
-            # 顯示大盤籌碼
-            col4.metric("💰 全市場法人", market_inst_total, "今日動向")
-            
-            st.divider()
-
-            if not top_10.empty:
-                st.success("✅ 全域分析完成")
-                
-                # --- 2. 📋 整合報告區塊 (一鍵複製) ---
-                st.subheader("📋 戰情摘要 (複製給 Predator Gem)")
-                timestamp = datetime.now(TW_TZ).strftime('%Y-%m-%d %H:%M')
-                
-                # 組合 宏觀 + 個股 的完整報告
-                final_report = f"""【Predator V14.0 戰情日報】
+            st.subheader("📋 戰情摘要 (複製給 Predator Gem)")
+            timestamp = datetime.now(TW_TZ).strftime('%Y-%m-%d %H:%M')
+            final_report = f"""【Predator V14.0 戰情日報】
 時間：{timestamp} | 市場：{market}
 
-[🌍 宏觀分析]
-{macro_analysis}
+[🌍 宏觀數據]
+成交金額：{total_amount} | 法人動向：{total_inst}
+{indices_df.to_string(index=False) if not indices_df.empty else "指數數據N/A"}
 
-[🦅 智能十股]
+[🦅 宏觀分析]
+{macro_text}
+
+[⚡ 智能十股]
 {report_text}
 """
-                st.code(final_report, language="markdown")
-                
-                # --- 3. 詳細表格 ---
-                st.subheader("📊 關鍵標的指標")
-                st.dataframe(top_10[['Symbol', 'Close', 'MA_Bias', 'Inst_Status', 'Vol_Ratio', 'Predator_Tag', 'Score']], use_container_width=True)
-            else:
-                st.error("個股分析結果為空")
+            st.code(final_report, language="markdown")
+            
+            st.subheader("📊 關鍵標的指標")
+            st.dataframe(top_10[['Symbol', 'Close', 'MA_Bias', 'Inst_Status', 'Vol_Ratio', 'Predator_Tag', 'Score']], use_container_width=True)
         else:
-            st.error("數據獲取異常")
+            st.error("個股數據獲取異常")
