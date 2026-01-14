@@ -16,7 +16,8 @@ def run(market_id):
         df['Body_Power'] = (abs(df['Close'] - df['Open']) / (df['High'] - df['Low']).replace(0, np.inf)) * 100
         
         # 處理盤前數據 (Volume=0)
-        if df['Volume'].iloc[-1] == 0:
+        latest_vol = df['Volume'].iloc[-1]
+        if latest_vol == 0 or pd.isna(latest_vol):
             df['Vol_Ratio'] = 0
             is_pre = True
         else:
@@ -33,7 +34,12 @@ def run(market_id):
             return " ".join(tags) if tags else "○ 觀察"
 
         df['Predator_Tag'] = df.apply(get_tag, axis=1)
-        report_text = {"📊 今日個股績效榜": df.tail(10)[['Symbol', 'Close', 'Return', 'Predator_Tag']].to_string(index=False)}
+        
+        # 產出摘要報告
+        report_text = {
+            "📊 今日個股績效榜": df.tail(10)[['Symbol', 'Close', 'Return', 'Predator_Tag']].to_string(index=False),
+            "FINAL_AI_REPORT": "根據 V14.0 邏輯判讀：優先關注[🛡️低位起漲]且[⚡真突破]之標的。"
+        }
         return [], df, report_text
     except Exception as e:
         return None, None, {"Error": str(e)}
