@@ -1,9 +1,9 @@
 name: Predator Daily Analysis V14.0
 on:
   schedule:
-    - cron: '30 0 * * 1-5' # 台北 08:30
-    - cron: '0 3 * * 1-5'  # 台北 11:00
-    - cron: '30 8 * * 1-5' # 台北 16:30
+    - cron: '30 0 * * 1-5' # 08:30 台北
+    - cron: '0 3 * * 1-5'  # 11:00 台北
+    - cron: '30 8 * * 1-5' # 16:30 台北
   workflow_dispatch:
 jobs:
   build:
@@ -13,10 +13,9 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.10' # 修正關鍵：升級版本
+          python-version: '3.10' # 🚀 強制要求 3.10
       - name: Install Dependencies
-        run: |
-          pip install pandas yfinance numpy requests beautifulsoup4 streamlit resend matplotlib
+        run: pip install pandas yfinance numpy requests beautifulsoup4 streamlit resend matplotlib
       - name: Run Predator
         env:
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
