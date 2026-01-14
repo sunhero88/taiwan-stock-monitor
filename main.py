@@ -22,23 +22,25 @@ def execute_analysis(market_id):
     return analyzer.run(market_id)
 
 if __name__ == "__main__":
-    # GitHub Actions 模式
+    # GitHub Actions 模式 (CLI)
     if "--cli" in sys.argv:
         session_name, target_market = get_session_info()
+        print(f"📡 執行模式：CLI | 時段：{session_name} | 市場：{target_market}")
         images, df_res, text_reports = execute_analysis(target_market)
         notifier = StockNotifier()
         notifier.send_stock_report(f"Predator V14.0 - {session_name}", images, df_res, text_reports)
     
-    # 本地 Streamlit 模式
+    # 本地 Streamlit 模式 (Web)
     else:
-        st.set_page_config(page_title="Predator V14.0", layout="wide")
+        st.set_page_config(page_title="Predator V14.0 指揮中心", layout="wide")
         st.title("🦅 Predator 戰略指揮中心 V14.0")
         market = st.sidebar.selectbox("監控市場", ["tw-share", "us", "asia"])
         
         if st.button("🔥 啟動即時數據介入"):
-            images, df_res, text_reports = execute_analysis(market)
-            st.subheader("📋 複製給 Predator Gem (數據介入)")
-            copy_msg = f"【數據介入報告】\n{text_reports.get('📊 今日個股績效榜', '')}"
-            st.code(copy_msg, language="markdown")
-            if df_res is not None:
-                st.dataframe(df_res.tail(20))
+            with st.spinner("介入數據中..."):
+                images, df_res, text_reports = execute_analysis(market)
+                st.subheader("📋 數據介入：請複製給 Predator Gem")
+                copy_msg = f"【數據介入報告】\n{text_reports.get('📊 今日個股績效榜', '')}"
+                st.code(copy_msg, language="markdown")
+                if df_res is not None:
+                    st.dataframe(df_res.tail(20))
