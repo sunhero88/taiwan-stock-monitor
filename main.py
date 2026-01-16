@@ -1,11 +1,16 @@
+# =========================
 # main.py
+# Predator V15.5.2 Patch (Inst fix + Rev_Growth rename + NBSP-safe)
+# =========================
 # -*- coding: utf-8 -*-
 """
 Filename: main.py
-Version: Predator V15.5.1 (HA + Caching + NBSP-safe)
-Notes:
-- Avoids non-printable characters (e.g., U+00A0)
-- Uses caching for stability on Streamlit Cloud
+Version: Predator V15.5.2 (Inst-Aware + Rev_Growth + NBSP-safe)
+Patch goals:
+A) 修正 Inst_Visual 全部 N/A：確保 Inst_Status / Inst_Net 會進入 analyzer 的輸出
+B) 修正 QoQ 命名誤判：Structure 欄位改為 Rev_Growth（來源 yfinance: revenueGrowth）
+C) Streamlit Cloud 穩定：cache + 嚴格 MultiIndex 判斷 + 全域 try/except
+D) 避免 U+00A0：全檔案僅使用一般空白
 """
 import streamlit as st
 import pandas as pd
@@ -17,15 +22,29 @@ import pytz
 
 TW_TZ = pytz.timezone("Asia/Taipei")
 
+
 # ======================================================
-# 1) Data Fetchers (with caching)
+# 0) Utilities
+# ======================================================
+
+def _safe_float(x, default=0.0) -> float:
+    try:
+        v = float(x)
+        if pd.isna(v):
+            return default
+        return v
+    except Exception:
+        return default
+
+
+# ======================================================
+# 1) Data fetchers (with caching)
 # ======================================================
 
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_detailed_indices() -> pd.DataFrame:
     """
-    Fetch indices one-by-one to avoid yfinance MultiIndex quirks.
-    Cached for 60 seconds.
+    逐一抓取指數，避免 yfinance MultiIndex 型別不一致。
     """
     tickers = {
         "^TWII": "TW 加權指數",
@@ -44,19 +63,19 @@ def fetch_detailed_indices() -> pd.DataFrame:
             latest = hist.iloc[-1]
             prev = hist.iloc[-2]
 
-            price = float(latest["Close"])
-            prev_close = float(prev["Close"])
+            price = _safe_float(latest.get("Close", 0.0))
+            prev_close = _safe_float(prev.get("Close", 0.0))
             change = price - prev_close
-            pct = (change / prev_close) * 100 if prev_close != 0 else 0.0
+            pct = (change / prev_close) * 100.0 if prev_close != 0 else 0.0
 
             rows.append({
                 "指數名稱": name,
                 "現價": f"{price:,.0f}",
                 "漲跌": f"{change:+.2f}",
                 "幅度": f"{pct:+.2f}%",
-                "開盤": f"{float(latest.get('Open', 0.0)):,.0f}",
-                "最高": f"{float(latest.get('High', 0.0)):,.0f}",
-                "最低": f"{float(latest.get('Low', 0.0)):,.0f}",
+                "開盤": f"{_safe_float(latest.get('Open', 0.0)):,.0f}",
+                "最高": f"{_safe_float(latest.get('High', 0.0)):,.0f}",
+                "最低": f"{_safe_float(latest.get('Low', 0.0)):,.0f}",
                 "昨收": f"{prev_close:,.0f}",
             })
         except Exception:
@@ -77,8 +96,7 @@ def fetch_detailed_indices() -> pd.DataFrame:
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_market_amount() -> str:
     """
-    Market trading amount (FinMind). Cached for 60 seconds.
-    FinMind often updates final value after 15:00.
+    大盤成交額 (FinMind)。
     """
     now = datetime.now(TW_TZ)
     if 9 <= now.hour < 15:
@@ -89,12 +107,12 @@ def fetch_market_amount() -> str:
         r = requests.get(
             "https://api.finmindtrade.com/api/v4/data",
             params={"dataset": "TaiwanStockPrice", "data_id": "TAIEX", "date": date_str},
-            timeout=3,
+            timeout=5,
         )
         data = r.json()
         if data.get("msg") == "success" and data.get("data"):
-            money = data["data"][0]["Trading_Money"]
-            return f"{money / 100000000:.0f} 億"
+            money = data["data"][0].get("Trading_Money", 0)
+            return f"{_safe_float(money) / 100000000:.0f} 億"
     except Exception:
         pass
 
@@ -104,7 +122,7 @@ def fetch_market_amount() -> str:
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_market_total_inst() -> str:
     """
-    Total institutional net (FinMind). Cached for 60 seconds.
+    全市場法人買賣超 (FinMind)。
     """
     now = datetime.now(TW_TZ)
     if now.hour < 15:
@@ -115,12 +133,12 @@ def fetch_market_total_inst() -> str:
         r = requests.get(
             "https://api.finmindtrade.com/api/v4/data",
             params={"dataset": "TaiwanStockTotalInstitutionalInvestors", "date": date_str},
-            timeout=3,
+            timeout=5,
         )
         data = r.json()
         if data.get("msg") == "success" and data.get("data"):
             df = pd.DataFrame(data["data"])
-            net = (df["buy"].sum() - df["sell"].sum()) / 100000000
+            net = (_safe_float(df["buy"].sum()) - _safe_float(df["sell"].sum())) / 100000000
             return f"+{net:.1f} 億" if net > 0 else f"{net:.1f} 億"
     except Exception:
         pass
@@ -131,8 +149,8 @@ def fetch_market_total_inst() -> str:
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_inst_data_finmind_stock() -> pd.DataFrame:
     """
-    Per-stock institutional net (FinMind). Cached for 5 minutes.
-    Returns columns: Symbol, Inst_Net
+    個股法人買賣超 (FinMind)。
+    output: Symbol, Inst_Net
     """
     now = datetime.now(TW_TZ)
     if now.hour < 15:
@@ -143,15 +161,17 @@ def fetch_inst_data_finmind_stock() -> pd.DataFrame:
         r = requests.get(
             "https://api.finmindtrade.com/api/v4/data",
             params={"dataset": "TaiwanStockInstitutionalInvestorsBuySell", "date": date_str},
-            timeout=5,
+            timeout=10,
         )
         data = r.json()
         if data.get("msg") == "success" and data.get("data"):
             df = pd.DataFrame(data["data"])
-            df["Net"] = df["buy"] - df["sell"]
+            df["Net"] = pd.to_numeric(df["buy"], errors="coerce").fillna(0) - pd.to_numeric(df["sell"], errors="coerce").fillna(0)
             g = df.groupby("stock_id")["Net"].sum().reset_index()
-            g.columns = ["Symbol", "Inst_Net"]
-            g["Symbol"] = g["Symbol"].astype(str) + ".TW"
+            g.columns = ["stock_id", "Inst_Net"]
+            # 正規化成 yfinance 的 Symbol 格式：xxxx.TW
+            g["Symbol"] = g["stock_id"].astype(str).str.strip() + ".TW"
+            g = g[["Symbol", "Inst_Net"]]
             return g
     except Exception:
         pass
@@ -162,9 +182,8 @@ def fetch_inst_data_finmind_stock() -> pd.DataFrame:
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_market_data(market_id: str) -> pd.DataFrame:
     """
-    Fetch OHLCV for a predefined list of symbols.
-    Returns a long-form dataframe with columns: Date index + OHLCV + Symbol + (optional) Inst fields.
-    Cached for 5 minutes.
+    下載 OHLCV 並合併 Inst_Net / Inst_Status。
+    output columns: Date, Open, High, Low, Close, Volume, Symbol, Inst_Net, Inst_Status
     """
     targets = {
         "tw-share": [
@@ -175,7 +194,6 @@ def fetch_market_data(market_id: str) -> pd.DataFrame:
         ],
         "us": ["AAPL", "NVDA", "TSLA", "MSFT", "GOOGL", "AMD", "META", "AMZN"],
     }
-
     symbols = targets.get(market_id, targets["tw-share"])
 
     raw = yf.download(
@@ -188,57 +206,62 @@ def fetch_market_data(market_id: str) -> pd.DataFrame:
     )
 
     inst_df = fetch_inst_data_finmind_stock() if market_id == "tw-share" else pd.DataFrame()
-    all_res = []
+    all_rows = []
 
-    # Determine structure
-    if isinstance(raw.columns, pd.MultiIndex):
-        available = list(raw.columns.levels[0])
-        multi = True
-    else:
-        available = symbols if len(symbols) == 1 and not raw.empty else []
-        multi = False
+    # 嚴格判定 MultiIndex
+    multi = isinstance(raw.columns, pd.MultiIndex)
 
-    # If multi-symbol but not MultiIndex, treat as failure
+    # 多檔但非 MultiIndex => 視為下載異常
     if len(symbols) > 1 and not multi:
         return pd.DataFrame()
 
     for s in symbols:
         try:
             if multi:
-                if s not in available:
+                if s not in raw.columns.levels[0]:
                     continue
                 s_df = raw[s].copy().dropna()
             else:
-                # single symbol
+                # 單檔回傳單層 columns
                 s_df = raw.copy().dropna()
 
             if s_df.empty:
                 continue
 
+            s_df = s_df.reset_index()
+            if "Datetime" in s_df.columns and "Date" not in s_df.columns:
+                s_df = s_df.rename(columns={"Datetime": "Date"})
+
             s_df["Symbol"] = s
 
+            # 合併籌碼
             if market_id == "tw-share":
                 if not inst_df.empty and s in inst_df["Symbol"].values:
-                    net_val = float(inst_df.loc[inst_df["Symbol"] == s, "Inst_Net"].values[0])
+                    net_val = _safe_float(inst_df.loc[inst_df["Symbol"] == s, "Inst_Net"].values[0], 0.0)
                     s_df["Inst_Net"] = net_val
                     val_k = round(net_val / 1000.0, 1)
-                    s_df["Inst_Status"] = f"+{val_k}k" if net_val > 0 else f"{val_k}k"
+                    s_df["Inst_Status"] = f"🔴+{val_k}k" if net_val > 0 else f"🔵{val_k}k"
                 else:
                     s_df["Inst_Net"] = 0.0
                     s_df["Inst_Status"] = "N/A"
+            else:
+                s_df["Inst_Net"] = 0.0
+                s_df["Inst_Status"] = "N/A"
 
-            all_res.append(s_df)
+            all_rows.append(s_df)
         except Exception:
             continue
 
-    if not all_res:
+    if not all_rows:
         return pd.DataFrame()
 
-    out = pd.concat(all_res)
-    out = out.reset_index()  # bring Date out as a column named 'Date'
-    # yfinance uses 'Date' or 'Datetime' depending on interval; normalize:
-    if "Datetime" in out.columns and "Date" not in out.columns:
-        out = out.rename(columns={"Datetime": "Date"})
+    out = pd.concat(all_rows, ignore_index=True)
+
+    # 統一欄位存在性（避免 analyzer 防呆後全 NaN）
+    for c in ["Date", "Open", "High", "Low", "Close", "Volume", "Symbol", "Inst_Net", "Inst_Status"]:
+        if c not in out.columns:
+            out[c] = pd.NA
+
     return out
 
 
@@ -246,21 +269,19 @@ def fetch_market_data(market_id: str) -> pd.DataFrame:
 # 2) UI
 # ======================================================
 
-st.set_page_config(page_title="Predator V15.5.1", layout="wide")
-st.title("Predator 指揮中心 V15.5.1")
+st.set_page_config(page_title="Predator V15.5.2", layout="wide")
+st.title("Predator 指揮中心 V15.5.2 (Inst + Rev_Growth)")
 
 market = st.sidebar.selectbox("市場介入", ["tw-share", "us"])
 
 if st.button("啟動全域掃描與結構分析"):
     try:
-        with st.spinner("執行中：技術面篩選 → 動能估算 → 基本面結構掃描"):
+        with st.spinner("執行中：技術面篩選 → 籌碼合併 → 結構面掃描"):
             indices_df = fetch_detailed_indices()
             total_amount = fetch_market_amount()
             total_inst = fetch_market_total_inst()
-
             full_df = fetch_market_data(market)
 
-            # Macro panel
             st.subheader("宏觀戰情室")
             c1, c2 = st.columns(2)
             c1.metric("大盤成交金額", total_amount)
@@ -282,16 +303,15 @@ if st.button("啟動全域掃描與結構分析"):
                 st.warning("國際指數數據暫時無法獲取")
 
             st.divider()
-
-            # Core analysis
             st.subheader("戰略核心分析")
 
+            # Session：15:00 後才視為 EOD（對齊 FinMind）
             current_hour = datetime.now(TW_TZ).hour
             current_session = analyzer.SESSION_EOD if current_hour >= 15 else analyzer.SESSION_INTRADAY
 
             top_10, err_msg = analyzer.run_analysis(full_df, session=current_session)
 
-            # Diagnostics
+            # Sidebar diagnostics
             if err_msg:
                 st.sidebar.error(f"系統警示: {err_msg}")
 
@@ -300,13 +320,16 @@ if st.button("啟動全域掃描與結構分析"):
                 total_symbols = full_df["Symbol"].nunique() if "Symbol" in full_df.columns else 0
                 missing_close = full_df["Close"].isna().mean() * 100 if "Close" in full_df.columns else 100.0
                 missing_vol = full_df["Volume"].isna().mean() * 100 if "Volume" in full_df.columns else 100.0
+                inst_coverage = (full_df["Inst_Status"] != "N/A").mean() * 100 if "Inst_Status" in full_df.columns else 0.0
+
                 st.sidebar.info(
                     "資料源診斷\n"
                     f"- 總筆數: {total_rows:,}\n"
                     f"- 監控標的: {total_symbols}\n"
                     "資料品質\n"
                     f"- Close 缺值: {missing_close:.1f}%\n"
-                    f"- Volume 缺值: {missing_vol:.1f}%"
+                    f"- Volume 缺值: {missing_vol:.1f}%\n"
+                    f"- 籌碼覆蓋率(非N/A): {inst_coverage:.1f}%"
                 )
             else:
                 st.sidebar.warning("資料源為空（可能連線失敗或市場休市）")
@@ -331,7 +354,7 @@ if st.button("啟動全域掃描與結構分析"):
             )
 
             st.subheader("AI 戰略數據包（JSON）")
-            st.caption(f"包含：技術評分、結構面（OPM/QoQ/PE）、Kill Switch。Session={current_session}")
+            st.caption("注意：Structure.Rev_Growth 來源為 yfinance.info['revenueGrowth']（非嚴格 QoQ）。")
             st.code(json_payload, language="json")
 
             st.subheader("關鍵標的指標")
