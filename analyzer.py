@@ -1,8 +1,15 @@
+# =========================
 # analyzer.py
+# Predator V15.5.2 Patch (Inst pass-through + Rev_Growth rename)
+# =========================
 # -*- coding: utf-8 -*-
 """
 Filename: analyzer.py
-Version: Predator V15.4 (Bulletproof Strategy Engine) - V15.5.1 compatible
+Version: Predator V15.5.2 (Inst-Aware + Rev_Growth)
+Patch goals:
+A) 保留並傳遞 Inst_Status / Inst_Net：進入 df_top10 與 JSON
+B) Structure 欄位 QoQ 改名 Rev_Growth（來源 revenueGrowth）
+C) 仍保留 Kill Switch 與原 ERS 計分邏輯
 """
 import pandas as pd
 import numpy as np
@@ -31,6 +38,7 @@ DISTRIBUTE_VOL_RATIO = 2.5
 SESSION_INTRADAY = "INTRADAY"
 SESSION_EOD = "EOD"
 
+
 # ======================================================
 # 2) Helpers
 # ======================================================
@@ -41,14 +49,11 @@ def calc_body_power(row: dict) -> float:
         low = float(row.get("Low", np.nan))
         close = float(row.get("Close", np.nan))
         open_ = float(row.get("Open", np.nan))
-
         if not np.isfinite(high) or not np.isfinite(low) or not np.isfinite(close) or not np.isfinite(open_):
             return 0.0
-
         span = high - low
         if span <= 0:
             return 0.0
-
         return abs(close - open_) / span * 100.0
     except Exception:
         return 0.0
@@ -68,11 +73,15 @@ def calc_ma_bias_penalty(ma_bias) -> float:
 
 
 def enrich_fundamentals(symbol: str) -> dict:
-    data = {"OPM": 0, "QoQ": 0, "PE": 0, "Sector": "Unknown"}
+    """
+    結構面補強（輕量）：避免過多連線。
+    注意：Rev_Growth 來源為 yfinance.info['revenueGrowth']，口徑可能為 YoY/TTM 映射，非嚴格 QoQ。
+    """
+    data = {"OPM": 0, "Rev_Growth": 0, "PE": 0, "Sector": "Unknown"}
     try:
         info = (yf.Ticker(symbol).info) or {}
         data["OPM"] = round((info.get("operatingMargins") or 0) * 100, 2)
-        data["QoQ"] = round((info.get("revenueGrowth") or 0) * 100, 2)
+        data["Rev_Growth"] = round((info.get("revenueGrowth") or 0) * 100, 2)
         data["PE"] = round((info.get("trailingPE") or 0), 2)
         data["Sector"] = info.get("sector", "Unknown") or "Unknown"
     except Exception:
@@ -82,17 +91,19 @@ def enrich_fundamentals(symbol: str) -> dict:
 
 def _ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
     required = ["Symbol", "Date", "Open", "High", "Low", "Close", "Volume"]
-    for c in required:
+    optional = ["Inst_Net", "Inst_Status"]
+    for c in required + optional:
         if c not in df.columns:
             df[c] = np.nan
     return df
 
 
 def _coerce_types(df: pd.DataFrame) -> pd.DataFrame:
-    for c in ["Open", "High", "Low", "Close", "Volume"]:
+    for c in ["Open", "High", "Low", "Close", "Volume", "Inst_Net"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce", utc=False)
     df["Symbol"] = df["Symbol"].astype(str)
+    df["Inst_Status"] = df["Inst_Status"].astype(str)
     return df
 
 
@@ -128,6 +139,7 @@ def run_analysis(df: pd.DataFrame, session: str = SESSION_INTRADAY):
         if df_today.empty:
             return pd.DataFrame(), "No rows for latest_date"
 
+        # Amount for weighted determination
         df_today["Amount"] = (df_today["Close"] * df_today["Volume"]).fillna(0)
         if len(df_today) > 50:
             top_50_amt_threshold = df_today["Amount"].nlargest(50).min()
@@ -156,6 +168,7 @@ def run_analysis(df: pd.DataFrame, session: str = SESSION_INTRADAY):
                 continue
 
             latest = latest_row.to_dict()
+
             latest["MA_Bias"] = ((latest["Close"] - ma20) / ma20) * 100.0
             latest["Vol_Ratio"] = latest["Volume"] / vol_ma20
             latest["Body_Power"] = calc_body_power(latest)
@@ -171,10 +184,23 @@ def run_analysis(df: pd.DataFrame, session: str = SESSION_INTRADAY):
                 continue
 
             penalty = calc_ma_bias_penalty(latest["MA_Bias"])
-            ers = ((latest["Vol_Ratio"] * 20.0) + (max(0.0, 15.0 - abs(latest["MA_Bias"])) * 2.0)) * (1.0 - 0.5 * penalty)
+            ers = (
+                (latest["Vol_Ratio"] * 20.0) +
+                (max(0.0, 15.0 - abs(latest["MA_Bias"])) * 2.0)
+            ) * (1.0 - 0.5 * penalty)
 
             latest["Score"] = round(float(ers), 2)
             latest["_Is_Weighted"] = bool(is_weighted)
+
+            # 重要：保留 Inst 欄位（若上游有帶）
+            if "Inst_Net" in latest and latest["Inst_Net"] is not None:
+                try:
+                    latest["Inst_Net"] = float(latest["Inst_Net"])
+                except Exception:
+                    latest["Inst_Net"] = 0.0
+            if "Inst_Status" in latest and latest["Inst_Status"] is not None:
+                latest["Inst_Status"] = str(latest["Inst_Status"])
+
             results.append(latest)
 
         if not results:
@@ -182,6 +208,7 @@ def run_analysis(df: pd.DataFrame, session: str = SESSION_INTRADAY):
 
         candidates = pd.DataFrame(results).sort_values("Score", ascending=False).head(15).to_dict("records")
 
+        # Fundamental enrich + tags
         final_list = []
         for row in candidates:
             symbol = str(row.get("Symbol", ""))
@@ -189,9 +216,10 @@ def run_analysis(df: pd.DataFrame, session: str = SESSION_INTRADAY):
             fundamentals = enrich_fundamentals(symbol)
             row["Structure"] = fundamentals
 
-            # Kill Switch III: QoQ < 0
+            # Kill Switch III: 結構惡化（Rev_Growth < 0）
+            # 若不想太嚴格，可註解掉此區
             try:
-                if fundamentals.get("QoQ", 0) is not None and float(fundamentals.get("QoQ", 0)) < 0:
+                if fundamentals.get("Rev_Growth", 0) is not None and float(fundamentals.get("Rev_Growth", 0)) < 0:
                     continue
             except Exception:
                 pass
@@ -214,12 +242,20 @@ def run_analysis(df: pd.DataFrame, session: str = SESSION_INTRADAY):
 
             suffix = "(觀望)" if session == SESSION_INTRADAY else "(確認)"
             row["Predator_Tag"] = (" ".join(tags) + suffix) if tags else "觀察"
+
             final_list.append(row)
 
         if not final_list:
             return pd.DataFrame(), "no_results_after_fundamental_filter"
 
         df_final = pd.DataFrame(final_list).sort_values("Score", ascending=False).head(10)
+
+        # 再保險：確保 Inst_Status/Inst_Net 欄位存在
+        if "Inst_Status" not in df_final.columns:
+            df_final["Inst_Status"] = "N/A"
+        if "Inst_Net" not in df_final.columns:
+            df_final["Inst_Net"] = 0.0
+
         return df_final, ""
 
     except Exception as e:
@@ -247,13 +283,15 @@ def generate_ai_json(df_top10: pd.DataFrame, market: str = "tw-share", session: 
                 "Score": round(float(r.get("Score", 0) or 0), 1),
                 "Tag": r.get("Predator_Tag", ""),
             },
+            # 修正：優先用 Inst_Status，沒有才 N/A
             "Inst_Visual": r.get("Inst_Status", "N/A"),
+            "Inst_Net_Raw": float(r.get("Inst_Net", 0) or 0),
             "Structure": r.get("Structure", {}),
         })
 
     payload = {
         "meta": {
-            "system": "Predator V15.5.1",
+            "system": "Predator V15.5.2",
             "market": market,
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
             "session": session,
