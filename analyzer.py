@@ -1,178 +1,112 @@
 # -*- coding: utf-8 -*-
 import pandas as pd
 import numpy as np
-import json
-import yfinance as yf
+import os
+from pathlib import Path
+from datetime import datetime
 
-def analyze_market_trend(indices_data, tw_inst_total):
-    """生成宏觀股市分析短評"""
+def run(market_id="tw-share"):
+    """
+    V15.0 Predator 戰略核心分析引擎
+    整合：量能分級、ERS 加權排序、紅綠燈權限、Kill Switch 否決邏輯
+    """
     try:
-        twii = indices_data.get('^TWII', {})
-        tw_change = float(twii.get('漲跌', 0)) if isinstance(twii.get('漲跌'), (int, float)) else 0
-        tw_trend = "偏多" if tw_change > 0 else "偏空"
-        
-        sox = indices_data.get('^SOX', {})
-        sox_change = float(sox.get('漲跌', 0)) if isinstance(sox.get('漲跌'), (int, float)) else 0
-        sox_status = "強勢" if sox_change > 0 else "疲軟"
-        
-        fund_status = "流入" if "🔴" in str(tw_inst_total) else "流出"
-        
-        return f"台股結構{tw_trend}，費半表現{sox_status}，整體資金呈現{fund_status}。"
-    except:
-        return "宏觀數據待更新"
+        # 1. 讀取數據
+        data_path = Path(f"raw_data_{market_id}.csv")
+        if not data_path.exists():
+            return None, None, {"Error": "缺失 raw_data，請先執行下載器。"}
 
-def enrich_fundamentals(top_10_df):
-    """
-    針對篩選出的 Top 10 進行基本面結構掃描 (OPM, QoQ)
-    注意：這會增加一點處理時間，但對 AI 判讀至關重要
-    """
-    enriched_list = []
-    
-    for _, row in top_10_df.iterrows():
-        symbol = row['Symbol']
-        # 預設值
-        fund_data = {
-            "OPM": None,      # 營業利益率 (Operating Margins)
-            "QoQ": None,      # 營收成長率 (Revenue Growth)
-            "PE": None,       # 本益比
-            "Sector": "Unknown"
-        }
+        df = pd.read_csv(data_path)
         
-        try:
-            # 呼叫 yfinance info (需要連網)
-            ticker = yf.Ticker(symbol)
-            info = ticker.info
-            
-            fund_data["OPM"] = round(info.get('operatingMargins', 0) * 100, 2) if info.get('operatingMargins') else 0
-            fund_data["QoQ"] = round(info.get('revenueGrowth', 0) * 100, 2) if info.get('revenueGrowth') else 0
-            fund_data["PE"] = round(info.get('trailingPE', 0), 2) if info.get('trailingPE') else 0
-            fund_data["Sector"] = info.get('sector', 'Unknown')
-            
-        except:
-            pass # 抓不到就用預設值，不卡流程
-            
-        # 將基本面數據合併到 row
-        row_dict = row.to_dict()
-        row_dict['Fundamentals'] = fund_data
-        enriched_list.append(row_dict)
-        
-    return enriched_list
+        # --- 數據預處理與權值股定義 ---
+        # 計算成交額 (Amount) 用於動態定義權值股
+        df['Amount'] = df['Close'] * df['Volume']
+        # 取成交額前 50 名定義為權值股 (Heavyweight)
+        top_50_threshold = df['Amount'].nlargest(50).min()
+        df['Is_Heavyweight'] = df['Amount'] >= top_50_threshold
 
-def generate_ai_json(market, timestamp, macro_data, top_10_df):
-    """
-    V15.0: 包含結構面 (Structure) 與 修正後的籌碼數據
-    """
-    # 1. 進行基本面補強 (Enrichment)
-    # 轉為列表字典
-    enriched_stocks = enrich_fundamentals(top_10_df)
-    
-    final_stocks_list = []
-    for item in enriched_stocks:
+        # --- 第一層：量能門檻 (Volume Core) ---
+        df['Vol_MA20'] = df['Volume'].rolling(window=20).mean()
+        df['Vol_Ratio'] = df['Volume'] / df['Vol_MA20']
         
-        # 判斷籌碼性質
-        inst_type = "Estimated_Force" if "⚡" in str(item.get('Inst_Status')) else "Real_Institutional"
+        # 判定量能是否達標 (權值 1.2 / 中小 1.8)
+        df['Vol_Qualified'] = df.apply(
+            lambda r: r['Vol_Ratio'] >= 1.2 if r['Is_Heavyweight'] else r['Vol_Ratio'] >= 1.8, axis=1
+        )
+
+        # --- 第二層：排序指標 (Effective Return Score, ERS) ---
+        df['Return'] = df['Close'].pct_change() * 100
+        df['MA20'] = df['Close'].rolling(window=20).mean()
+        df['MA_Bias'] = ((df['Close'] - df['MA20']) / df['MA20']) * 100
         
-        stock_data = {
-            "Symbol": item['Symbol'],
-            "Price": item['Close'],
-            "Technical": {
-                "MA_Bias": round(item['MA_Bias'], 2),
-                "Vol_Ratio": round(item['Vol_Ratio'], 2),
-                "Score": round(item['Score'], 1),
-                "Tag": item['Predator_Tag']
-            },
-            "Institutional": {
-                "Status_Visual": item['Inst_Status'],
-                "Net_Raw": item.get('Inst_Net_Raw', 0), # 修正：確保有數值
-                "Type": inst_type, # 標註是估算還是真法人
-                "Note": "Intraday breakdown (Foreign/Trust) unavail." if inst_type == "Estimated_Force" else "Official Data"
-            },
-            "Structure": item['Fundamentals'] # 新增：基本面結構
-        }
-        final_stocks_list.append(stock_data)
-    
-    # 組裝完整封包
-    ai_data = {
-        "meta": {
-            "system": "Predator V15.0 (Structure Enhanced)",
-            "market": market,
-            "timestamp": timestamp,
-            "mode": "JSON_API_FULL"
-        },
-        "macro": macro_data,
-        "stocks": final_stocks_list
-    }
-    
-    return json.dumps(ai_data, ensure_ascii=False, indent=2)
-
-def run_analysis(df):
-    try:
-        if df is None or df.empty:
-            return pd.DataFrame(), ""
-
-        df = df.reset_index()
-        results = []
+        # MA_Bias 懲罰函數 (10%-15% 線性扣分, >15% 加重扣分)
+        def get_penalty(bias):
+            if bias <= 10: return 0
+            elif 10 < bias <= 15: return (bias - 10) / 5  # 線性 0~1
+            else: return 1 + (bias - 15) * 0.2           # 加重扣分
         
-        for symbol, group in df.groupby('Symbol'):
-            if len(group) < 20: continue
-            
-            group = group.sort_values('Date').tail(30)
-            latest = group.iloc[-1].copy()
-            
-            # --- 技術指標 ---
-            ma20 = group['Close'].rolling(window=20).mean().iloc[-1]
-            vol_ma20 = group['Volume'].rolling(window=20).mean().iloc[-1]
-            latest['MA_Bias'] = ((latest['Close'] - ma20) / ma20) * 100
-            latest['Vol_Ratio'] = latest['Volume'] / vol_ma20 if vol_ma20 > 0 else 0
-            
-            # --- 籌碼/動能 修正 ---
-            inst_net = latest.get('Inst_Net', 0)
-            
-            if inst_net == 0:
-                # ⚡ 盤中估算模式
-                h_l_range = latest['High'] - latest['Low']
-                est_force = latest['Volume'] * ((latest['Close'] - latest['Open']) / h_l_range) * 0.5 if h_l_range > 0 else 0
-                
-                # 關鍵修正：將估算值填入 Inst_Net_Raw，讓 AI 有數字可讀
-                latest['Inst_Net_Raw'] = est_force 
-                
-                val_k = round(est_force / 1000, 1)
-                latest['Inst_Status'] = f"⚡🔴+{val_k}k" if est_force > 0 else f"⚡🔵{val_k}k"
-                score_feed = est_force
-            else:
-                # 盤後真實模式
-                latest['Inst_Net_Raw'] = inst_net # 真實值
-                
-                val_k = round(inst_net / 1000, 1)
-                latest['Inst_Status'] = f"🔴+{val_k}k" if inst_net > 0 else f"🔵{val_k}k"
-                score_feed = inst_net
+        df['Penalty'] = df['MA_Bias'].apply(get_penalty)
+        # ERS 公式：漲幅 * 量比 * (1 - 0.5 * 懲罰)
+        df['ERS'] = df['Return'] * df['Vol_Ratio'] * (1 - 0.5 * df['Penalty'])
 
-            # --- 評分 ---
-            chip_score = min(25, max(0, score_feed / 1000 * 5)) if score_feed > 0 else 0
-            score = (min(latest['Vol_Ratio'] * 12, 40) + 
-                     max(0, (12 - abs(latest['MA_Bias'])) * 2.5) + 
-                     chip_score)
-            latest['Score'] = score
-            
-            # --- 標籤 ---
+        # --- 第三層：指標判讀與標籤 (紅綠燈系統) ---
+        # 計算 Body_Power (實體力道)
+        df['K_High_Low'] = df['High'] - df['Low']
+        df['K_Real_Body'] = abs(df['Close'] - df['Open'])
+        df['Body_Power'] = df.apply(lambda r: (r['K_Real_Body'] / r['K_High_Low'] * 100) if r['K_High_Low'] > 0 else 0, axis=1)
+
+        def get_tags(row):
             tags = []
-            if latest['Vol_Ratio'] > 1.5: tags.append("🔥主力")
-            if -2.0 < latest['MA_Bias'] < 3.5: tags.append("🛡️起漲")
+            # 🟢 綠燈 (交易資格)：MA_Bias 在安全起漲區
+            limit = 8 if row['Is_Heavyweight'] else 12
+            if 0 < row['MA_Bias'] <= limit:
+                tags.append("🟢起漲")
             
-            if "⚡" not in latest['Inst_Status'] and inst_net > 0: 
-                tags.append("🏦法人")
-            elif "⚡" in latest['Inst_Status'] and score_feed > 0: 
-                tags.append("⚡主力")
+            # 🟡 黃燈 (動力確認)：量能達標 + 法人同步 (Net_Raw > 0)
+            if row['Vol_Qualified'] and row.get('Net_Raw', 0) > 0:
+                tags.append("🟡主力")
             
-            latest['Predator_Tag'] = " ".join(tags) if tags else "○觀察"
-            results.append(latest)
+            # 🟣 紫燈 (攻擊加分)：強實體
+            if row['Body_Power'] >= 75:
+                tags.append("🟣突破")
+                
+            return " ".join(tags) if tags else "○觀察"
 
-        if not results: return pd.DataFrame(), ""
+        df['Predator_Tag'] = df.apply(get_tags, axis=1)
 
-        full_df = pd.DataFrame(results)
-        top_10 = full_df.sort_values(by='Score', ascending=False).head(10)
+        # --- 第四層：Kill Switch (結構否決) ---
+        def apply_kill_switch(row):
+            # 1. 派貨陷阱：Body_Power 極低且爆量 (Vol_Ratio > 2.5)
+            if row['Body_Power'] < 20 and row['Vol_Ratio'] > 2.5:
+                return True
+            # 2. 結構惡化：QoQ < 0 (需有基本面資料)
+            if row.get('QoQ', 0) < 0:
+                return True
+            # 3. 乖離極端：MA_Bias > 20
+            if row['MA_Bias'] > 20:
+                return True
+            return False
+
+        df['Is_Killed'] = df.apply(apply_kill_switch, axis=1)
+
+        # --- 最終篩選與輸出 ---
+        # 1. 必須量能達標 2. 未被 Kill Switch 否決
+        final_candidates = df[(df['Vol_Qualified']) & (~df['Is_Killed'])].copy()
         
-        return top_10, ""
+        # 依 ERS 評分排序取 Top 10
+        top_10 = final_candidates.sort_values('ERS', ascending=False).head(10)
+        
+        # 判定 Session 狀態
+        is_eod = datetime.now().hour >= 14
+        session_tag = "【確認｜量能成立】" if is_eod else "【觀望｜量能預估】"
+
+        report_text = {
+            "FINAL_AI_REPORT": f"V15.0 系統掃描完畢。當前狀態：{session_tag}",
+            "📊 10 關鍵監控標的 (ERS 排序)": top_10[['Symbol', 'Close', 'Return', 'ERS', 'Predator_Tag']].to_string(index=False),
+            "🛡️ 戰略提醒": "嚴禁操作無「🟢起漲」標籤之個股。排除之標的已進入 Kill Switch 名單。"
+        }
+
+        return [], df, report_text
 
     except Exception as e:
-        return pd.DataFrame(), f"Analysis Error: {str(e)}"
+        return None, None, {"Error": f"V15.0 引擎中斷: {str(e)}"}
