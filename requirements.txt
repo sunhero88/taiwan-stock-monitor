@@ -1,24 +1,12 @@
-# --- 核心框架 ---
+# requirements.txt
 streamlit>=1.32
 streamlit-autorefresh>=1.0.1
 
-# --- 數據處理 ---
 pandas>=2.1
 numpy>=1.24
 
-# --- 金融數據源 ---
 yfinance>=0.2.33
 requests>=2.31
 beautifulsoup4>=4.12
 pytz
-
-# --- 工具與其他 ---
 tqdm>=4.66
-# resend  <-- 若您的程式碼沒用到 email 發送，建議先註解
-# flask   <-- Streamlit 本身就是 Web Server，除非您有特殊雙架構需求，否則不需要 flask
-# matplotlib <-- V15.5 代碼主要用 Streamlit 原生圖表，若沒用到 plt 可移除以加速
-
-# --- 亞洲市場 (暫時註解以加速部署) ---
-# 注意：akshare 非常巨大，安裝需耗時很久，若目前主要用 yfinance/finmind，強烈建議不要打開
-# akshare>=1.12
-# pykrx>=1.0.40
