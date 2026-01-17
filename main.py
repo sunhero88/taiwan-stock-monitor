@@ -16,6 +16,7 @@ from finmind_institutional import (
     fetch_finmind_market_inst_net_ab,
 )
 from institutional_utils import calc_inst_3d
+from arbiter import arbitrate
 
 
 def _fmt_date(dt) -> str:
@@ -26,18 +27,15 @@ def _fmt_date(dt) -> str:
 
 
 def _load_market_csv(market: str) -> pd.DataFrame:
-    # 你的 repo 目前是 data_tw-share.csv / data_tw.csv
     fname = f"data_{market}.csv"
     if not os.path.exists(fname):
-        # fallback
         if os.path.exists("data_tw-share.csv"):
             fname = "data_tw-share.csv"
         elif os.path.exists("data_tw.csv"):
             fname = "data_tw.csv"
         else:
             raise FileNotFoundError(f"找不到資料檔：{fname} / data_tw-share.csv / data_tw.csv")
-    df = pd.read_csv(fname)
-    return df
+    return pd.read_csv(fname)
 
 
 def _compute_market_amount_today(df: pd.DataFrame, latest_date) -> str:
@@ -49,7 +47,6 @@ def _compute_market_amount_today(df: pd.DataFrame, latest_date) -> str:
     d["Close"] = pd.to_numeric(d.get("Close"), errors="coerce").fillna(0)
     d["Volume"] = pd.to_numeric(d.get("Volume"), errors="coerce").fillna(0)
     amt = float((d["Close"] * d["Volume"]).sum())
-    # 以整數字串顯示（你也可改成億）
     return f"{amt:,.0f}"
 
 
@@ -68,7 +65,6 @@ def _merge_institutional_into_df_top(df_top: pd.DataFrame, inst_df: pd.DataFrame
             {
                 "Symbol": symbol,
                 "Institutional": {
-                    # Arbiter/Schema 需要的欄位
                     "Inst_Visual": inst_calc.get("Inst_Status", "PENDING"),
                     "Inst_Net_3d": float(inst_calc.get("Inst_Net_3d", 0.0)),
                     "Inst_Streak3": int(inst_calc.get("Inst_Streak3", 0)),
@@ -97,7 +93,6 @@ def _decide_inst_status(inst_df: pd.DataFrame, symbols: list[str], trade_date: s
         if r.get("Inst_Status") == "READY":
             ready_any = True
 
-    # 另外把 inst_df 近三個交易日列出，方便 Debug
     try:
         if not inst_df.empty and "date" in inst_df.columns:
             dates_3d = sorted(inst_df["date"].astype(str).unique().tolist())[-3:]
@@ -105,6 +100,23 @@ def _decide_inst_status(inst_df: pd.DataFrame, symbols: list[str], trade_date: s
         dates_3d = []
 
     return ("READY" if ready_any else "PENDING"), dates_3d
+
+
+def _apply_arbiter_to_payload(payload: dict) -> dict:
+    """
+    在 payload["stocks"] 逐檔寫入 FinalDecision（Conservative/Aggressive）
+    """
+    macro_overview = (payload.get("macro", {}) or {}).get("overview", {}) or {}
+    stocks = payload.get("stocks", []) or []
+
+    for s in stocks:
+        s["FinalDecision"] = {
+            "Conservative": arbitrate(s, macro_overview, account="Conservative"),
+            "Aggressive": arbitrate(s, macro_overview, account="Aggressive"),
+        }
+
+    payload["stocks"] = stocks
+    return payload
 
 
 def app():
@@ -115,7 +127,6 @@ def app():
     session = st.sidebar.selectbox("Session", [SESSION_INTRADAY, SESSION_EOD], index=0)
 
     run_btn = st.sidebar.button("Run")
-
     if not run_btn:
         st.info("按左側 Run 產生 Top 清單與 JSON。")
         return
@@ -123,7 +134,6 @@ def app():
     # 1) Load market data
     df = _load_market_csv(market)
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-
     latest_date = df["Date"].max()
     trade_date = _fmt_date(latest_date)
 
@@ -133,20 +143,19 @@ def app():
         st.error(f"Analyzer error: {err}")
         return
 
-    # 3) Fetch institutional (FinMind) - 402 自動降級為 UNAVAILABLE，不中斷
-    # 建議抓 45 天，跨假日仍可拿到 3 交易日（若權限可用）
-    start_date = (pd.to_datetime(trade_date) - pd.Timedelta(days=45)).strftime("%Y-%m-%d")
-    end_date = trade_date
-
     symbols = df_top["Symbol"].astype(str).tolist()
     finmind_token = os.getenv("FINMIND_TOKEN", None)
+
+    # 3) Fetch institutional (FinMind) - 402 自動降級，不中斷
+    start_date = (pd.to_datetime(trade_date) - pd.Timedelta(days=45)).strftime("%Y-%m-%d")
+    end_date = trade_date
 
     inst_df = pd.DataFrame(columns=["date", "symbol", "net_amount"])
     inst_status = "PENDING"  # READY / PENDING / UNAVAILABLE
     inst_dates_3d: list[str] = []
     market_inst_ab = {"A": 0.0, "B": 0.0}
 
-    # --- 個股法人（若 402 → UNAVAILABLE）
+    # --- 個股法人
     try:
         inst_df = fetch_finmind_institutional(
             symbols=symbols,
@@ -170,7 +179,7 @@ def app():
         inst_dates_3d = []
         st.warning(f"個股法人資料抓取失敗：{type(e).__name__}: {str(e)}。系統將進入「法人缺失模式」繼續運行。")
 
-    # --- 市場法人 A/B（若 402 → 顯示但不阻斷）
+    # --- 市場法人 A/B（你指定：inst_net 用 A三大法人合計 / B外資）
     try:
         market_inst_ab = fetch_finmind_market_inst_net_ab(
             trade_date=trade_date,
@@ -187,22 +196,19 @@ def app():
     except Exception as e:
         st.warning(f"市場整體法人 A/B 抓取失敗：{type(e).__name__}: {str(e)}。本次 inst_net 將以 0 顯示。")
 
-    # 4) Merge institutional into df_top（若 UNAVAILABLE 或無資料，維持 analyzer 預設）
+    # 4) Merge institutional into df_top（若可用）
     if inst_status in ("READY", "PENDING") and (not inst_df.empty):
         df_top2 = _merge_institutional_into_df_top(df_top, inst_df, trade_date=trade_date)
     else:
         df_top2 = df_top.copy()
 
-    # 5) Macro overview (amount / inst_net(A/B) / degraded flags)
+    # 5) Macro overview
     amount_str = _compute_market_amount_today(df, latest_date)
-
-    # inst_net：用 A 三大法人合計 / B 外資（你指定）
     a_net = float(market_inst_ab.get("A", 0.0) or 0.0)
     b_net = float(market_inst_ab.get("B", 0.0) or 0.0)
     inst_net_str = f"A:{a_net:,.0f} | B:{b_net:,.0f}"
 
-    # degraded_mode 建議：只由系統風險觸發，不因法人缺失就升級到 Level-2
-    # Arbiter 仍會因 inst_status!=READY 進入「法人缺失模式」(Level-1)
+    # 重點：不因法人缺失就進 Level-2（只讓 Arbiter 用 inst_status 判斷「法人缺失模式」）
     macro_data = {
         "overview": {
             "amount": amount_str,
@@ -217,8 +223,17 @@ def app():
         "indices": [],
     }
 
-    # 6) Generate JSON for Arbiter
+    # 6) Generate JSON（Arbiter input schema）
     json_text = generate_ai_json(df_top2, market=market, session=session, macro_data=macro_data)
+
+    # 7) Apply Arbiter → FinalDecision 寫回 payload
+    try:
+        payload = json.loads(json_text)
+        payload = _apply_arbiter_to_payload(payload)
+        json_text2 = json.dumps(payload, ensure_ascii=False, indent=2)
+    except Exception as e:
+        st.warning(f"Arbiter 套用失敗：{type(e).__name__}: {str(e)}")
+        json_text2 = json_text
 
     # UI
     st.subheader("Top List")
@@ -227,13 +242,13 @@ def app():
     st.subheader("Macro Overview")
     st.json(macro_data["overview"])
 
-    st.subheader("AI JSON (Arbiter Input)")
-    st.code(json_text, language="json")
+    st.subheader("AI JSON (Arbiter Output Included)")
+    st.code(json_text2, language="json")
 
-    # optional: save
+    # save
     outname = f"ai_payload_{market}_{trade_date.replace('-', '')}_{session.lower()}.json"
     with open(outname, "w", encoding="utf-8") as f:
-        f.write(json_text)
+        f.write(json_text2)
     st.success(f"JSON 已輸出：{outname}")
 
 
