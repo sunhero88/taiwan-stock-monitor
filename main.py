@@ -1,15 +1,14 @@
 # -*- coding: utf-8 -*-
 """
 Filename: main.py
-Version: Predator V15.5.5 (Inst Fix + FinMind TradeDate + CacheKey)
-Key Fix:
-1) FinMind trade_date auto-detect (avoid wrong date / empty EOD)
-2) Cache key binds to trade_date (avoid stale empty cache)
-3) FinMind response diagnostics (msg / count / status)
-4) Inst merge hardening (Symbol normalization)
+Version: Predator V15.6 (Inst 3D Streak + Dual Engine + FinMind Date Fallback)
+Notes:
+- NBSP-safe: avoid non-printable characters
+- FinMind EOD date fallback: find latest available trade date automatically
+- Institutional: 3-day same-direction streak
+- Dual decision engine: Conservative vs Aggressive
 """
 
-import os
 import streamlit as st
 import pandas as pd
 import yfinance as yf
@@ -20,91 +19,41 @@ import pytz
 
 TW_TZ = pytz.timezone("Asia/Taipei")
 
-# ---------------------------
-# Optional: FinMind API token
-# ---------------------------
-# Streamlit Cloud: set in Secrets as:
-# FINMIND_TOKEN = "YOUR_TOKEN"
-FINMIND_TOKEN = None
-try:
-    FINMIND_TOKEN = st.secrets.get("FINMIND_TOKEN", None)
-except Exception:
-    FINMIND_TOKEN = os.environ.get("FINMIND_TOKEN")
-
+FINMIND_ENDPOINT = "https://api.finmindtrade.com/api/v4/data"
 
 # ======================================================
-# FinMind low-level helper (with diagnostics)
+# 0) FinMind helpers (date fallback)
 # ======================================================
-def finmind_get(dataset: str, params: dict, timeout: int = 6):
+
+@st.cache_data(ttl=300, show_spinner=False)
+def finmind_get_latest_trade_date(max_lookback_days: int = 10) -> str:
     """
-    Returns: (ok: bool, payload: dict, diag: dict)
-    diag includes http_status, msg, data_len
+    Find latest FinMind-available trade date within lookback window.
+    Strategy: query TaiwanStockPrice for TAIEX; if empty, go back day by day.
+    Return YYYY-MM-DD string.
     """
-    url = "https://api.finmindtrade.com/api/v4/data"
-    q = dict(params)
-    q["dataset"] = dataset
-
-    # attach token if provided
-    if FINMIND_TOKEN:
-        q["token"] = FINMIND_TOKEN
-
-    diag = {"http_status": None, "msg": None, "data_len": 0, "dataset": dataset}
-
-    try:
-        r = requests.get(url, params=q, timeout=timeout)
-        diag["http_status"] = r.status_code
-        payload = r.json()
-
-        diag["msg"] = payload.get("msg")
-        data = payload.get("data") or []
-        diag["data_len"] = len(data)
-
-        ok = (payload.get("msg") == "success") and (len(data) > 0)
-        return ok, payload, diag
-    except Exception as e:
-        diag["msg"] = f"exception:{type(e).__name__}"
-        return False, {}, diag
+    now = datetime.now(TW_TZ)
+    for i in range(max_lookback_days):
+        d = (now - timedelta(days=i)).strftime("%Y-%m-%d")
+        try:
+            r = requests.get(
+                FINMIND_ENDPOINT,
+                params={"dataset": "TaiwanStockPrice", "data_id": "TAIEX", "date": d},
+                timeout=4,
+            )
+            j = r.json()
+            if j.get("msg") == "success" and j.get("data"):
+                return d
+        except Exception:
+            pass
+    # fallback: today
+    return now.strftime("%Y-%m-%d")
 
 
 # ======================================================
-# 1) Trade date detection (critical)
+# 1) Indices (yfinance) - caching
 # ======================================================
-@st.cache_data(ttl=120, show_spinner=False)
-def detect_finmind_trade_date(lookback_days: int = 10) -> str:
-    """
-    Use TAIEX index price dataset to get latest available trading date from FinMind.
-    Returns 'YYYY-MM-DD' or '' if failed.
-    """
-    end = datetime.now(TW_TZ).date()
-    start = end - timedelta(days=lookback_days)
 
-    ok, payload, _ = finmind_get(
-        "TaiwanStockPrice",
-        {
-            "data_id": "TAIEX",
-            "start_date": start.strftime("%Y-%m-%d"),
-            "end_date": end.strftime("%Y-%m-%d"),
-        },
-        timeout=6,
-    )
-    if not ok:
-        return ""
-
-    df = pd.DataFrame(payload.get("data", []))
-    if df.empty or "date" not in df.columns:
-        return ""
-
-    # FinMind returns date as string
-    df = df.dropna(subset=["date"]).sort_values("date")
-    if df.empty:
-        return ""
-
-    return str(df.iloc[-1]["date"])
-
-
-# ======================================================
-# 2) Indices (yfinance) - keep as you had (stable)
-# ======================================================
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_detailed_indices() -> pd.DataFrame:
     tickers = {
@@ -155,98 +104,140 @@ def fetch_detailed_indices() -> pd.DataFrame:
 
 
 # ======================================================
-# 3) Macro: amount & total inst (FinMind) - cache by trade_date
+# 2) FinMind macro (amount + total inst) - caching
 # ======================================================
+
 @st.cache_data(ttl=120, show_spinner=False)
-def fetch_market_amount(trade_date: str) -> tuple[str, dict]:
+def fetch_market_amount(trade_date: str) -> str:
     """
-    Returns (value_str, diag)
+    Market trading amount (FinMind). Uses latest available trade_date.
     """
-    if not trade_date:
-        return "待更新", {"msg": "trade_date_empty", "data_len": 0, "http_status": None}
-
-    ok, payload, diag = finmind_get(
-        "TaiwanStockPrice",
-        {"data_id": "TAIEX", "date": trade_date},
-        timeout=6,
-    )
-    if not ok:
-        return "待更新", diag
-
-    row = (payload.get("data") or [])[0]
-    money = row.get("Trading_Money", None)
-    if money is None:
-        return "待更新", diag
-
-    return f"{float(money) / 100000000:.0f} 億", diag
+    try:
+        r = requests.get(
+            FINMIND_ENDPOINT,
+            params={"dataset": "TaiwanStockPrice", "data_id": "TAIEX", "date": trade_date},
+            timeout=4,
+        )
+        data = r.json()
+        if data.get("msg") == "success" and data.get("data"):
+            money = data["data"][0].get("Trading_Money", None)
+            if money is not None:
+                return f"{float(money) / 1e8:.0f} 億"
+    except Exception:
+        pass
+    return "待更新"
 
 
 @st.cache_data(ttl=120, show_spinner=False)
-def fetch_market_total_inst(trade_date: str) -> tuple[str, dict]:
+def fetch_market_total_inst(trade_date: str) -> str:
     """
-    Returns (value_str, diag)
+    Total institutional net (FinMind): dataset TaiwanStockTotalInstitutionalInvestors.
     """
-    if not trade_date:
-        return "待更新", {"msg": "trade_date_empty", "data_len": 0, "http_status": None}
-
-    ok, payload, diag = finmind_get(
-        "TaiwanStockTotalInstitutionalInvestors",
-        {"date": trade_date},
-        timeout=6,
-    )
-    if not ok:
-        return "待更新", diag
-
-    df = pd.DataFrame(payload.get("data", []))
-    if df.empty or ("buy" not in df.columns) or ("sell" not in df.columns):
-        return "待更新", diag
-
-    net = (df["buy"].sum() - df["sell"].sum()) / 100000000
-    return (f"+{net:.1f} 億" if net > 0 else f"{net:.1f} 億"), diag
+    try:
+        r = requests.get(
+            FINMIND_ENDPOINT,
+            params={"dataset": "TaiwanStockTotalInstitutionalInvestors", "date": trade_date},
+            timeout=4,
+        )
+        data = r.json()
+        if data.get("msg") == "success" and data.get("data"):
+            df = pd.DataFrame(data["data"])
+            net = (df["buy"].sum() - df["sell"].sum()) / 1e8
+            return f"+{net:.1f} 億" if net > 0 else f"{net:.1f} 億"
+    except Exception:
+        pass
+    return "待更新"
 
 
 # ======================================================
-# 4) Per-stock institutional (FinMind) - cache by trade_date
+# 3) FinMind inst per stock (3-day) - caching
 # ======================================================
+
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_inst_data_finmind_stock(trade_date: str) -> tuple[pd.DataFrame, dict]:
+def fetch_inst_data_finmind_stock_3d(trade_date: str) -> pd.DataFrame:
     """
-    Returns (df_inst, diag)
-    df_inst columns: Symbol, Inst_Net
+    Fetch per-stock institutional buy/sell for recent 3 available trade days (<= trade_date).
+    Dataset: TaiwanStockInstitutionalInvestorsBuySell
+    Output columns:
+      - Symbol (e.g., 2330.TW)
+      - Inst_Net_D0, Inst_Net_D1, Inst_Net_D2  (raw shares)
+      - Inst_Net_3d (sum)
+      - Inst_Dir3 (BUY/SELL/FLAT)
+      - Inst_Streak3 (0-3)
+      - Inst_Visual (e.g., +12.3k, -8.1k, 0.0k)
+      - Inst_Ready (bool)
+      - Trade_Dates (list string for debug)
     """
-    if not trade_date:
-        return pd.DataFrame(), {"msg": "trade_date_empty", "data_len": 0, "http_status": None}
+    # ask analyzer helper to find last 3 trade dates from FinMind
+    dates = analyzer.get_recent_finmind_trade_dates(trade_date, lookback_days=12, need_days=3)
+    if len(dates) < 3:
+        return pd.DataFrame()
 
-    ok, payload, diag = finmind_get(
-        "TaiwanStockInstitutionalInvestorsBuySell",
-        {"date": trade_date},
-        timeout=8,
-    )
-    if not ok:
-        return pd.DataFrame(), diag
+    frames = []
+    for d in dates:
+        try:
+            r = requests.get(
+                FINMIND_ENDPOINT,
+                params={"dataset": "TaiwanStockInstitutionalInvestorsBuySell", "date": d},
+                timeout=6,
+            )
+            j = r.json()
+            if j.get("msg") == "success" and j.get("data"):
+                df = pd.DataFrame(j["data"])
+                # Net = buy - sell, then sum by stock_id (all inst types aggregated)
+                df["Net"] = df["buy"] - df["sell"]
+                g = df.groupby("stock_id")["Net"].sum().reset_index()
+                g.columns = ["stock_id", f"Inst_Net_{d}"]
+                frames.append(g)
+        except Exception:
+            continue
 
-    df = pd.DataFrame(payload.get("data", []))
-    if df.empty or ("stock_id" not in df.columns):
-        return pd.DataFrame(), diag
+    if not frames:
+        return pd.DataFrame()
 
-    # Net in shares
-    df["Net"] = pd.to_numeric(df.get("buy", 0), errors="coerce").fillna(0) - pd.to_numeric(df.get("sell", 0), errors="coerce").fillna(0)
-    g = df.groupby("stock_id")["Net"].sum().reset_index()
-    g.columns = ["stock_id", "Inst_Net"]
+    out = frames[0]
+    for f in frames[1:]:
+        out = out.merge(f, on="stock_id", how="outer")
 
-    # normalize symbol key to match yfinance symbols: 2330.TW
-    g["Symbol"] = g["stock_id"].astype(str).str.upper().str.strip() + ".TW"
-    g["Inst_Net"] = pd.to_numeric(g["Inst_Net"], errors="coerce").fillna(0.0)
+    out = out.fillna(0.0)
+    out["Symbol"] = out["stock_id"].astype(str) + ".TW"
 
-    out = g[["Symbol", "Inst_Net"]].copy()
-    return out, diag
+    # map dates to D0/D1/D2 (D0 = most recent)
+    dates_sorted = sorted(dates)  # ascending
+    d2, d1, d0 = dates_sorted[-3], dates_sorted[-2], dates_sorted[-1]
+
+    out["Inst_Net_D0"] = out.get(f"Inst_Net_{d0}", 0.0)
+    out["Inst_Net_D1"] = out.get(f"Inst_Net_{d1}", 0.0)
+    out["Inst_Net_D2"] = out.get(f"Inst_Net_{d2}", 0.0)
+    out["Inst_Net_3d"] = out["Inst_Net_D0"] + out["Inst_Net_D1"] + out["Inst_Net_D2"]
+
+    # direction + streak (3-day)
+    out["Inst_Dir3"] = out.apply(lambda r: analyzer.inst_direction_3d(r["Inst_Net_D0"], r["Inst_Net_D1"], r["Inst_Net_D2"]), axis=1)
+    out["Inst_Streak3"] = out.apply(lambda r: analyzer.inst_streak_3d(r["Inst_Net_D0"], r["Inst_Net_D1"], r["Inst_Net_D2"]), axis=1)
+
+    # ready: total abs sum > 0 means data not all zeros (rough but effective in practice)
+    abs_sum = float(out["Inst_Net_D0"].abs().sum() + out["Inst_Net_D1"].abs().sum() + out["Inst_Net_D2"].abs().sum())
+    out["Inst_Ready"] = abs_sum > 0
+
+    # visual: show D0 (most recent) in k
+    def to_k(x: float) -> str:
+        k = round(float(x) / 1000.0, 1)
+        if k > 0:
+            return f"+{k}k"
+        return f"{k}k"
+
+    out["Inst_Visual"] = out["Inst_Net_D0"].apply(to_k)
+    out["Trade_Dates"] = str([d2, d1, d0])
+
+    return out[["Symbol", "Inst_Net_D0", "Inst_Net_D1", "Inst_Net_D2", "Inst_Net_3d", "Inst_Dir3", "Inst_Streak3", "Inst_Visual", "Inst_Ready", "Trade_Dates"]]
 
 
 # ======================================================
-# 5) OHLCV (yfinance) + Inst merge (hardening)
+# 4) Market OHLCV (yfinance) - caching
 # ======================================================
+
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_market_data(market_id: str, trade_date: str) -> pd.DataFrame:
+def fetch_market_data(market_id: str) -> pd.DataFrame:
     targets = {
         "tw-share": [
             "2330.TW", "2317.TW", "2454.TW", "2308.TW",
@@ -256,6 +247,7 @@ def fetch_market_data(market_id: str, trade_date: str) -> pd.DataFrame:
         ],
         "us": ["AAPL", "NVDA", "TSLA", "MSFT", "GOOGL", "AMD", "META", "AMZN"],
     }
+
     symbols = targets.get(market_id, targets["tw-share"])
 
     raw = yf.download(
@@ -267,19 +259,22 @@ def fetch_market_data(market_id: str, trade_date: str) -> pd.DataFrame:
         threads=True,
     )
 
-    inst_df, _ = fetch_inst_data_finmind_stock(trade_date) if market_id == "tw-share" else (pd.DataFrame(), {})
-
     all_res = []
 
-    # strict structure detect
-    multi = isinstance(raw.columns, pd.MultiIndex)
+    if isinstance(raw.columns, pd.MultiIndex):
+        available = list(raw.columns.levels[0])
+        multi = True
+    else:
+        available = symbols if len(symbols) == 1 and not raw.empty else []
+        multi = False
+
     if len(symbols) > 1 and not multi:
         return pd.DataFrame()
 
     for s in symbols:
         try:
             if multi:
-                if s not in list(raw.columns.levels[0]):
+                if s not in available:
                     continue
                 s_df = raw[s].copy().dropna()
             else:
@@ -288,29 +283,7 @@ def fetch_market_data(market_id: str, trade_date: str) -> pd.DataFrame:
             if s_df.empty:
                 continue
 
-            s_df["Symbol"] = str(s).upper().strip()
-
-            if market_id == "tw-share":
-                # merge inst
-                if not inst_df.empty:
-                    match = inst_df.loc[inst_df["Symbol"] == s_df["Symbol"].iloc[0], "Inst_Net"]
-                    if not match.empty:
-                        net_val = float(match.values[0])
-                    else:
-                        net_val = 0.0
-                else:
-                    net_val = 0.0
-
-                s_df["Inst_Net"] = net_val
-                val_k = round(net_val / 1000.0, 1)
-                # keep explicit sign for quick visual
-                if net_val > 0:
-                    s_df["Inst_Status"] = f"+{val_k}k"
-                elif net_val < 0:
-                    s_df["Inst_Status"] = f"{val_k}k"
-                else:
-                    s_df["Inst_Status"] = "0.0k"
-
+            s_df["Symbol"] = s
             all_res.append(s_df)
         except Exception:
             continue
@@ -321,55 +294,57 @@ def fetch_market_data(market_id: str, trade_date: str) -> pd.DataFrame:
     out = pd.concat(all_res).reset_index()
     if "Datetime" in out.columns and "Date" not in out.columns:
         out = out.rename(columns={"Datetime": "Date"})
-
-    # normalize required fields for analyzer
-    if "Date" not in out.columns:
-        return pd.DataFrame()
-
-    out["Date"] = pd.to_datetime(out["Date"], errors="coerce")
-    out["Symbol"] = out["Symbol"].astype(str).str.upper().str.strip()
     return out
 
 
 # ======================================================
-# UI
+# 5) UI
 # ======================================================
-st.set_page_config(page_title="Predator V15.5.5", layout="wide")
-st.title("Predator 指揮中心 V15.5.5（Inst Fix + FinMind TradeDate + Rev_Growth）")
+
+st.set_page_config(page_title="Predator V15.6", layout="wide")
+st.title("Predator 指揮中心 V15.6（Inst 3D + 雙規則引擎）")
 
 market = st.sidebar.selectbox("市場介入", ["tw-share", "us"])
 
 if st.button("啟動全域掃描與結構分析"):
     try:
-        with st.spinner("執行中：技術面篩選 → 籌碼合併 → 結構面掃描"):
-            # 0) detect trade_date from FinMind
-            trade_date = detect_finmind_trade_date(lookback_days=14)
+        with st.spinner("執行中：技術面篩選 → 法人連續性（3日） → 結構面 → 雙規則決策"):
+            now = datetime.now(TW_TZ)
+            current_hour = now.hour
+            current_session = analyzer.SESSION_EOD if current_hour >= 15 else analyzer.SESSION_INTRADAY
 
-            # 1) macro
+            # Macro: trade date (FinMind)
+            trade_date = finmind_get_latest_trade_date(max_lookback_days=10)
+
             indices_df = fetch_detailed_indices()
 
-            total_amount, diag_amt = fetch_market_amount(trade_date)
-            total_inst, diag_inst = fetch_market_total_inst(trade_date)
+            # FinMind macro is meaningful mainly in/after EOD; but we still fetch latest available date
+            total_amount = fetch_market_amount(trade_date)
+            total_inst = fetch_market_total_inst(trade_date)
 
-            # 2) per-stock inst diag
-            inst_df, diag_inst_stock = fetch_inst_data_finmind_stock(trade_date) if market == "tw-share" else (pd.DataFrame(), {})
+            full_df = fetch_market_data(market)
 
-            # 3) ohlcv + merge
-            full_df = fetch_market_data(market, trade_date)
-
-            # --- sidebar diagnostics (critical for Cloud) ---
-            st.sidebar.markdown("### FinMind 診斷")
-            st.sidebar.write(f"trade_date: {trade_date if trade_date else 'N/A'}")
-            st.sidebar.write({"amount": diag_amt, "total_inst": diag_inst, "stock_inst": diag_inst_stock})
+            # Inst 3D only for TW
+            inst3_df = pd.DataFrame()
+            inst_ready = False
+            inst_dates = "[]"
             if market == "tw-share":
-                st.sidebar.write(f"stock_inst rows: {len(inst_df):,}")
+                inst3_df = fetch_inst_data_finmind_stock_3d(trade_date)
+                if inst3_df is not None and not inst3_df.empty:
+                    inst_ready = bool(inst3_df["Inst_Ready"].iloc[0])  # global ready flag repeated per row
+                    inst_dates = inst3_df["Trade_Dates"].iloc[0]
+                else:
+                    inst_ready = False
 
-            # --- macro panel ---
+            # --- Macro panel ---
             st.subheader("宏觀戰情室")
             c1, c2, c3 = st.columns(3)
-            c1.metric("FinMind 查詢交易日", trade_date if trade_date else "待更新")
+            c1.metric("FinMind 查詢交易日", trade_date)
             c2.metric("大盤成交金額", total_amount)
             c3.metric("全市場法人", total_inst)
+
+            if market == "tw-share":
+                st.caption(f"法人資料狀態：{'READY' if inst_ready else 'PENDING'}；法人採樣日（3日）：{inst_dates}")
 
             if not indices_df.empty:
                 def color_change(val):
@@ -383,37 +358,58 @@ if st.button("啟動全域掃描與結構分析"):
                     use_container_width=True,
                     hide_index=True,
                 )
+            else:
+                st.warning("國際指數數據暫時無法獲取")
 
             st.divider()
 
-            # --- session logic (do not lie) ---
-            now = datetime.now(TW_TZ)
-            # If before 15:00, treat as INTRADAY even if you show FinMind previous trade_date
-            current_session = analyzer.SESSION_EOD if now.hour >= 15 else analyzer.SESSION_INTRADAY
-
+            # --- Core analysis ---
             st.subheader("戰略核心分析")
 
-            top_10, err_msg = analyzer.run_analysis(full_df, session=current_session)
+            # Run analyzer (inst_ready influences confirmation gating)
+            top_10, err_msg = analyzer.run_analysis(
+                full_df,
+                session=current_session,
+                inst_ready=inst_ready,
+            )
 
-            # data quality
+            # Merge inst3 into top_10 (so JSON carries it)
+            if market == "tw-share" and top_10 is not None and not top_10.empty:
+                if inst3_df is not None and not inst3_df.empty:
+                    top_10 = top_10.merge(inst3_df.drop(columns=["Inst_Ready", "Trade_Dates"], errors="ignore"), on="Symbol", how="left")
+                    # if missing merge => fill pending
+                    for c in ["Inst_Visual", "Inst_Net_D0", "Inst_Net_D1", "Inst_Net_D2", "Inst_Net_3d", "Inst_Dir3", "Inst_Streak3"]:
+                        if c not in top_10.columns:
+                            top_10[c] = None
+                    top_10["Inst_Visual"] = top_10["Inst_Visual"].fillna("PENDING")
+                    top_10["Inst_Net_3d"] = pd.to_numeric(top_10["Inst_Net_3d"], errors="coerce").fillna(0.0)
+                    top_10["Inst_Streak3"] = pd.to_numeric(top_10["Inst_Streak3"], errors="coerce").fillna(0).astype(int)
+                    top_10["Inst_Dir3"] = top_10["Inst_Dir3"].fillna("PENDING")
+                else:
+                    top_10["Inst_Visual"] = "PENDING"
+                    top_10["Inst_Streak3"] = 0
+                    top_10["Inst_Dir3"] = "PENDING"
+                    top_10["Inst_Net_3d"] = 0.0
+
+            # Diagnostics
+            if err_msg:
+                st.sidebar.error(f"系統警示: {err_msg}")
+
             if full_df is not None and not full_df.empty:
                 total_rows = len(full_df)
                 total_symbols = full_df["Symbol"].nunique() if "Symbol" in full_df.columns else 0
                 missing_close = full_df["Close"].isna().mean() * 100 if "Close" in full_df.columns else 100.0
                 missing_vol = full_df["Volume"].isna().mean() * 100 if "Volume" in full_df.columns else 100.0
-
-                st.sidebar.markdown("### 資料源品質")
-                st.sidebar.write({
-                    "rows": total_rows,
-                    "symbols": total_symbols,
-                    "close_missing_%": round(missing_close, 1),
-                    "volume_missing_%": round(missing_vol, 1),
-                })
+                st.sidebar.info(
+                    "資料源診斷\n"
+                    f"- 總筆數: {total_rows:,}\n"
+                    f"- 監控標的: {total_symbols}\n"
+                    "資料品質\n"
+                    f"- Close 缺值: {missing_close:.1f}%\n"
+                    f"- Volume 缺值: {missing_vol:.1f}%"
+                )
             else:
-                st.sidebar.warning("OHLCV 資料源為空（yfinance 連線失敗 / 市場休市 / 回傳結構異常）")
-
-            if err_msg:
-                st.sidebar.error(f"Analyzer: {err_msg}")
+                st.sidebar.warning("資料源為空（可能連線失敗或市場休市）")
 
             if top_10 is None or top_10.empty:
                 st.warning("本次掃描無符合策略標準之標的")
@@ -426,7 +422,9 @@ if st.button("啟動全域掃描與結構分析"):
                 "overview": {
                     "amount": total_amount,
                     "inst_net": total_inst,
-                    "trade_date": trade_date if trade_date else "",
+                    "trade_date": trade_date,
+                    "inst_status": "READY" if inst_ready else "PENDING",
+                    "inst_dates_3d": inst_dates,
                 },
                 "indices": indices_df.to_dict(orient="records") if not indices_df.empty else [],
             }
@@ -436,18 +434,17 @@ if st.button("啟動全域掃描與結構分析"):
                 market=market,
                 session=current_session,
                 macro_data=macro_dict,
+                inst_ready=inst_ready,
             )
 
             st.subheader("AI 戰略數據包（JSON）")
-            st.caption("包含：技術評分、籌碼（Inst_Status + Inst_Net_Raw）、結構面（OPM/Rev_Growth/PE）、風控 Kill Switch。")
+            st.caption(f"包含：技術評分、結構面（OPM/Rev_Growth/PE）、法人連續性（3日）、雙規則決策。Session={current_session}")
             st.code(json_payload, language="json")
 
             st.subheader("關鍵標的指標")
             cols = ["Symbol", "Close", "MA_Bias", "Vol_Ratio", "Predator_Tag", "Score"]
-            if "Inst_Status" in top_10.columns:
-                cols.insert(3, "Inst_Status")
-            if "Inst_Net" in top_10.columns:
-                cols.insert(4, "Inst_Net")
+            if market == "tw-share":
+                cols = ["Symbol", "Close", "Inst_Visual", "Inst_Streak3", "Inst_Dir3", "MA_Bias", "Vol_Ratio", "Predator_Tag", "Score"]
             st.dataframe(top_10[cols], use_container_width=True)
 
     except Exception as e:
