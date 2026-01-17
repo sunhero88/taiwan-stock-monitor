@@ -3,14 +3,10 @@
 """
 Filename: analyzer.py
 Version: Predator V15.6.3 (Frozen / Production) - Analyzer Engine
-Goal:
+
 - Keep core selection logic intact
 - Output JSON schema compatible with Arbiter (V15.6.3)
-- Minimal-risk additions: macro.overview fields, per-stock ranking/inst/risk/orphan/weaken fields
-
-Notes:
-- JSON is the only trusted source for Arbiter. This module must be deterministic on the same input DF.
-- Fundamentals via yfinance.info can be flaky; failures are tolerated (values default to 0/Unknown).
+- Deterministic on same input DF
 """
 from __future__ import annotations
 
@@ -20,10 +16,6 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 import yfinance as yf
-
-# ======================================================
-# 1) Parameters (keep original logic)
-# ======================================================
 
 VOL_THRESHOLD_WEIGHTED = 1.2
 VOL_THRESHOLD_SMALL = 1.8
@@ -41,10 +33,6 @@ DISTRIBUTE_VOL_RATIO = 2.5
 
 SESSION_INTRADAY = "INTRADAY"
 SESSION_EOD = "EOD"
-
-# ======================================================
-# 2) Helpers
-# ======================================================
 
 
 def calc_body_power(row: dict) -> float:
@@ -81,7 +69,7 @@ def calc_ma_bias_penalty(ma_bias) -> float:
 
 def enrich_fundamentals(symbol: str) -> dict:
     """
-    Important: yfinance revenueGrowth is NOT guaranteed QoQ; label as Rev_Growth and note source.
+    yfinance revenueGrowth 口徑不保證 QoQ，因此以 Rev_Growth 命名並保留來源欄位。
     """
     data = {
         "OPM": 0.0,
@@ -132,23 +120,13 @@ def _safe_float(x, default=0.0) -> float:
         return float(default)
 
 
-# ======================================================
-# 3) Core
-# ======================================================
-
-
 def run_analysis(df: pd.DataFrame, session: str = SESSION_INTRADAY):
-    """
-    Return: (df_topN, err_msg)
-    - df_topN: top 10 with required columns for UI/JSON
-    """
     try:
         if df is None or df.empty:
             return pd.DataFrame(), "Input DataFrame is empty"
 
         df = df.copy()
 
-        # Normalize Date column existence
         if "Date" not in df.columns:
             df = df.reset_index(drop=False)
             if "Date" not in df.columns and "index" in df.columns:
@@ -160,7 +138,6 @@ def run_analysis(df: pd.DataFrame, session: str = SESSION_INTRADAY):
         if df["Date"].isna().all():
             return pd.DataFrame(), "Date invalid (all NaT)"
 
-        # Latest trading day
         latest_date = df["Date"].max()
         df_today = df[df["Date"] == latest_date].copy()
         if df_today.empty:
@@ -174,7 +151,6 @@ def run_analysis(df: pd.DataFrame, session: str = SESSION_INTRADAY):
 
         weighted_symbols = set(df_today.loc[df_today["Amount"] >= top_50_amt_threshold, "Symbol"].dropna().astype(str))
 
-        # Tech filter
         results = []
         for symbol, g in df.groupby("Symbol"):
             g = g.sort_values("Date")
@@ -200,11 +176,9 @@ def run_analysis(df: pd.DataFrame, session: str = SESSION_INTRADAY):
 
             is_weighted = str(symbol) in weighted_symbols
 
-            # Kill Switch I: distribute trap
             if latest["Body_Power"] < BODY_POWER_DISTRIBUTE and latest["Vol_Ratio"] > DISTRIBUTE_VOL_RATIO:
                 continue
 
-            # Kill Switch II: MA_Bias hard cap
             if latest["MA_Bias"] > MA_BIAS_HARD_CAP:
                 continue
 
@@ -220,15 +194,12 @@ def run_analysis(df: pd.DataFrame, session: str = SESSION_INTRADAY):
         if not results:
             return pd.DataFrame(), "no_results_after_tech_filter"
 
-        # Rank candidates by Score
         df_candidates = pd.DataFrame(results).sort_values("Score", ascending=False).head(20).copy()
         if df_candidates.empty:
             return pd.DataFrame(), "no_candidates"
 
-        # Add Rank (1..N)
         df_candidates["Rank"] = np.arange(1, len(df_candidates) + 1)
 
-        # Fundamentals filter (keep original QoQ<0 kill-switch but applied to Rev_Growth)
         final_list = []
         for _, row in df_candidates.iterrows():
             symbol = str(row.get("Symbol", ""))
@@ -237,10 +208,9 @@ def run_analysis(df: pd.DataFrame, session: str = SESSION_INTRADAY):
             row_dict = row.to_dict()
             row_dict["Structure"] = fundamentals
 
-            # Kill Switch III: Rev_Growth < 0 (previously QoQ < 0)
+            # Kill Switch III: Rev_Growth < 0
             try:
                 if fundamentals.get("Rev_Growth", 0) is not None and float(fundamentals.get("Rev_Growth", 0)) < 0:
-                    # Keep behavior: filter out negative growth candidates
                     continue
             except Exception:
                 pass
@@ -255,34 +225,29 @@ def run_analysis(df: pd.DataFrame, session: str = SESSION_INTRADAY):
             body_power = _safe_float(row_dict.get("Body_Power", 0))
 
             if green_range[0] < ma_bias <= green_range[1]:
-                tags.append("起漲")
+                tags.append("🟢起漲")
             if vol_ratio >= vol_threshold:
-                tags.append("主力")
+                tags.append("🔥主力")
             if body_power >= BODY_POWER_STRONG:
-                tags.append("真突破")
+                tags.append("⚡真突破")
 
             suffix = "(觀望)" if session == SESSION_INTRADAY else "(確認)"
-            row_dict["Predator_Tag"] = (" ".join(tags) + suffix) if tags else ("觀察" + suffix)
+            row_dict["Predator_Tag"] = (" ".join(tags) + suffix) if tags else ("○觀察" + suffix)
 
             final_list.append(row_dict)
 
         if not final_list:
             return pd.DataFrame(), "no_results_after_fundamental_filter"
 
-        df_final = pd.DataFrame(final_list).sort_values("Score", ascending=False).head(10).copy()
-        # Ensure Rank exists in final output
+        df_final = pd.DataFrame(final_list).sort_values("Score", ascending=False).head(20).copy()
         if "Rank" not in df_final.columns:
             df_final["Rank"] = np.arange(1, len(df_final) + 1)
 
+        # 注意：run_analysis 回傳 Top20（方便 main.py 後續做 Tier A/B）
         return df_final, ""
 
     except Exception as e:
         return pd.DataFrame(), f"Analyzer Crash: {type(e).__name__}: {str(e)}"
-
-
-# ======================================================
-# 4) JSON payload (V15.6.3 schema for Arbiter)
-# ======================================================
 
 
 def generate_ai_json(
@@ -291,19 +256,21 @@ def generate_ai_json(
     session: str = SESSION_INTRADAY,
     macro_data: dict | None = None,
 ) -> str:
-    """
-    Output schema highlights:
-    - meta: system/market/timestamp/session
-    - macro.overview: amount/inst_net/trade_date/inst_status/degraded_mode/kill_switch/v14_watch/inst_dates_3d
-    - stocks[]: Symbol/Price/Technical/Institutional/Structure/risk/orphan_holding/weaken_flags/ranking
-    """
     if df_top is None or df_top.empty:
         return json.dumps({"error": "No data"}, ensure_ascii=False, indent=2)
 
     macro_data = macro_data or {}
     overview = (macro_data.get("overview") or {}).copy()
 
-    # --- Normalize macro.overview to Arbiter-required fields
+    # trade_date 優先以 df_top 的最新 Date 為準（避免外部寫錯）
+    if "Date" in df_top.columns:
+        try:
+            td = pd.to_datetime(df_top["Date"], errors="coerce").max()
+            if pd.notna(td):
+                overview["trade_date"] = td.strftime("%Y-%m-%d")
+        except Exception:
+            pass
+
     inst_status = overview.get("inst_status", "PENDING")
     degraded_mode = bool(overview.get("degraded_mode", inst_status != "READY"))
 
@@ -328,7 +295,6 @@ def generate_ai_json(
         symbol = str(r.get("Symbol", "Unknown"))
         rank = int(_safe_float(r.get("Rank", 999), default=999))
 
-        # --- Technical block
         tech = {
             "MA_Bias": round(_safe_float(r.get("MA_Bias", 0)), 2),
             "Vol_Ratio": round(_safe_float(r.get("Vol_Ratio", 0)), 2),
@@ -337,25 +303,21 @@ def generate_ai_json(
             "Tag": r.get("Predator_Tag", ""),
         }
 
-        # --- Structure block (already embedded by run_analysis)
         struct = r.get("Structure", {}) or {}
-        # Ensure Rev_Growth key exists consistently
         if "Rev_Growth" not in struct and "QoQ" in struct:
             struct["Rev_Growth"] = struct.pop("QoQ")
             struct["Rev_Growth_Source"] = "legacy:QoQ_renamed"
 
-        # --- Institutional block
-        # If upstream main.py already merged inst fields, keep them; else default PENDING.
+        # 這裡最關鍵：如果 main.py 已把 Institutional dict 塞進來，就原樣帶出
         inst = r.get("Institutional", {}) or {}
         inst_out = {
-            "Inst_Visual": inst.get("Inst_Visual", inst_status if inst_status != "READY" else "N/A"),
+            "Inst_Visual": inst.get("Inst_Visual", "PENDING"),
             "Inst_Net_3d": _safe_float(inst.get("Inst_Net_3d", 0.0)),
             "Inst_Streak3": int(_safe_float(inst.get("Inst_Streak3", 0), default=0)),
             "Inst_Dir3": inst.get("Inst_Dir3", "PENDING"),
             "Inst_Status": inst.get("Inst_Status", "PENDING"),
         }
 
-        # --- Risk defaults (Arbiter reads these caps)
         risk = r.get("risk", {}) or {}
         risk_out = {
             "position_pct_max": int(_safe_float(risk.get("position_pct_max", 12), default=12)),
@@ -363,7 +325,6 @@ def generate_ai_json(
             "trial_flag": bool(risk.get("trial_flag", True)),
         }
 
-        # --- Orphan & weaken flags (default safe)
         orphan_holding = bool(r.get("orphan_holding", False))
         weaken_flags = r.get("weaken_flags", {}) or {
             "technical_weaken": False,
@@ -372,7 +333,6 @@ def generate_ai_json(
         weaken_flags.setdefault("technical_weaken", False)
         weaken_flags.setdefault("structure_weaken", False)
 
-        # --- Ranking block (Top20 pool)
         ranking = {
             "symbol": symbol,
             "rank": rank,
