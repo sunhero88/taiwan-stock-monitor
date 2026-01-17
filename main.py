@@ -1,16 +1,15 @@
 # =========================
 # main.py
-# Predator V15.5.3 Patch (FinMind date aligned + Inst fixed + Rev_Growth + NBSP-safe)
+# Predator V15.5.4 Patch (FinMind EOD Date Fallback + Inst fixed + Rev_Growth + NBSP-safe)
 # =========================
 # -*- coding: utf-8 -*-
 """
 Filename: main.py
-Version: Predator V15.5.3 (FinMind date aligned + Inst fixed + Rev_Growth)
-Key Fix:
-- FinMind 的查詢日期改為「最新交易日」(來自 yfinance full_df['Date'].max())
-- 早上也可看「上一交易日 EOD」籌碼，而不是拿 today 去問空資料
-- FinMind token：若 st.secrets / env 有就自動帶入
-- Sidebar 顯示 FinMind 回傳筆數（可觀測性）
+Version: Predator V15.5.4 (FinMind EOD Date Fallback)
+Fix:
+- 盤中(<15:00) FinMind 查詢 trade_date 強制退回「上一個交易日」
+- 收盤後(>=15:00) 才查「今日」(最新交易日)
+- Sidebar 顯示：trade_date / finmind rows / inst coverage / finmind token status
 """
 import os
 import streamlit as st
@@ -39,11 +38,6 @@ def _safe_float(x, default=0.0) -> float:
 
 
 def _get_finmind_token() -> str:
-    """
-    Optional token support:
-    - Streamlit Cloud: st.secrets["FINMIND_TOKEN"]
-    - Env var: FINMIND_TOKEN
-    """
     try:
         if "FINMIND_TOKEN" in st.secrets:
             return str(st.secrets["FINMIND_TOKEN"]).strip()
@@ -53,9 +47,6 @@ def _get_finmind_token() -> str:
 
 
 def _to_yyyymmdd(d) -> str:
-    """
-    Convert pandas Timestamp / datetime / date to YYYY-MM-DD string.
-    """
     try:
         ts = pd.to_datetime(d)
         if pd.isna(ts):
@@ -65,15 +56,33 @@ def _to_yyyymmdd(d) -> str:
         return ""
 
 
-def _latest_trading_date_from_df(df: pd.DataFrame) -> str:
+def _choose_finmind_trade_date(full_df: pd.DataFrame) -> str:
     """
-    Use yfinance market data to derive latest trading date for FinMind query.
+    關鍵修補：
+    - 以 yfinance 的 Date 序列推導「最新交易日」與「上一交易日」
+    - 若現在時間 < 15:00，FinMind 查詢日退回上一交易日（避免盤中查 today 得到空資料）
+    - 若 >= 15:00，使用最新交易日
     """
-    if df is None or df.empty:
+    if full_df is None or full_df.empty or "Date" not in full_df.columns:
         return ""
-    if "Date" not in df.columns:
+
+    now = datetime.now(TW_TZ)
+    dates = pd.to_datetime(full_df["Date"], errors="coerce")
+    dates = dates.dropna()
+
+    # 取「不重複交易日」排序
+    uniq = sorted(dates.dt.normalize().unique())
+    if not uniq:
         return ""
-    latest = pd.to_datetime(df["Date"], errors="coerce").max()
+
+    latest = pd.to_datetime(uniq[-1])
+    prev = pd.to_datetime(uniq[-2]) if len(uniq) >= 2 else latest
+
+    # 盤中：強制上一交易日
+    if now.hour < 15:
+        return _to_yyyymmdd(prev)
+
+    # 收盤後：最新交易日
     return _to_yyyymmdd(latest)
 
 
@@ -126,9 +135,6 @@ def fetch_detailed_indices() -> pd.DataFrame:
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_market_data(market_id: str) -> pd.DataFrame:
-    """
-    下載 OHLCV；回傳包含 Date + Symbol 的 long-form。
-    """
     targets = {
         "tw-share": [
             "2330.TW", "2317.TW", "2454.TW", "2308.TW",
@@ -187,9 +193,6 @@ def fetch_market_data(market_id: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=120, show_spinner=False)
 def finmind_market_amount(trade_date: str) -> str:
-    """
-    大盤成交額（指定 trade_date）
-    """
     if not trade_date:
         return "待更新"
 
@@ -199,7 +202,7 @@ def finmind_market_amount(trade_date: str) -> str:
         params["token"] = token
 
     try:
-        r = requests.get("https://api.finmindtrade.com/api/v4/data", params=params, timeout=10)
+        r = requests.get("https://api.finmindtrade.com/api/v4/data", params=params, timeout=15)
         data = r.json()
         if data.get("msg") == "success" and data.get("data"):
             money = data["data"][0].get("Trading_Money", 0)
@@ -211,9 +214,6 @@ def finmind_market_amount(trade_date: str) -> str:
 
 @st.cache_data(ttl=120, show_spinner=False)
 def finmind_market_total_inst(trade_date: str) -> str:
-    """
-    全市場法人（指定 trade_date）
-    """
     if not trade_date:
         return "待更新"
 
@@ -223,7 +223,7 @@ def finmind_market_total_inst(trade_date: str) -> str:
         params["token"] = token
 
     try:
-        r = requests.get("https://api.finmindtrade.com/api/v4/data", params=params, timeout=10)
+        r = requests.get("https://api.finmindtrade.com/api/v4/data", params=params, timeout=15)
         data = r.json()
         if data.get("msg") == "success" and data.get("data"):
             df = pd.DataFrame(data["data"])
@@ -236,10 +236,6 @@ def finmind_market_total_inst(trade_date: str) -> str:
 
 @st.cache_data(ttl=300, show_spinner=False)
 def finmind_inst_by_stock(trade_date: str) -> pd.DataFrame:
-    """
-    個股法人（指定 trade_date）
-    output: Symbol, Inst_Net
-    """
     if not trade_date:
         return pd.DataFrame()
 
@@ -249,7 +245,7 @@ def finmind_inst_by_stock(trade_date: str) -> pd.DataFrame:
         params["token"] = token
 
     try:
-        r = requests.get("https://api.finmindtrade.com/api/v4/data", params=params, timeout=15)
+        r = requests.get("https://api.finmindtrade.com/api/v4/data", params=params, timeout=20)
         data = r.json()
         if data.get("msg") == "success" and data.get("data"):
             df = pd.DataFrame(data["data"])
@@ -268,9 +264,6 @@ def finmind_inst_by_stock(trade_date: str) -> pd.DataFrame:
 
 
 def attach_inst_to_ohlcv(full_df: pd.DataFrame, trade_date: str, market_id: str):
-    """
-    將 FinMind 的 Inst_Net/Inst_Status 合併到 full_df（以 Symbol 為 key）
-    """
     if full_df is None or full_df.empty:
         return full_df, 0
 
@@ -303,7 +296,7 @@ def attach_inst_to_ohlcv(full_df: pd.DataFrame, trade_date: str, market_id: str)
         val_k = round(net / 1000.0, 1)
         return f"🔴+{val_k}k" if net > 0 else f"🔵{val_k}k"
 
-    merged["Inst_Status"] = merged["Inst_Net"].apply(lambda x: _fmt_status(x) if x != 0 else "0.0k")
+    merged["Inst_Status"] = merged["Inst_Net"].apply(lambda x: _fmt_status(x))
     return merged, len(inst_df)
 
 
@@ -311,23 +304,21 @@ def attach_inst_to_ohlcv(full_df: pd.DataFrame, trade_date: str, market_id: str)
 # 2) UI
 # ======================================================
 
-st.set_page_config(page_title="Predator V15.5.3", layout="wide")
-st.title("Predator 指揮中心 V15.5.3 (FinMind Date Aligned + Inst + Rev_Growth)")
+st.set_page_config(page_title="Predator V15.5.4", layout="wide")
+st.title("Predator 指揮中心 V15.5.4 (Inst Fix + FinMind EOD Date Fallback + Rev_Growth)")
 
 market = st.sidebar.selectbox("市場介入", ["tw-share", "us"])
 
-# 提供手動清 cache（避免你調整後還被 cache 卡住）
 if st.sidebar.button("清除快取並重跑"):
     st.cache_data.clear()
 
 if st.button("啟動全域掃描與結構分析"):
     try:
-        with st.spinner("執行中：下載行情 → 推導交易日 → FinMind 籌碼/大盤 → 策略引擎"):
+        with st.spinner("執行中：下載行情 → 推導 FinMind 交易日 → 籌碼/大盤 → 策略引擎"):
             indices_df = fetch_detailed_indices()
             full_df = fetch_market_data(market)
 
-            # 用 yfinance 的最新交易日當作 FinMind 查詢日期（關鍵修補）
-            trade_date = _latest_trading_date_from_df(full_df)
+            trade_date = _choose_finmind_trade_date(full_df)
 
             total_amount = finmind_market_amount(trade_date) if market == "tw-share" else "N/A"
             total_inst = finmind_market_total_inst(trade_date) if market == "tw-share" else "N/A"
@@ -359,13 +350,15 @@ if st.button("啟動全域掃描與結構分析"):
             st.divider()
             st.subheader("戰略核心分析")
 
-            current_hour = datetime.now(TW_TZ).hour
-            current_session = analyzer.SESSION_EOD if current_hour >= 15 else analyzer.SESSION_EOD
-            # 你早上跑也要看「昨日日終」，所以這裡直接固定 EOD 也合理（你要改回 intraday 再調）
+            # Session 呈現可以仍顯示 EOD（因為你此系統主要用日線）
+            current_session = analyzer.SESSION_EOD
 
             top_10, err_msg = analyzer.run_analysis(full_df, session=current_session)
 
             # Sidebar diagnostics
+            token = _get_finmind_token()
+            token_state = "已設定" if token else "未設定"
+
             if err_msg:
                 st.sidebar.error(f"系統警示: {err_msg}")
 
@@ -383,8 +376,9 @@ if st.button("啟動全域掃描與結構分析"):
                     "資料品質\n"
                     f"- Close 缺值: {missing_close:.1f}%\n"
                     f"- Volume 缺值: {missing_vol:.1f}%\n"
-                    f"- 籌碼覆蓋率(非N/A): {inst_coverage:.1f}%\n"
-                    f"- FinMind 個股筆數: {finmind_rows}"
+                    f"- 籌碼覆蓋率: {inst_coverage:.1f}%\n"
+                    f"- FinMind 個股筆數: {finmind_rows}\n"
+                    f"- FinMind Token: {token_state}"
                 )
             else:
                 st.sidebar.warning("資料源為空（可能連線失敗或市場休市）")
@@ -409,7 +403,7 @@ if st.button("啟動全域掃描與結構分析"):
             )
 
             st.subheader("AI 戰略數據包（JSON）")
-            st.caption("Structure.Rev_Growth 來源：yfinance.info['revenueGrowth']（避免誤讀為嚴格 QoQ）。")
+            st.caption("Structure.Rev_Growth 來源：yfinance.info['revenueGrowth']（避免誤判為嚴格 QoQ）。")
             st.code(json_payload, language="json")
 
             st.subheader("關鍵標的指標")
