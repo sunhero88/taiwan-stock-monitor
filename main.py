@@ -1,95 +1,110 @@
-# =========================
-# main.py
-# Predator V15.5.4 Patch (FinMind EOD Date Fallback + Inst fixed + Rev_Growth + NBSP-safe)
-# =========================
 # -*- coding: utf-8 -*-
 """
 Filename: main.py
-Version: Predator V15.5.4 (FinMind EOD Date Fallback)
-Fix:
-- 盤中(<15:00) FinMind 查詢 trade_date 強制退回「上一個交易日」
-- 收盤後(>=15:00) 才查「今日」(最新交易日)
-- Sidebar 顯示：trade_date / finmind rows / inst coverage / finmind token status
+Version: Predator V15.5.5 (Inst Fix + FinMind TradeDate + CacheKey)
+Key Fix:
+1) FinMind trade_date auto-detect (avoid wrong date / empty EOD)
+2) Cache key binds to trade_date (avoid stale empty cache)
+3) FinMind response diagnostics (msg / count / status)
+4) Inst merge hardening (Symbol normalization)
 """
+
 import os
 import streamlit as st
 import pandas as pd
 import yfinance as yf
 import requests
 import analyzer
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 
 TW_TZ = pytz.timezone("Asia/Taipei")
 
+# ---------------------------
+# Optional: FinMind API token
+# ---------------------------
+# Streamlit Cloud: set in Secrets as:
+# FINMIND_TOKEN = "YOUR_TOKEN"
+FINMIND_TOKEN = None
+try:
+    FINMIND_TOKEN = st.secrets.get("FINMIND_TOKEN", None)
+except Exception:
+    FINMIND_TOKEN = os.environ.get("FINMIND_TOKEN")
+
 
 # ======================================================
-# 0) Utilities
+# FinMind low-level helper (with diagnostics)
 # ======================================================
-
-def _safe_float(x, default=0.0) -> float:
-    try:
-        v = float(x)
-        if pd.isna(v):
-            return default
-        return v
-    except Exception:
-        return default
-
-
-def _get_finmind_token() -> str:
-    try:
-        if "FINMIND_TOKEN" in st.secrets:
-            return str(st.secrets["FINMIND_TOKEN"]).strip()
-    except Exception:
-        pass
-    return str(os.getenv("FINMIND_TOKEN", "")).strip()
-
-
-def _to_yyyymmdd(d) -> str:
-    try:
-        ts = pd.to_datetime(d)
-        if pd.isna(ts):
-            return ""
-        return ts.strftime("%Y-%m-%d")
-    except Exception:
-        return ""
-
-
-def _choose_finmind_trade_date(full_df: pd.DataFrame) -> str:
+def finmind_get(dataset: str, params: dict, timeout: int = 6):
     """
-    關鍵修補：
-    - 以 yfinance 的 Date 序列推導「最新交易日」與「上一交易日」
-    - 若現在時間 < 15:00，FinMind 查詢日退回上一交易日（避免盤中查 today 得到空資料）
-    - 若 >= 15:00，使用最新交易日
+    Returns: (ok: bool, payload: dict, diag: dict)
+    diag includes http_status, msg, data_len
     """
-    if full_df is None or full_df.empty or "Date" not in full_df.columns:
-        return ""
+    url = "https://api.finmindtrade.com/api/v4/data"
+    q = dict(params)
+    q["dataset"] = dataset
 
-    now = datetime.now(TW_TZ)
-    dates = pd.to_datetime(full_df["Date"], errors="coerce")
-    dates = dates.dropna()
+    # attach token if provided
+    if FINMIND_TOKEN:
+        q["token"] = FINMIND_TOKEN
 
-    # 取「不重複交易日」排序
-    uniq = sorted(dates.dt.normalize().unique())
-    if not uniq:
-        return ""
+    diag = {"http_status": None, "msg": None, "data_len": 0, "dataset": dataset}
 
-    latest = pd.to_datetime(uniq[-1])
-    prev = pd.to_datetime(uniq[-2]) if len(uniq) >= 2 else latest
+    try:
+        r = requests.get(url, params=q, timeout=timeout)
+        diag["http_status"] = r.status_code
+        payload = r.json()
 
-    # 盤中：強制上一交易日
-    if now.hour < 15:
-        return _to_yyyymmdd(prev)
+        diag["msg"] = payload.get("msg")
+        data = payload.get("data") or []
+        diag["data_len"] = len(data)
 
-    # 收盤後：最新交易日
-    return _to_yyyymmdd(latest)
+        ok = (payload.get("msg") == "success") and (len(data) > 0)
+        return ok, payload, diag
+    except Exception as e:
+        diag["msg"] = f"exception:{type(e).__name__}"
+        return False, {}, diag
 
 
 # ======================================================
-# 1) Data fetchers (with caching)
+# 1) Trade date detection (critical)
 # ======================================================
+@st.cache_data(ttl=120, show_spinner=False)
+def detect_finmind_trade_date(lookback_days: int = 10) -> str:
+    """
+    Use TAIEX index price dataset to get latest available trading date from FinMind.
+    Returns 'YYYY-MM-DD' or '' if failed.
+    """
+    end = datetime.now(TW_TZ).date()
+    start = end - timedelta(days=lookback_days)
 
+    ok, payload, _ = finmind_get(
+        "TaiwanStockPrice",
+        {
+            "data_id": "TAIEX",
+            "start_date": start.strftime("%Y-%m-%d"),
+            "end_date": end.strftime("%Y-%m-%d"),
+        },
+        timeout=6,
+    )
+    if not ok:
+        return ""
+
+    df = pd.DataFrame(payload.get("data", []))
+    if df.empty or "date" not in df.columns:
+        return ""
+
+    # FinMind returns date as string
+    df = df.dropna(subset=["date"]).sort_values("date")
+    if df.empty:
+        return ""
+
+    return str(df.iloc[-1]["date"])
+
+
+# ======================================================
+# 2) Indices (yfinance) - keep as you had (stable)
+# ======================================================
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_detailed_indices() -> pd.DataFrame:
     tickers = {
@@ -109,32 +124,129 @@ def fetch_detailed_indices() -> pd.DataFrame:
             latest = hist.iloc[-1]
             prev = hist.iloc[-2]
 
-            price = _safe_float(latest.get("Close", 0.0))
-            prev_close = _safe_float(prev.get("Close", 0.0))
+            price = float(latest["Close"])
+            prev_close = float(prev["Close"])
             change = price - prev_close
-            pct = (change / prev_close) * 100.0 if prev_close != 0 else 0.0
+            pct = (change / prev_close) * 100 if prev_close != 0 else 0.0
 
             rows.append({
                 "指數名稱": name,
                 "現價": f"{price:,.0f}",
                 "漲跌": f"{change:+.2f}",
                 "幅度": f"{pct:+.2f}%",
-                "開盤": f"{_safe_float(latest.get('Open', 0.0)):,.0f}",
-                "最高": f"{_safe_float(latest.get('High', 0.0)):,.0f}",
-                "最低": f"{_safe_float(latest.get('Low', 0.0)):,.0f}",
+                "開盤": f"{float(latest.get('Open', 0.0)):,.0f}",
+                "最高": f"{float(latest.get('High', 0.0)):,.0f}",
+                "最低": f"{float(latest.get('Low', 0.0)):,.0f}",
                 "昨收": f"{prev_close:,.0f}",
             })
         except Exception:
             rows.append({
-                "指數名稱": name, "現價": "-", "漲跌": "-", "幅度": "-",
-                "開盤": "-", "最高": "-", "最低": "-", "昨收": "-"
+                "指數名稱": name,
+                "現價": "-",
+                "漲跌": "-",
+                "幅度": "-",
+                "開盤": "-",
+                "最高": "-",
+                "最低": "-",
+                "昨收": "-",
             })
 
     return pd.DataFrame(rows)
 
 
+# ======================================================
+# 3) Macro: amount & total inst (FinMind) - cache by trade_date
+# ======================================================
+@st.cache_data(ttl=120, show_spinner=False)
+def fetch_market_amount(trade_date: str) -> tuple[str, dict]:
+    """
+    Returns (value_str, diag)
+    """
+    if not trade_date:
+        return "待更新", {"msg": "trade_date_empty", "data_len": 0, "http_status": None}
+
+    ok, payload, diag = finmind_get(
+        "TaiwanStockPrice",
+        {"data_id": "TAIEX", "date": trade_date},
+        timeout=6,
+    )
+    if not ok:
+        return "待更新", diag
+
+    row = (payload.get("data") or [])[0]
+    money = row.get("Trading_Money", None)
+    if money is None:
+        return "待更新", diag
+
+    return f"{float(money) / 100000000:.0f} 億", diag
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def fetch_market_total_inst(trade_date: str) -> tuple[str, dict]:
+    """
+    Returns (value_str, diag)
+    """
+    if not trade_date:
+        return "待更新", {"msg": "trade_date_empty", "data_len": 0, "http_status": None}
+
+    ok, payload, diag = finmind_get(
+        "TaiwanStockTotalInstitutionalInvestors",
+        {"date": trade_date},
+        timeout=6,
+    )
+    if not ok:
+        return "待更新", diag
+
+    df = pd.DataFrame(payload.get("data", []))
+    if df.empty or ("buy" not in df.columns) or ("sell" not in df.columns):
+        return "待更新", diag
+
+    net = (df["buy"].sum() - df["sell"].sum()) / 100000000
+    return (f"+{net:.1f} 億" if net > 0 else f"{net:.1f} 億"), diag
+
+
+# ======================================================
+# 4) Per-stock institutional (FinMind) - cache by trade_date
+# ======================================================
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_market_data(market_id: str) -> pd.DataFrame:
+def fetch_inst_data_finmind_stock(trade_date: str) -> tuple[pd.DataFrame, dict]:
+    """
+    Returns (df_inst, diag)
+    df_inst columns: Symbol, Inst_Net
+    """
+    if not trade_date:
+        return pd.DataFrame(), {"msg": "trade_date_empty", "data_len": 0, "http_status": None}
+
+    ok, payload, diag = finmind_get(
+        "TaiwanStockInstitutionalInvestorsBuySell",
+        {"date": trade_date},
+        timeout=8,
+    )
+    if not ok:
+        return pd.DataFrame(), diag
+
+    df = pd.DataFrame(payload.get("data", []))
+    if df.empty or ("stock_id" not in df.columns):
+        return pd.DataFrame(), diag
+
+    # Net in shares
+    df["Net"] = pd.to_numeric(df.get("buy", 0), errors="coerce").fillna(0) - pd.to_numeric(df.get("sell", 0), errors="coerce").fillna(0)
+    g = df.groupby("stock_id")["Net"].sum().reset_index()
+    g.columns = ["stock_id", "Inst_Net"]
+
+    # normalize symbol key to match yfinance symbols: 2330.TW
+    g["Symbol"] = g["stock_id"].astype(str).str.upper().str.strip() + ".TW"
+    g["Inst_Net"] = pd.to_numeric(g["Inst_Net"], errors="coerce").fillna(0.0)
+
+    out = g[["Symbol", "Inst_Net"]].copy()
+    return out, diag
+
+
+# ======================================================
+# 5) OHLCV (yfinance) + Inst merge (hardening)
+# ======================================================
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_market_data(market_id: str, trade_date: str) -> pd.DataFrame:
     targets = {
         "tw-share": [
             "2330.TW", "2317.TW", "2454.TW", "2308.TW",
@@ -155,7 +267,11 @@ def fetch_market_data(market_id: str) -> pd.DataFrame:
         threads=True,
     )
 
-    all_rows = []
+    inst_df, _ = fetch_inst_data_finmind_stock(trade_date) if market_id == "tw-share" else (pd.DataFrame(), {})
+
+    all_res = []
+
+    # strict structure detect
     multi = isinstance(raw.columns, pd.MultiIndex)
     if len(symbols) > 1 and not multi:
         return pd.DataFrame()
@@ -163,7 +279,7 @@ def fetch_market_data(market_id: str) -> pd.DataFrame:
     for s in symbols:
         try:
             if multi:
-                if s not in raw.columns.levels[0]:
+                if s not in list(raw.columns.levels[0]):
                     continue
                 s_df = raw[s].copy().dropna()
             else:
@@ -172,163 +288,86 @@ def fetch_market_data(market_id: str) -> pd.DataFrame:
             if s_df.empty:
                 continue
 
-            s_df = s_df.reset_index()
-            if "Datetime" in s_df.columns and "Date" not in s_df.columns:
-                s_df = s_df.rename(columns={"Datetime": "Date"})
+            s_df["Symbol"] = str(s).upper().strip()
 
-            s_df["Symbol"] = s
-            all_rows.append(s_df)
+            if market_id == "tw-share":
+                # merge inst
+                if not inst_df.empty:
+                    match = inst_df.loc[inst_df["Symbol"] == s_df["Symbol"].iloc[0], "Inst_Net"]
+                    if not match.empty:
+                        net_val = float(match.values[0])
+                    else:
+                        net_val = 0.0
+                else:
+                    net_val = 0.0
+
+                s_df["Inst_Net"] = net_val
+                val_k = round(net_val / 1000.0, 1)
+                # keep explicit sign for quick visual
+                if net_val > 0:
+                    s_df["Inst_Status"] = f"+{val_k}k"
+                elif net_val < 0:
+                    s_df["Inst_Status"] = f"{val_k}k"
+                else:
+                    s_df["Inst_Status"] = "0.0k"
+
+            all_res.append(s_df)
         except Exception:
             continue
 
-    if not all_rows:
+    if not all_res:
         return pd.DataFrame()
 
-    out = pd.concat(all_rows, ignore_index=True)
-    for c in ["Date", "Open", "High", "Low", "Close", "Volume", "Symbol"]:
-        if c not in out.columns:
-            out[c] = pd.NA
+    out = pd.concat(all_res).reset_index()
+    if "Datetime" in out.columns and "Date" not in out.columns:
+        out = out.rename(columns={"Datetime": "Date"})
+
+    # normalize required fields for analyzer
+    if "Date" not in out.columns:
+        return pd.DataFrame()
+
+    out["Date"] = pd.to_datetime(out["Date"], errors="coerce")
+    out["Symbol"] = out["Symbol"].astype(str).str.upper().str.strip()
     return out
 
 
-@st.cache_data(ttl=120, show_spinner=False)
-def finmind_market_amount(trade_date: str) -> str:
-    if not trade_date:
-        return "待更新"
-
-    token = _get_finmind_token()
-    params = {"dataset": "TaiwanStockPrice", "data_id": "TAIEX", "date": trade_date}
-    if token:
-        params["token"] = token
-
-    try:
-        r = requests.get("https://api.finmindtrade.com/api/v4/data", params=params, timeout=15)
-        data = r.json()
-        if data.get("msg") == "success" and data.get("data"):
-            money = data["data"][0].get("Trading_Money", 0)
-            return f"{_safe_float(money) / 100000000:.0f} 億"
-    except Exception:
-        pass
-    return "待更新"
-
-
-@st.cache_data(ttl=120, show_spinner=False)
-def finmind_market_total_inst(trade_date: str) -> str:
-    if not trade_date:
-        return "待更新"
-
-    token = _get_finmind_token()
-    params = {"dataset": "TaiwanStockTotalInstitutionalInvestors", "date": trade_date}
-    if token:
-        params["token"] = token
-
-    try:
-        r = requests.get("https://api.finmindtrade.com/api/v4/data", params=params, timeout=15)
-        data = r.json()
-        if data.get("msg") == "success" and data.get("data"):
-            df = pd.DataFrame(data["data"])
-            net = (_safe_float(df["buy"].sum()) - _safe_float(df["sell"].sum())) / 100000000
-            return f"🔴+{net:.1f}億" if net > 0 else f"🔵{net:.1f}億"
-    except Exception:
-        pass
-    return "待更新"
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def finmind_inst_by_stock(trade_date: str) -> pd.DataFrame:
-    if not trade_date:
-        return pd.DataFrame()
-
-    token = _get_finmind_token()
-    params = {"dataset": "TaiwanStockInstitutionalInvestorsBuySell", "date": trade_date}
-    if token:
-        params["token"] = token
-
-    try:
-        r = requests.get("https://api.finmindtrade.com/api/v4/data", params=params, timeout=20)
-        data = r.json()
-        if data.get("msg") == "success" and data.get("data"):
-            df = pd.DataFrame(data["data"])
-            df["buy"] = pd.to_numeric(df["buy"], errors="coerce").fillna(0)
-            df["sell"] = pd.to_numeric(df["sell"], errors="coerce").fillna(0)
-            df["Net"] = df["buy"] - df["sell"]
-
-            g = df.groupby("stock_id")["Net"].sum().reset_index()
-            g.columns = ["stock_id", "Inst_Net"]
-            g["Symbol"] = g["stock_id"].astype(str).str.strip() + ".TW"
-            return g[["Symbol", "Inst_Net"]]
-    except Exception:
-        pass
-
-    return pd.DataFrame()
-
-
-def attach_inst_to_ohlcv(full_df: pd.DataFrame, trade_date: str, market_id: str):
-    if full_df is None or full_df.empty:
-        return full_df, 0
-
-    if market_id != "tw-share":
-        full_df["Inst_Net"] = 0.0
-        full_df["Inst_Status"] = "N/A"
-        return full_df, 0
-
-    inst_df = finmind_inst_by_stock(trade_date)
-    if inst_df is None or inst_df.empty:
-        full_df["Inst_Net"] = 0.0
-        full_df["Inst_Status"] = "N/A"
-        return full_df, 0
-
-    full_df = full_df.copy()
-    full_df["Symbol"] = full_df["Symbol"].astype(str)
-
-    inst_df = inst_df.copy()
-    inst_df["Symbol"] = inst_df["Symbol"].astype(str)
-    inst_df["Inst_Net"] = pd.to_numeric(inst_df["Inst_Net"], errors="coerce").fillna(0)
-
-    merged = full_df.merge(inst_df, on="Symbol", how="left")
-    merged["Inst_Net"] = pd.to_numeric(merged["Inst_Net"], errors="coerce").fillna(0)
-
-    def _fmt_status(net):
-        try:
-            net = float(net)
-        except Exception:
-            net = 0.0
-        val_k = round(net / 1000.0, 1)
-        return f"🔴+{val_k}k" if net > 0 else f"🔵{val_k}k"
-
-    merged["Inst_Status"] = merged["Inst_Net"].apply(lambda x: _fmt_status(x))
-    return merged, len(inst_df)
-
-
 # ======================================================
-# 2) UI
+# UI
 # ======================================================
-
-st.set_page_config(page_title="Predator V15.5.4", layout="wide")
-st.title("Predator 指揮中心 V15.5.4 (Inst Fix + FinMind EOD Date Fallback + Rev_Growth)")
+st.set_page_config(page_title="Predator V15.5.5", layout="wide")
+st.title("Predator 指揮中心 V15.5.5（Inst Fix + FinMind TradeDate + Rev_Growth）")
 
 market = st.sidebar.selectbox("市場介入", ["tw-share", "us"])
 
-if st.sidebar.button("清除快取並重跑"):
-    st.cache_data.clear()
-
 if st.button("啟動全域掃描與結構分析"):
     try:
-        with st.spinner("執行中：下載行情 → 推導 FinMind 交易日 → 籌碼/大盤 → 策略引擎"):
+        with st.spinner("執行中：技術面篩選 → 籌碼合併 → 結構面掃描"):
+            # 0) detect trade_date from FinMind
+            trade_date = detect_finmind_trade_date(lookback_days=14)
+
+            # 1) macro
             indices_df = fetch_detailed_indices()
-            full_df = fetch_market_data(market)
 
-            trade_date = _choose_finmind_trade_date(full_df)
+            total_amount, diag_amt = fetch_market_amount(trade_date)
+            total_inst, diag_inst = fetch_market_total_inst(trade_date)
 
-            total_amount = finmind_market_amount(trade_date) if market == "tw-share" else "N/A"
-            total_inst = finmind_market_total_inst(trade_date) if market == "tw-share" else "N/A"
+            # 2) per-stock inst diag
+            inst_df, diag_inst_stock = fetch_inst_data_finmind_stock(trade_date) if market == "tw-share" else (pd.DataFrame(), {})
 
-            full_df, finmind_rows = attach_inst_to_ohlcv(full_df, trade_date, market)
+            # 3) ohlcv + merge
+            full_df = fetch_market_data(market, trade_date)
 
-            # Macro panel
+            # --- sidebar diagnostics (critical for Cloud) ---
+            st.sidebar.markdown("### FinMind 診斷")
+            st.sidebar.write(f"trade_date: {trade_date if trade_date else 'N/A'}")
+            st.sidebar.write({"amount": diag_amt, "total_inst": diag_inst, "stock_inst": diag_inst_stock})
+            if market == "tw-share":
+                st.sidebar.write(f"stock_inst rows: {len(inst_df):,}")
+
+            # --- macro panel ---
             st.subheader("宏觀戰情室")
             c1, c2, c3 = st.columns(3)
-            c1.metric("FinMind 查詢交易日", trade_date if trade_date else "N/A")
+            c1.metric("FinMind 查詢交易日", trade_date if trade_date else "待更新")
             c2.metric("大盤成交金額", total_amount)
             c3.metric("全市場法人", total_inst)
 
@@ -344,44 +383,37 @@ if st.button("啟動全域掃描與結構分析"):
                     use_container_width=True,
                     hide_index=True,
                 )
-            else:
-                st.warning("國際指數數據暫時無法獲取")
 
             st.divider()
-            st.subheader("戰略核心分析")
 
-            # Session 呈現可以仍顯示 EOD（因為你此系統主要用日線）
-            current_session = analyzer.SESSION_EOD
+            # --- session logic (do not lie) ---
+            now = datetime.now(TW_TZ)
+            # If before 15:00, treat as INTRADAY even if you show FinMind previous trade_date
+            current_session = analyzer.SESSION_EOD if now.hour >= 15 else analyzer.SESSION_INTRADAY
+
+            st.subheader("戰略核心分析")
 
             top_10, err_msg = analyzer.run_analysis(full_df, session=current_session)
 
-            # Sidebar diagnostics
-            token = _get_finmind_token()
-            token_state = "已設定" if token else "未設定"
-
-            if err_msg:
-                st.sidebar.error(f"系統警示: {err_msg}")
-
+            # data quality
             if full_df is not None and not full_df.empty:
                 total_rows = len(full_df)
                 total_symbols = full_df["Symbol"].nunique() if "Symbol" in full_df.columns else 0
                 missing_close = full_df["Close"].isna().mean() * 100 if "Close" in full_df.columns else 100.0
                 missing_vol = full_df["Volume"].isna().mean() * 100 if "Volume" in full_df.columns else 100.0
-                inst_coverage = (full_df["Inst_Status"] != "N/A").mean() * 100 if "Inst_Status" in full_df.columns else 0.0
 
-                st.sidebar.info(
-                    "資料源診斷\n"
-                    f"- 總筆數: {total_rows:,}\n"
-                    f"- 監控標的: {total_symbols}\n"
-                    "資料品質\n"
-                    f"- Close 缺值: {missing_close:.1f}%\n"
-                    f"- Volume 缺值: {missing_vol:.1f}%\n"
-                    f"- 籌碼覆蓋率: {inst_coverage:.1f}%\n"
-                    f"- FinMind 個股筆數: {finmind_rows}\n"
-                    f"- FinMind Token: {token_state}"
-                )
+                st.sidebar.markdown("### 資料源品質")
+                st.sidebar.write({
+                    "rows": total_rows,
+                    "symbols": total_symbols,
+                    "close_missing_%": round(missing_close, 1),
+                    "volume_missing_%": round(missing_vol, 1),
+                })
             else:
-                st.sidebar.warning("資料源為空（可能連線失敗或市場休市）")
+                st.sidebar.warning("OHLCV 資料源為空（yfinance 連線失敗 / 市場休市 / 回傳結構異常）")
+
+            if err_msg:
+                st.sidebar.error(f"Analyzer: {err_msg}")
 
             if top_10 is None or top_10.empty:
                 st.warning("本次掃描無符合策略標準之標的")
@@ -391,7 +423,11 @@ if st.button("啟動全域掃描與結構分析"):
             st.success(f"結構化數據構建完成（{len(top_10)} 檔入選）")
 
             macro_dict = {
-                "overview": {"amount": total_amount, "inst_net": total_inst, "trade_date": trade_date},
+                "overview": {
+                    "amount": total_amount,
+                    "inst_net": total_inst,
+                    "trade_date": trade_date if trade_date else "",
+                },
                 "indices": indices_df.to_dict(orient="records") if not indices_df.empty else [],
             }
 
@@ -403,12 +439,15 @@ if st.button("啟動全域掃描與結構分析"):
             )
 
             st.subheader("AI 戰略數據包（JSON）")
-            st.caption("Structure.Rev_Growth 來源：yfinance.info['revenueGrowth']（避免誤判為嚴格 QoQ）。")
+            st.caption("包含：技術評分、籌碼（Inst_Status + Inst_Net_Raw）、結構面（OPM/Rev_Growth/PE）、風控 Kill Switch。")
             st.code(json_payload, language="json")
 
             st.subheader("關鍵標的指標")
-            cols = ["Symbol", "Close", "Inst_Status", "MA_Bias", "Vol_Ratio", "Predator_Tag", "Score"]
-            cols = [c for c in cols if c in top_10.columns]
+            cols = ["Symbol", "Close", "MA_Bias", "Vol_Ratio", "Predator_Tag", "Score"]
+            if "Inst_Status" in top_10.columns:
+                cols.insert(3, "Inst_Status")
+            if "Inst_Net" in top_10.columns:
+                cols.insert(4, "Inst_Net")
             st.dataframe(top_10[cols], use_container_width=True)
 
     except Exception as e:
