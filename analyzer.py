@@ -1,20 +1,19 @@
 # -*- coding: utf-8 -*-
 """
 Filename: analyzer.py
-Version: Predator V15.5.5 (Rev_Growth rename + Inst passthrough)
-Notes:
-- QoQ renamed to Rev_Growth (source: yfinance.info['revenueGrowth'])
-- JSON exports Inst_Visual + Inst_Net_Raw
+Version: Predator V15.6 (Inst 3D + Dual Engine + Rev_Growth)
 """
+
 import pandas as pd
 import numpy as np
 import json
 import yfinance as yf
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # ======================================================
-# Parameters
+# 1) Parameters
 # ======================================================
+
 VOL_THRESHOLD_WEIGHTED = 1.2
 VOL_THRESHOLD_SMALL = 1.8
 
@@ -33,8 +32,81 @@ SESSION_INTRADAY = "INTRADAY"
 SESSION_EOD = "EOD"
 
 # ======================================================
-# Helpers
+# 2) FinMind trade date helpers (pure logic; main.py calls API)
 # ======================================================
+
+def get_recent_finmind_trade_dates(anchor_date: str, lookback_days: int = 12, need_days: int = 3):
+    """
+    Returns last `need_days` date strings <= anchor_date by probing date list.
+    main.py will validate data existence per date; here we just generate candidates.
+    """
+    try:
+        d0 = datetime.strptime(anchor_date, "%Y-%m-%d")
+    except Exception:
+        d0 = datetime.now()
+
+    candidates = [(d0 - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(lookback_days)]
+    # main.py will keep the dates where API returns data; but for caching we pass candidates.
+    # Here return full candidate list; main.py will choose actual 3.
+    # However in V15.6 we want analyzer to supply a stable list -> main will filter.
+    # We'll still return candidates and let main.py decide; but for simplicity we return candidates.
+    return candidates[:lookback_days]
+
+def inst_direction_3d(d0: float, d1: float, d2: float) -> str:
+    """
+    Direction classification for 3 days: BUY / SELL / FLAT
+    """
+    a = [float(d2), float(d1), float(d0)]  # oldest -> newest
+    # consider tiny values as flat
+    eps = 1e-9
+    signs = []
+    for x in a:
+        if abs(x) <= eps:
+            signs.append(0)
+        elif x > 0:
+            signs.append(1)
+        else:
+            signs.append(-1)
+
+    if signs == [1, 1, 1]:
+        return "BUY"
+    if signs == [-1, -1, -1]:
+        return "SELL"
+    if signs == [0, 0, 0]:
+        return "FLAT"
+    return "MIXED"
+
+def inst_streak_3d(d0: float, d1: float, d2: float) -> int:
+    """
+    Streak of same direction ending at most recent day (d0).
+    Returns 0~3:
+      - If d0 == 0 => 0
+      - Else count consecutive days backwards with same sign as d0
+    """
+    vals = [float(d0), float(d1), float(d2)]  # newest -> oldest
+    eps = 1e-9
+
+    def sgn(x):
+        if abs(x) <= eps:
+            return 0
+        return 1 if x > 0 else -1
+
+    s0 = sgn(vals[0])
+    if s0 == 0:
+        return 0
+
+    streak = 1
+    for x in vals[1:]:
+        if sgn(x) == s0:
+            streak += 1
+        else:
+            break
+    return streak
+
+# ======================================================
+# 3) Helpers
+# ======================================================
+
 def calc_body_power(row: dict) -> float:
     try:
         high = float(row.get("High", np.nan))
@@ -53,7 +125,6 @@ def calc_body_power(row: dict) -> float:
     except Exception:
         return 0.0
 
-
 def calc_ma_bias_penalty(ma_bias) -> float:
     try:
         ma_bias = float(ma_bias)
@@ -66,12 +137,22 @@ def calc_ma_bias_penalty(ma_bias) -> float:
         return 1.0
     return (ma_bias - MA_BIAS_PENALTY_START) / (MA_BIAS_PENALTY_FULL - MA_BIAS_PENALTY_START)
 
-
 def enrich_fundamentals(symbol: str) -> dict:
     """
-    Important: Rev_Growth is mapped from yfinance.info['revenueGrowth'] (NOT guaranteed QoQ).
+    Structure fields:
+      - OPM: operatingMargins * 100
+      - Rev_Growth: revenueGrowth * 100 (SOURCE MUST BE DECLARED)
+      - PE: trailingPE
+      - Sector
+      - Rev_Growth_Source
     """
-    data = {"OPM": 0.0, "Rev_Growth": 0.0, "PE": 0.0, "Sector": "Unknown", "Rev_Growth_Source": "yfinance:revenueGrowth"}
+    data = {
+        "OPM": 0.0,
+        "Rev_Growth": 0.0,
+        "PE": 0.0,
+        "Sector": "Unknown",
+        "Rev_Growth_Source": "yfinance:revenueGrowth",
+    }
     try:
         info = (yf.Ticker(symbol).info) or {}
         data["OPM"] = round((info.get("operatingMargins") or 0) * 100, 2)
@@ -82,7 +163,6 @@ def enrich_fundamentals(symbol: str) -> dict:
         pass
     return data
 
-
 def _ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
     required = ["Symbol", "Date", "Open", "High", "Low", "Close", "Volume"]
     for c in required:
@@ -90,18 +170,70 @@ def _ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
             df[c] = np.nan
     return df
 
-
 def _coerce_types(df: pd.DataFrame) -> pd.DataFrame:
     for c in ["Open", "High", "Low", "Close", "Volume"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce", utc=False)
-    df["Symbol"] = df["Symbol"].astype(str).str.upper().str.strip()
+    df["Symbol"] = df["Symbol"].astype(str)
     return df
 
 # ======================================================
-# Core
+# 4) Dual decision engine (V15.6)
 # ======================================================
-def run_analysis(df: pd.DataFrame, session: str = SESSION_INTRADAY):
+
+def decide_conservative(row: dict, session: str, inst_ready: bool) -> str:
+    """
+    Conservative account:
+      - Must be EOD AND inst_ready
+      - Must have inst_streak3 == 3 AND direction BUY
+      - Prefer tags include 主力 and not extreme MA_Bias
+    Output: BUY / WATCH / AVOID
+    """
+    if session != SESSION_EOD or not inst_ready:
+        return "WATCH"
+
+    streak = int(row.get("Inst_Streak3", 0) or 0)
+    ddir = str(row.get("Inst_Dir3", "PENDING"))
+    ma_bias = float(row.get("MA_Bias", 0) or 0)
+    vol_ratio = float(row.get("Vol_Ratio", 0) or 0)
+
+    if streak == 3 and ddir == "BUY" and ma_bias <= 12 and vol_ratio >= 1.0:
+        return "BUY"
+    if ma_bias > MA_BIAS_HARD_CAP:
+        return "AVOID"
+    return "WATCH"
+
+def decide_aggressive(row: dict, session: str, inst_ready: bool) -> str:
+    """
+    Aggressive account:
+      - INTRADAY: can allow TRIAL if Vol_Ratio >= threshold or Body_Power strong
+      - EOD: prefer inst_streak3 >= 2 with BUY
+    Output: BUY / TRIAL / WATCH / AVOID
+    """
+    ma_bias = float(row.get("MA_Bias", 0) or 0)
+    vol_ratio = float(row.get("Vol_Ratio", 0) or 0)
+    body = float(row.get("Body_Power", 0) or 0)
+
+    if ma_bias > MA_BIAS_HARD_CAP:
+        return "AVOID"
+
+    if session == SESSION_EOD and inst_ready:
+        streak = int(row.get("Inst_Streak3", 0) or 0)
+        ddir = str(row.get("Inst_Dir3", "PENDING"))
+        if streak >= 2 and ddir == "BUY" and vol_ratio >= 1.0:
+            return "BUY"
+        return "WATCH"
+
+    # INTRADAY or inst not ready: allow TRIAL with strict risk
+    if vol_ratio >= 1.5 or body >= BODY_POWER_STRONG:
+        return "TRIAL"
+    return "WATCH"
+
+# ======================================================
+# 5) Core analysis
+# ======================================================
+
+def run_analysis(df: pd.DataFrame, session: str = SESSION_INTRADAY, inst_ready: bool = False):
     """
     Return: (df_top10, err_msg)
     """
@@ -160,11 +292,11 @@ def run_analysis(df: pd.DataFrame, session: str = SESSION_INTRADAY):
 
             is_weighted = str(symbol) in weighted_symbols
 
-            # Kill Switch I
+            # Kill Switch I: distribute trap
             if latest["Body_Power"] < BODY_POWER_DISTRIBUTE and latest["Vol_Ratio"] > DISTRIBUTE_VOL_RATIO:
                 continue
 
-            # Kill Switch II
+            # Kill Switch II: MA_Bias hard cap
             if latest["MA_Bias"] > MA_BIAS_HARD_CAP:
                 continue
 
@@ -182,14 +314,13 @@ def run_analysis(df: pd.DataFrame, session: str = SESSION_INTRADAY):
 
         final_list = []
         for row in candidates:
-            symbol = str(row.get("Symbol", "")).upper().strip()
+            symbol = str(row.get("Symbol", ""))
 
             fundamentals = enrich_fundamentals(symbol)
             row["Structure"] = fundamentals
 
-            # Optional Kill Switch III:
-            # revenueGrowth might be YoY/TTM mapping, keep it as a warning, do not hard-kill by default.
-            # (If you want strict filter, you can re-enable negative growth kill here.)
+            # Optional: if you still want a hard filter based on Rev_Growth < 0, do it here
+            # For now, DO NOT hard-kill to avoid data-definition risk.
 
             weighted = bool(row.get("_Is_Weighted", False))
             vol_threshold = VOL_THRESHOLD_WEIGHTED if weighted else VOL_THRESHOLD_SMALL
@@ -207,13 +338,22 @@ def run_analysis(df: pd.DataFrame, session: str = SESSION_INTRADAY):
             if body_power >= BODY_POWER_STRONG:
                 tags.append("真突破")
 
-            suffix = "(觀望)" if session == SESSION_INTRADAY else "(確認)"
-            row["Predator_Tag"] = (" ".join(tags) + suffix) if tags else "觀察"
+            # V15.5.6+ confirmation gate
+            if session == SESSION_EOD and inst_ready:
+                suffix = "(確認)"
+            else:
+                suffix = "(觀望)"
+
+            row["Predator_Tag"] = (" ".join(tags) + suffix) if tags else ("觀察" + suffix)
+
+            # V15.6 dual decisions (inst streak will be merged in main.py; default 0 if missing)
+            row["Decision_Conservative"] = decide_conservative(row, session=session, inst_ready=inst_ready)
+            row["Decision_Aggressive"] = decide_aggressive(row, session=session, inst_ready=inst_ready)
 
             final_list.append(row)
 
         if not final_list:
-            return pd.DataFrame(), "no_results_after_fundamental_filter"
+            return pd.DataFrame(), "no_results_after_structure_step"
 
         df_final = pd.DataFrame(final_list).sort_values("Score", ascending=False).head(10)
         return df_final, ""
@@ -223,9 +363,10 @@ def run_analysis(df: pd.DataFrame, session: str = SESSION_INTRADAY):
 
 
 # ======================================================
-# JSON payload
+# 6) JSON payload
 # ======================================================
-def generate_ai_json(df_top10: pd.DataFrame, market: str = "tw-share", session: str = SESSION_INTRADAY, macro_data=None) -> str:
+
+def generate_ai_json(df_top10: pd.DataFrame, market: str = "tw-share", session: str = SESSION_INTRADAY, macro_data=None, inst_ready: bool = False) -> str:
     if df_top10 is None or df_top10.empty:
         return json.dumps({"error": "No data"}, ensure_ascii=False, indent=2)
 
@@ -233,8 +374,11 @@ def generate_ai_json(df_top10: pd.DataFrame, market: str = "tw-share", session: 
     stocks = []
 
     for r in records:
-        inst_visual = r.get("Inst_Status", "N/A")
-        inst_raw = float(r.get("Inst_Net", 0) or 0)
+        # Inst fields (if merged)
+        inst_visual = r.get("Inst_Visual", "PENDING")
+        inst_net_3d = float(r.get("Inst_Net_3d", 0) or 0)
+        inst_streak3 = int(r.get("Inst_Streak3", 0) or 0)
+        inst_dir3 = r.get("Inst_Dir3", "PENDING")
 
         stocks.append({
             "Symbol": str(r.get("Symbol", "Unknown")),
@@ -246,14 +390,23 @@ def generate_ai_json(df_top10: pd.DataFrame, market: str = "tw-share", session: 
                 "Score": round(float(r.get("Score", 0) or 0), 1),
                 "Tag": r.get("Predator_Tag", ""),
             },
-            "Inst_Visual": inst_visual,
-            "Inst_Net_Raw": inst_raw,
+            "Institutional": {
+                "Inst_Visual": inst_visual,
+                "Inst_Net_3d": inst_net_3d,
+                "Inst_Streak3": inst_streak3,
+                "Inst_Dir3": inst_dir3,
+                "Inst_Status": "READY" if inst_ready else "PENDING",
+            },
             "Structure": r.get("Structure", {}),
+            "Decision": {
+                "Conservative": r.get("Decision_Conservative", "WATCH"),
+                "Aggressive": r.get("Decision_Aggressive", "WATCH"),
+            }
         })
 
     payload = {
         "meta": {
-            "system": "Predator V15.5.5",
+            "system": "Predator V15.6",
             "market": market,
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
             "session": session,
