@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import os
-import json
 from datetime import datetime
 
 import pandas as pd
 import streamlit as st
 
 from analyzer import run_analysis, generate_ai_json, SESSION_INTRADAY, SESSION_EOD
-from finmind_institutional import fetch_finmind_institutional
+from finmind_institutional import fetch_finmind_institutional, fetch_finmind_market_inst_net_ab
 from institutional_utils import calc_inst_3d
 
 
@@ -22,18 +21,15 @@ def _fmt_date(dt) -> str:
 
 
 def _load_market_csv(market: str) -> pd.DataFrame:
-    # 你的 repo 目前是 data_tw-share.csv / data_tw.csv
     fname = f"data_{market}.csv"
     if not os.path.exists(fname):
-        # fallback
         if os.path.exists("data_tw-share.csv"):
             fname = "data_tw-share.csv"
         elif os.path.exists("data_tw.csv"):
             fname = "data_tw.csv"
         else:
             raise FileNotFoundError(f"找不到資料檔：{fname} / data_tw-share.csv / data_tw.csv")
-    df = pd.read_csv(fname)
-    return df
+    return pd.read_csv(fname)
 
 
 def _compute_market_amount_today(df: pd.DataFrame, latest_date) -> str:
@@ -45,14 +41,10 @@ def _compute_market_amount_today(df: pd.DataFrame, latest_date) -> str:
     d["Close"] = pd.to_numeric(d.get("Close"), errors="coerce").fillna(0)
     d["Volume"] = pd.to_numeric(d.get("Volume"), errors="coerce").fillna(0)
     amt = float((d["Close"] * d["Volume"]).sum())
-    # 以整數字串顯示（你也可改成億）
     return f"{amt:,.0f}"
 
 
 def _merge_institutional_into_df_top(df_top: pd.DataFrame, inst_df: pd.DataFrame, trade_date: str) -> pd.DataFrame:
-    """
-    把 calc_inst_3d 的結果塞回 df_top 的 Institutional 欄位（dict）
-    """
     df_out = df_top.copy()
     inst_records = []
 
@@ -64,13 +56,12 @@ def _merge_institutional_into_df_top(df_top: pd.DataFrame, inst_df: pd.DataFrame
             {
                 "Symbol": symbol,
                 "Institutional": {
-                    # 你 Arbiter/Schema 需要的欄位
                     "Inst_Visual": inst_calc.get("Inst_Status", "PENDING"),
                     "Inst_Net_3d": float(inst_calc.get("Inst_Net_3d", 0.0)),
                     "Inst_Streak3": int(inst_calc.get("Inst_Streak3", 0)),
                     "Inst_Dir3": inst_calc.get("Inst_Dir3", "PENDING"),
                     "Inst_Status": inst_calc.get("Inst_Status", "PENDING"),
-                }
+                },
             }
         )
 
@@ -80,11 +71,6 @@ def _merge_institutional_into_df_top(df_top: pd.DataFrame, inst_df: pd.DataFrame
 
 
 def _decide_inst_status(inst_df: pd.DataFrame, symbols: list[str], trade_date: str) -> tuple[str, list[str]]:
-    """
-    給 macro.overview.inst_status + inst_dates_3d
-    規則：只要有任何一檔能滿足「三日資料齊全」→ READY
-    否則 PENDING
-    """
     ready_any = False
     dates_3d = []
 
@@ -93,9 +79,8 @@ def _decide_inst_status(inst_df: pd.DataFrame, symbols: list[str], trade_date: s
         if r.get("Inst_Status") == "READY":
             ready_any = True
 
-    # 另外把 inst_df 近三個交易日列出，方便你 Debug
     try:
-        if not inst_df.empty:
+        if inst_df is not None and (not inst_df.empty) and ("date" in inst_df.columns):
             dates_3d = sorted(inst_df["date"].astype(str).unique().tolist())[-3:]
     except Exception:
         dates_3d = []
@@ -109,7 +94,6 @@ def app():
 
     market = st.sidebar.selectbox("Market", ["tw-share", "tw"], index=0)
     session = st.sidebar.selectbox("Session", [SESSION_INTRADAY, SESSION_EOD], index=0)
-
     run_btn = st.sidebar.button("Run")
 
     if not run_btn:
@@ -129,23 +113,22 @@ def app():
         st.error(f"Analyzer error: {err}")
         return
 
-    # 3) Fetch institutional (FinMind)
-    # 建議抓 30 天，確保跨假日仍可拿到 3 交易日
+    # 3) Fetch institutional (FinMind) for selected symbols
     start_date = (pd.to_datetime(trade_date) - pd.Timedelta(days=45)).strftime("%Y-%m-%d")
     end_date = trade_date
-
     symbols = df_top["Symbol"].astype(str).tolist()
+    token = os.getenv("FINMIND_TOKEN", None)
 
     try:
         inst_df = fetch_finmind_institutional(
             symbols=symbols,
             start_date=start_date,
             end_date=end_date,
-            token=os.getenv("FINMIND_TOKEN", None),
+            token=token,
         )
     except Exception as e:
         inst_df = pd.DataFrame(columns=["date", "symbol", "net_amount"])
-        st.warning(f"法人資料抓取失敗：{type(e).__name__}: {str(e)}")
+        st.warning(f"個股法人資料抓取失敗：{type(e).__name__}: {str(e)}")
 
     # 4) Determine macro inst_status + inst_dates_3d
     inst_status, inst_dates_3d = _decide_inst_status(inst_df, symbols, trade_date)
@@ -153,18 +136,33 @@ def app():
     # 5) Merge institutional into df_top
     df_top2 = _merge_institutional_into_df_top(df_top, inst_df, trade_date=trade_date)
 
-    # 6) Macro overview (amount / degraded)
+    # 6) Market amount + Market total A/B inst_net
     amount_str = _compute_market_amount_today(df, latest_date)
+
+    # A/B：優先用「市場整體」dataset，失敗才回退 0
+    try:
+        # 抓 trade_date 當天；若遇到 API 更新延遲，可自行改成抓 end_date=trade_date、start_date=trade_date-3
+        inst_net_ab = fetch_finmind_market_inst_net_ab(
+            trade_date=trade_date,
+            start_date=trade_date,
+            end_date=trade_date,
+            token=token,
+        )
+    except Exception as e:
+        inst_net_ab = {"A": 0.0, "B": 0.0}
+        st.warning(f"市場整體法人 A/B 抓取失敗：{type(e).__name__}: {str(e)}")
 
     macro_data = {
         "overview": {
             "amount": amount_str,
-            "inst_net": "待更新",  # 你若要加上全市場法人淨額，可在此擴充
+            # 你指定：inst_net 用 A 三大法人合計 / B 外資
+            "inst_net": inst_net_ab,  # {"A":..., "B":...}
             "trade_date": trade_date,
             "inst_status": inst_status,
             "inst_dates_3d": inst_dates_3d,
             "kill_switch": False,
             "v14_watch": False,
+            # 這裡維持你既有策略：法人未 READY → 降級
             "degraded_mode": (inst_status != "READY"),
         },
         "indices": [],
@@ -177,10 +175,12 @@ def app():
     st.subheader("Top List")
     st.dataframe(df_top2)
 
+    st.subheader("Market A/B (inst_net)")
+    st.write(inst_net_ab)
+
     st.subheader("AI JSON (Arbiter Input)")
     st.code(json_text, language="json")
 
-    # optional: save
     outname = f"ai_payload_{market}_{trade_date.replace('-', '')}_{session.lower()}.json"
     with open(outname, "w", encoding="utf-8") as f:
         f.write(json_text)
