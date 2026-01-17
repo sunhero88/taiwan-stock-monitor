@@ -1,17 +1,21 @@
+# analyzer.py
 # -*- coding: utf-8 -*-
 """
-Filename: analyzer.py
-Version: Predator V15.6 (Inst 3D + Dual Engine + Rev_Growth)
+Predator Analyzer V15.6.3
+- 技術面篩選 + 結構面補強 + 法人3日欄位準備
+- 不做 BUY/SELL（裁決由 arbiter.py 負責）
 """
 
+import json
+from datetime import datetime
 import pandas as pd
 import numpy as np
-import json
 import yfinance as yf
-from datetime import datetime, timedelta
+
+from institutional_utils import calc_inst_3d  # 你已新增
 
 # ======================================================
-# 1) Parameters
+# Parameters
 # ======================================================
 
 VOL_THRESHOLD_WEIGHTED = 1.2
@@ -31,80 +35,11 @@ DISTRIBUTE_VOL_RATIO = 2.5
 SESSION_INTRADAY = "INTRADAY"
 SESSION_EOD = "EOD"
 
-# ======================================================
-# 2) FinMind trade date helpers (pure logic; main.py calls API)
-# ======================================================
+TOPN_FINAL = 20
 
-def get_recent_finmind_trade_dates(anchor_date: str, lookback_days: int = 12, need_days: int = 3):
-    """
-    Returns last `need_days` date strings <= anchor_date by probing date list.
-    main.py will validate data existence per date; here we just generate candidates.
-    """
-    try:
-        d0 = datetime.strptime(anchor_date, "%Y-%m-%d")
-    except Exception:
-        d0 = datetime.now()
-
-    candidates = [(d0 - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(lookback_days)]
-    # main.py will keep the dates where API returns data; but for caching we pass candidates.
-    # Here return full candidate list; main.py will choose actual 3.
-    # However in V15.6 we want analyzer to supply a stable list -> main will filter.
-    # We'll still return candidates and let main.py decide; but for simplicity we return candidates.
-    return candidates[:lookback_days]
-
-def inst_direction_3d(d0: float, d1: float, d2: float) -> str:
-    """
-    Direction classification for 3 days: BUY / SELL / FLAT
-    """
-    a = [float(d2), float(d1), float(d0)]  # oldest -> newest
-    # consider tiny values as flat
-    eps = 1e-9
-    signs = []
-    for x in a:
-        if abs(x) <= eps:
-            signs.append(0)
-        elif x > 0:
-            signs.append(1)
-        else:
-            signs.append(-1)
-
-    if signs == [1, 1, 1]:
-        return "BUY"
-    if signs == [-1, -1, -1]:
-        return "SELL"
-    if signs == [0, 0, 0]:
-        return "FLAT"
-    return "MIXED"
-
-def inst_streak_3d(d0: float, d1: float, d2: float) -> int:
-    """
-    Streak of same direction ending at most recent day (d0).
-    Returns 0~3:
-      - If d0 == 0 => 0
-      - Else count consecutive days backwards with same sign as d0
-    """
-    vals = [float(d0), float(d1), float(d2)]  # newest -> oldest
-    eps = 1e-9
-
-    def sgn(x):
-        if abs(x) <= eps:
-            return 0
-        return 1 if x > 0 else -1
-
-    s0 = sgn(vals[0])
-    if s0 == 0:
-        return 0
-
-    streak = 1
-    for x in vals[1:]:
-        if sgn(x) == s0:
-            streak += 1
-        else:
-            break
-    return streak
 
 # ======================================================
-# 3) Helpers
+# Helpers
 # ======================================================
 
 def calc_body_power(row: dict) -> float:
@@ -125,6 +60,7 @@ def calc_body_power(row: dict) -> float:
     except Exception:
         return 0.0
 
+
 def calc_ma_bias_penalty(ma_bias) -> float:
     try:
         ma_bias = float(ma_bias)
@@ -137,14 +73,11 @@ def calc_ma_bias_penalty(ma_bias) -> float:
         return 1.0
     return (ma_bias - MA_BIAS_PENALTY_START) / (MA_BIAS_PENALTY_FULL - MA_BIAS_PENALTY_START)
 
+
 def enrich_fundamentals(symbol: str) -> dict:
     """
-    Structure fields:
-      - OPM: operatingMargins * 100
-      - Rev_Growth: revenueGrowth * 100 (SOURCE MUST BE DECLARED)
-      - PE: trailingPE
-      - Sector
-      - Rev_Growth_Source
+    注意：Rev_Growth 來源為 yfinance.info['revenueGrowth']
+    口徑可能是 YoY 或 trailing growth，故不命名 QoQ。
     """
     data = {
         "OPM": 0.0,
@@ -163,12 +96,14 @@ def enrich_fundamentals(symbol: str) -> dict:
         pass
     return data
 
+
 def _ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
     required = ["Symbol", "Date", "Open", "High", "Low", "Close", "Volume"]
     for c in required:
         if c not in df.columns:
             df[c] = np.nan
     return df
+
 
 def _coerce_types(df: pd.DataFrame) -> pd.DataFrame:
     for c in ["Open", "High", "Low", "Close", "Volume"]:
@@ -177,72 +112,29 @@ def _coerce_types(df: pd.DataFrame) -> pd.DataFrame:
     df["Symbol"] = df["Symbol"].astype(str)
     return df
 
-# ======================================================
-# 4) Dual decision engine (V15.6)
-# ======================================================
-
-def decide_conservative(row: dict, session: str, inst_ready: bool) -> str:
-    """
-    Conservative account:
-      - Must be EOD AND inst_ready
-      - Must have inst_streak3 == 3 AND direction BUY
-      - Prefer tags include 主力 and not extreme MA_Bias
-    Output: BUY / WATCH / AVOID
-    """
-    if session != SESSION_EOD or not inst_ready:
-        return "WATCH"
-
-    streak = int(row.get("Inst_Streak3", 0) or 0)
-    ddir = str(row.get("Inst_Dir3", "PENDING"))
-    ma_bias = float(row.get("MA_Bias", 0) or 0)
-    vol_ratio = float(row.get("Vol_Ratio", 0) or 0)
-
-    if streak == 3 and ddir == "BUY" and ma_bias <= 12 and vol_ratio >= 1.0:
-        return "BUY"
-    if ma_bias > MA_BIAS_HARD_CAP:
-        return "AVOID"
-    return "WATCH"
-
-def decide_aggressive(row: dict, session: str, inst_ready: bool) -> str:
-    """
-    Aggressive account:
-      - INTRADAY: can allow TRIAL if Vol_Ratio >= threshold or Body_Power strong
-      - EOD: prefer inst_streak3 >= 2 with BUY
-    Output: BUY / TRIAL / WATCH / AVOID
-    """
-    ma_bias = float(row.get("MA_Bias", 0) or 0)
-    vol_ratio = float(row.get("Vol_Ratio", 0) or 0)
-    body = float(row.get("Body_Power", 0) or 0)
-
-    if ma_bias > MA_BIAS_HARD_CAP:
-        return "AVOID"
-
-    if session == SESSION_EOD and inst_ready:
-        streak = int(row.get("Inst_Streak3", 0) or 0)
-        ddir = str(row.get("Inst_Dir3", "PENDING"))
-        if streak >= 2 and ddir == "BUY" and vol_ratio >= 1.0:
-            return "BUY"
-        return "WATCH"
-
-    # INTRADAY or inst not ready: allow TRIAL with strict risk
-    if vol_ratio >= 1.5 or body >= BODY_POWER_STRONG:
-        return "TRIAL"
-    return "WATCH"
 
 # ======================================================
-# 5) Core analysis
+# Core
 # ======================================================
 
-def run_analysis(df: pd.DataFrame, session: str = SESSION_INTRADAY, inst_ready: bool = False):
+def run_analysis(
+    df: pd.DataFrame,
+    session: str = SESSION_INTRADAY,
+    market: str = "tw-share",
+    trade_date: str = "",
+    inst_df_3d: pd.DataFrame = None,
+    inst_status: str = "PENDING",
+    inst_dates_3d=None,
+):
     """
-    Return: (df_top10, err_msg)
+    Return: (df_top20_records, err_msg)
+    df_top20_records: DataFrame，每列是一檔股票的完整欄位（含 Institutional/Structure/Technical）
     """
     try:
         if df is None or df.empty:
             return pd.DataFrame(), "Input DataFrame is empty"
 
         df = df.copy()
-
         if "Date" not in df.columns:
             df = df.reset_index(drop=False)
             if "Date" not in df.columns and "index" in df.columns:
@@ -259,14 +151,12 @@ def run_analysis(df: pd.DataFrame, session: str = SESSION_INTRADAY, inst_ready: 
         if df_today.empty:
             return pd.DataFrame(), "No rows for latest_date"
 
+        # 動態權值：成交額前 50
         df_today["Amount"] = (df_today["Close"] * df_today["Volume"]).fillna(0)
-        if len(df_today) > 50:
-            top_50_amt_threshold = df_today["Amount"].nlargest(50).min()
-        else:
-            top_50_amt_threshold = 0
-
+        top_50_amt_threshold = df_today["Amount"].nlargest(50).min() if len(df_today) > 50 else 0
         weighted_symbols = set(df_today.loc[df_today["Amount"] >= top_50_amt_threshold, "Symbol"].dropna().astype(str))
 
+        # 技術快篩
         results = []
         for symbol, g in df.groupby("Symbol"):
             g = g.sort_values("Date")
@@ -276,7 +166,6 @@ def run_analysis(df: pd.DataFrame, session: str = SESSION_INTRADAY, inst_ready: 
             latest_row = g.iloc[-1]
             close_v = latest_row.get("Close", np.nan)
             vol_v = latest_row.get("Volume", np.nan)
-
             if not np.isfinite(close_v) or not np.isfinite(vol_v) or float(vol_v) == 0:
                 continue
 
@@ -292,16 +181,18 @@ def run_analysis(df: pd.DataFrame, session: str = SESSION_INTRADAY, inst_ready: 
 
             is_weighted = str(symbol) in weighted_symbols
 
-            # Kill Switch I: distribute trap
+            # Kill Switch I
             if latest["Body_Power"] < BODY_POWER_DISTRIBUTE and latest["Vol_Ratio"] > DISTRIBUTE_VOL_RATIO:
                 continue
-
-            # Kill Switch II: MA_Bias hard cap
+            # Kill Switch II
             if latest["MA_Bias"] > MA_BIAS_HARD_CAP:
                 continue
 
             penalty = calc_ma_bias_penalty(latest["MA_Bias"])
-            ers = ((latest["Vol_Ratio"] * 20.0) + (max(0.0, 15.0 - abs(latest["MA_Bias"])) * 2.0)) * (1.0 - 0.5 * penalty)
+            ers = (
+                (latest["Vol_Ratio"] * 20.0)
+                + (max(0.0, 15.0 - abs(latest["MA_Bias"])) * 2.0)
+            ) * (1.0 - 0.5 * penalty)
 
             latest["Score"] = round(float(ers), 2)
             latest["_Is_Weighted"] = bool(is_weighted)
@@ -310,18 +201,18 @@ def run_analysis(df: pd.DataFrame, session: str = SESSION_INTRADAY, inst_ready: 
         if not results:
             return pd.DataFrame(), "no_results_after_tech_filter"
 
-        candidates = pd.DataFrame(results).sort_values("Score", ascending=False).head(15).to_dict("records")
+        # 準決賽：前 30 做結構
+        candidates = pd.DataFrame(results).sort_values("Score", ascending=False).head(30).to_dict("records")
 
         final_list = []
         for row in candidates:
             symbol = str(row.get("Symbol", ""))
 
+            # 結構面
             fundamentals = enrich_fundamentals(symbol)
             row["Structure"] = fundamentals
 
-            # Optional: if you still want a hard filter based on Rev_Growth < 0, do it here
-            # For now, DO NOT hard-kill to avoid data-definition risk.
-
+            # Tag
             weighted = bool(row.get("_Is_Weighted", False))
             vol_threshold = VOL_THRESHOLD_WEIGHTED if weighted else VOL_THRESHOLD_SMALL
             green_range = MA_BIAS_GREEN_WEIGHTED if weighted else MA_BIAS_GREEN_SMALL
@@ -332,30 +223,47 @@ def run_analysis(df: pd.DataFrame, session: str = SESSION_INTRADAY, inst_ready: 
             body_power = float(row.get("Body_Power", 0))
 
             if green_range[0] < ma_bias <= green_range[1]:
-                tags.append("起漲")
+                tags.append("🟢起漲")
             if vol_ratio >= vol_threshold:
-                tags.append("主力")
+                tags.append("🔥主力")
             if body_power >= BODY_POWER_STRONG:
-                tags.append("真突破")
+                tags.append("⚡真突破")
 
-            # V15.5.6+ confirmation gate
-            if session == SESSION_EOD and inst_ready:
-                suffix = "(確認)"
+            suffix = "(觀望)" if session == SESSION_INTRADAY else "(確認)"
+            row["Predator_Tag"] = (" ".join(tags) + suffix) if tags else f"○觀察{suffix}"
+
+            # 法人（3日）
+            if market == "tw-share" and inst_df_3d is not None and not inst_df_3d.empty:
+                inst_info = calc_inst_3d(inst_df_3d, symbol, trade_date)
             else:
-                suffix = "(觀望)"
+                inst_info = {
+                    "Inst_Status": "PENDING",
+                    "Inst_Streak3": 0,
+                    "Inst_Dir3": "PENDING",
+                    "Inst_Net_3d": 0.0,
+                }
 
-            row["Predator_Tag"] = (" ".join(tags) + suffix) if tags else ("觀察" + suffix)
-
-            # V15.6 dual decisions (inst streak will be merged in main.py; default 0 if missing)
-            row["Decision_Conservative"] = decide_conservative(row, session=session, inst_ready=inst_ready)
-            row["Decision_Aggressive"] = decide_aggressive(row, session=session, inst_ready=inst_ready)
+            row["Institutional"] = {
+                "Inst_Visual": inst_info.get("Inst_Dir3", "PENDING"),
+                "Inst_Net_3d": float(inst_info.get("Inst_Net_3d", 0.0) or 0.0),
+                "Inst_Streak3": int(inst_info.get("Inst_Streak3", 0) or 0),
+                "Inst_Dir3": inst_info.get("Inst_Dir3", "PENDING"),
+                "Inst_Status": inst_info.get("Inst_Status", "PENDING"),
+            }
 
             final_list.append(row)
 
         if not final_list:
-            return pd.DataFrame(), "no_results_after_structure_step"
+            return pd.DataFrame(), "no_results_after_structure_build"
 
-        df_final = pd.DataFrame(final_list).sort_values("Score", ascending=False).head(10)
+        df_final = pd.DataFrame(final_list).sort_values("Score", ascending=False).head(TOPN_FINAL)
+
+        # Ranking: Top20 Tier A/B
+        df_final = df_final.reset_index(drop=True)
+        df_final["rank"] = df_final.index + 1
+        df_final["tier"] = df_final["rank"].apply(lambda r: "A" if r <= 10 else "B")
+        df_final["top20_flag"] = True
+
         return df_final, ""
 
     except Exception as e:
@@ -363,56 +271,42 @@ def run_analysis(df: pd.DataFrame, session: str = SESSION_INTRADAY, inst_ready: 
 
 
 # ======================================================
-# 6) JSON payload
+# JSON payload (V15.6.3)
 # ======================================================
 
-def generate_ai_json(df_top10: pd.DataFrame, market: str = "tw-share", session: str = SESSION_INTRADAY, macro_data=None, inst_ready: bool = False) -> str:
-    if df_top10 is None or df_top10.empty:
-        return json.dumps({"error": "No data"}, ensure_ascii=False, indent=2)
-
-    records = df_top10.to_dict("records")
-    stocks = []
-
-    for r in records:
-        # Inst fields (if merged)
-        inst_visual = r.get("Inst_Visual", "PENDING")
-        inst_net_3d = float(r.get("Inst_Net_3d", 0) or 0)
-        inst_streak3 = int(r.get("Inst_Streak3", 0) or 0)
-        inst_dir3 = r.get("Inst_Dir3", "PENDING")
-
-        stocks.append({
-            "Symbol": str(r.get("Symbol", "Unknown")),
-            "Price": float(r.get("Close", 0) or 0),
-            "Technical": {
-                "MA_Bias": round(float(r.get("MA_Bias", 0) or 0), 2),
-                "Vol_Ratio": round(float(r.get("Vol_Ratio", 0) or 0), 2),
-                "Body_Power": round(float(r.get("Body_Power", 0) or 0), 1),
-                "Score": round(float(r.get("Score", 0) or 0), 1),
-                "Tag": r.get("Predator_Tag", ""),
-            },
-            "Institutional": {
-                "Inst_Visual": inst_visual,
-                "Inst_Net_3d": inst_net_3d,
-                "Inst_Streak3": inst_streak3,
-                "Inst_Dir3": inst_dir3,
-                "Inst_Status": "READY" if inst_ready else "PENDING",
-            },
-            "Structure": r.get("Structure", {}),
-            "Decision": {
-                "Conservative": r.get("Decision_Conservative", "WATCH"),
-                "Aggressive": r.get("Decision_Aggressive", "WATCH"),
-            }
-        })
-
+def generate_ai_json_v1563(stocks: list, market: str, session: str, macro: dict) -> str:
     payload = {
         "meta": {
-            "system": "Predator V15.6",
+            "system": "Predator V15.6.3",
             "market": market,
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
             "session": session,
         },
-        "macro": macro_data if macro_data else {},
-        "stocks": stocks,
+        "macro": macro,
+        "stocks": []
     }
+
+    for s in stocks:
+        symbol = str(s.get("Symbol", "Unknown"))
+        payload["stocks"].append({
+            "Symbol": symbol,
+            "Price": float(s.get("Close", 0) or 0),
+            "ranking": {
+                "symbol": symbol,
+                "rank": int(s.get("rank", 0) or 0),
+                "tier": s.get("tier", "B"),
+                "top20_flag": bool(s.get("top20_flag", False)),
+            },
+            "Technical": {
+                "MA_Bias": round(float(s.get("MA_Bias", 0) or 0), 2),
+                "Vol_Ratio": round(float(s.get("Vol_Ratio", 0) or 0), 2),
+                "Body_Power": round(float(s.get("Body_Power", 0) or 0), 1),
+                "Score": round(float(s.get("Score", 0) or 0), 1),
+                "Tag": s.get("Predator_Tag", ""),
+            },
+            "Institutional": s.get("Institutional", {}),
+            "Structure": s.get("Structure", {}),
+            "FinalDecision": s.get("FinalDecision", {}),
+        })
 
     return json.dumps(payload, ensure_ascii=False, indent=2, default=str)
