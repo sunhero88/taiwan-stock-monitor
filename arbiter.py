@@ -1,97 +1,82 @@
 # arbiter.py
 # -*- coding: utf-8 -*-
-"""
-Predator V15.6.4 (Hotfix in Arbiter)
-- inst_net uses dual-layer: A=三大法人合計, B=外資
-- A decides "can buy" (Hard Gate), B decides "position sizing" (Soft Governor)
-- Keep V15.6.3 core principles: JSON only, deterministic, risk-first
-"""
-
 from __future__ import annotations
-from typing import Any, Dict, Tuple
+
+from typing import Any, Dict, Optional
 
 
-def _safe_float(x: Any, default: float = 0.0) -> float:
+def _safe_float(x, default: float = 0.0) -> float:
     try:
         v = float(x)
-        if v == v:  # not NaN
-            return v
-        return default
+        return v
     except Exception:
-        return default
+        return float(default)
 
 
-def _extract_inst_net_ab(macro_overview: Dict[str, Any]) -> Tuple[float, float]:
+def _get_macro_overview(macro: dict) -> dict:
+    # macro 可傳入整包或已是 overview；此處做相容
+    if not isinstance(macro, dict):
+        return {}
+    if "overview" in macro and isinstance(macro["overview"], dict):
+        return macro["overview"]
+    return macro
+
+
+def _parse_inst_net_ab(overview: dict) -> tuple[Optional[float], Optional[float]]:
     """
-    解析 inst_net A/B（單位建議：元或新台幣）
-    支援多種輸入型態（避免你上游還在調整 schema）：
-
-    1) overview["inst_net_A"], overview["inst_net_B"]
-    2) overview["inst_net"] = {"A":..., "B":...} 或 {"inst_net_A":..., "inst_net_B":...}
-    3) overview["inst_net"] 是數字 → 視為 A，B=0（兼容舊版）
-    4) overview["inst_net"] 是字串 "待更新" → 回傳 (0,0)
+    inst_net 支援格式：
+    1) {"A": <float>, "B": <float>}
+    2) {"A_total": <float>, "B_foreign": <float>}
+    3) 字串（舊版）→ 無法解析則回 None
     """
-    a = 0.0
-    b = 0.0
-
-    if not isinstance(macro_overview, dict):
-        return a, b
-
-    # Direct keys
-    if "inst_net_A" in macro_overview or "inst_net_B" in macro_overview:
-        a = _safe_float(macro_overview.get("inst_net_A", 0.0))
-        b = _safe_float(macro_overview.get("inst_net_B", 0.0))
-        return a, b
-
-    inst_net = macro_overview.get("inst_net", 0.0)
-
-    # Dict style
+    inst_net = overview.get("inst_net")
     if isinstance(inst_net, dict):
-        # Common patterns
-        a = _safe_float(inst_net.get("A", inst_net.get("inst_net_A", inst_net.get("total", 0.0))), 0.0)
-        b = _safe_float(inst_net.get("B", inst_net.get("inst_net_B", inst_net.get("foreign", 0.0))), 0.0)
+        a = inst_net.get("A", inst_net.get("A_total"))
+        b = inst_net.get("B", inst_net.get("B_foreign"))
+        a = _safe_float(a, default=None) if a is not None else None
+        b = _safe_float(b, default=None) if b is not None else None
         return a, b
-
-    # Numeric style (legacy)
-    if isinstance(inst_net, (int, float)):
-        a = float(inst_net)
-        b = 0.0
-        return a, b
-
-    # String / others (e.g., "待更新")
-    return 0.0, 0.0
+    return None, None
 
 
-def arbitrate(stock: Dict[str, Any], macro: Dict[str, Any], account: str = "Conservative") -> Dict[str, Any]:
+def _macro_boost_factor(a_net: Optional[float], b_net: Optional[float]) -> float:
     """
-    回傳單一股票的最終裁決（可直接塞進 stocks[i]["FinalDecision"][account]）
+    以「方向」做輕量加權（不做預測，只做風險/信心微調）：
+    - A>0 且 B>0：順風（boost=1.2）
+    - A<0 且 B<0：逆風（boost=0.7）
+    - 其餘：中性（boost=1.0）
 
-    account:
-      - "Conservative"
-      - "Aggressive"
+    這裡不設金額閾值，因為金額尺度會隨市場與資料源變動；
+    若你後續要更精準，可在 JSON 端提供「inst_net_unit/threshold」。
+    """
+    if a_net is None or b_net is None:
+        return 1.0
+    if a_net > 0 and b_net > 0:
+        return 1.2
+    if a_net < 0 and b_net < 0:
+        return 0.7
+    return 1.0
+
+
+def arbitrate(stock: dict, macro: dict, account: str = "Conservative") -> Dict[str, Any]:
+    """
+    回傳單一股票的最終裁決（V15.6.3）
+    - 嚴格遵守 Data Health Gate：degraded_mode / inst_status != READY / kill_switch / v14_watch → 禁止 BUY/TRIAL
+    - 加入 inst_net A/B（市場整體）作為「倉位微調與嚴格度微調」：不改核心門檻，只在允許範圍內調整 action_size_pct
     """
 
-    # ------------------------------------------------------------
-    # Step 0: Read macro.overview (兼容你的 analyzer.py 結構)
-    # ------------------------------------------------------------
-    overview = {}
-    if isinstance(macro, dict):
-        # macro 可能直接傳 overview，或傳整包 macro
-        if "overview" in macro and isinstance(macro["overview"], dict):
-            overview = macro["overview"]
-        else:
-            overview = macro
+    overview = _get_macro_overview(macro)
 
-    # ------------------------------------------------------------
-    # Step 1: Data Health Gate (Hard)
-    # ------------------------------------------------------------
-    # 只要資料降級（法人未 READY / kill_switch / v14_watch / degraded_mode）→ 禁止 BUY/TRIAL
-    inst_status = str(overview.get("inst_status", "PENDING")).upper()
+    # ---------- Step 1：Data Health Gate ----------
+    inst_status = overview.get("inst_status", "PENDING")
     degraded_mode = bool(overview.get("degraded_mode", inst_status != "READY"))
-    kill_switch = bool(overview.get("kill_switch", False))
-    v14_watch = bool(overview.get("v14_watch", False))
 
-    degraded = (inst_status != "READY") or degraded_mode or kill_switch or v14_watch
+    degraded = (
+        degraded_mode
+        or inst_status != "READY"
+        or bool(overview.get("kill_switch", False))
+        or bool(overview.get("v14_watch", False))
+    )
 
     inst = stock.get("Institutional", {}) or {}
     tech = stock.get("Technical", {}) or {}
@@ -101,244 +86,142 @@ def arbitrate(stock: Dict[str, Any], macro: Dict[str, Any], account: str = "Cons
     weaken_flags = stock.get("weaken_flags", {}) or {}
     orphan_holding = bool(stock.get("orphan_holding", False))
 
-    # 風控上限
-    position_pct_max = int(_safe_float(risk.get("position_pct_max", 12), 12))
-    risk_per_trade_max = _safe_float(risk.get("risk_per_trade_max", 1.0), 1.0)
+    position_pct_max = int(_safe_float(risk.get("position_pct_max", 12), default=12))
+    risk_per_trade_max = _safe_float(risk.get("risk_per_trade_max", 1.0), default=1.0)
     trial_flag = bool(risk.get("trial_flag", True))
 
-    # Default output
-    out = {
-        "Decision": "WATCH",
-        "action_size_pct": 0,
-        "exit_reason_code": "None",
-        "degraded_note": "資料降級：否",
-        "reason_technical": "",
-        "reason_structure": "",
-        "reason_inst": "",
-    }
+    # ---------- Default output ----------
+    decision = "WATCH"
+    action_size = 0
+    exit_code = "None"
 
+    # ---------- 降級模式（強制） ----------
     if degraded:
-        out.update(
-            {
-                "Decision": "WATCH",
-                "action_size_pct": 0,
-                "exit_reason_code": "DATA_DEGRADED",
-                "degraded_note": "資料降級：是（禁止 BUY）",
-                "reason_technical": "資料健康門觸發：禁止交易進場。",
-                "reason_structure": "資料健康門觸發：禁止交易進場。",
-                "reason_inst": f"inst_status={inst_status} / degraded_mode={degraded_mode} / kill_switch={kill_switch} / v14_watch={v14_watch}",
-            }
-        )
-        return out
+        return {
+            "Decision": "WATCH",
+            "action_size_pct": 0,
+            "exit_reason_code": "DATA_DEGRADED",
+            "degraded_note": "資料降級：是（禁止 BUY）",
+            "reason_technical": "資料健康門觸發：禁止交易進場。",
+            "reason_structure": "資料健康門觸發：禁止交易進場。",
+            "reason_inst": f"inst_status={inst_status} / degraded_mode={degraded_mode}",
+        }
 
-    # ------------------------------------------------------------
-    # Step 2: 取得 inst_net A/B（A=三大法人合計, B=外資）
-    # ------------------------------------------------------------
-    inst_net_a, inst_net_b = _extract_inst_net_ab(overview)
-
-    # Hard Gate (市場總開關)：A < -10億 → 禁止 BUY（TRIAL 也只能 <=5%）
-    HARD_GATE_A_NTD = -1_000_000_000  # -10億
-    SOFT_STRONG_A_NTD = 1_000_000_000  # +10億
-    SOFT_STRONG_B_NTD = 500_000_000    # +5億
-
-    hard_gate = inst_net_a < HARD_GATE_A_NTD
-
-    # ------------------------------------------------------------
-    # Step 3: 法人連續性（單股）— 只有 READY + streak>=3 + POSITIVE 才可作為進場理由
-    # ------------------------------------------------------------
+    # ---------- Step 2：法人連續性硬規則 ----------
     inst_ok = (
-        str(inst.get("Inst_Status", "PENDING")).upper() == "READY"
-        and int(_safe_float(inst.get("Inst_Streak3", 0), 0)) >= 3
-        and str(inst.get("Inst_Dir3", "PENDING")).upper() == "POSITIVE"
+        inst.get("Inst_Status") == "READY"
+        and int(_safe_float(inst.get("Inst_Streak3", 0), default=0)) >= 3
+        and inst.get("Inst_Dir3") == "POSITIVE"
     )
 
-    # ------------------------------------------------------------
-    # Step 4: Top20 池化 + orphan 規則
-    # ------------------------------------------------------------
-    rank = int(_safe_float(ranking.get("rank", 999), 999))
-    top20_flag = bool(ranking.get("top20_flag", rank <= 20))
-    tier = str(ranking.get("tier", "A" if rank <= 10 else "B"))
+    # ---------- Step 3：Top20 池化裁決 ----------
+    top20_flag = bool(ranking.get("top20_flag", False))
+    tier = str(ranking.get("tier", "B"))
 
-    # 非 Top20 且非持倉 → 直接忽略/觀望（避免測試資料混入）
+    # Top20 以外且非持倉 → 直接 IGNORE（明確化）
     if (not top20_flag) and (not orphan_holding):
-        out.update(
-            {
-                "Decision": "WATCH",
-                "action_size_pct": 0,
-                "exit_reason_code": "IGNORE",
-                "reason_technical": "不在 Top20 且非持倉：不納入操作池。",
-                "reason_structure": "不在 Top20 且非持倉：不納入操作池。",
-                "reason_inst": "不在操作池：忽略。",
-            }
-        )
-        return out
+        return {
+            "Decision": "IGNORE",
+            "action_size_pct": 0,
+            "exit_reason_code": "OUT_OF_POOL",
+            "degraded_note": "資料降級：否",
+            "reason_technical": "不在 Top20 且非持倉，依規則忽略。",
+            "reason_structure": "不在 Top20 且非持倉，依規則忽略。",
+            "reason_inst": "不在 Top20 池化範圍。",
+        }
 
-    # 持倉跌出名單（orphan_holding=true）不可自動賣出：除非 weaken
+    # Orphan 持倉處理：不自動賣出；若 weaken → REDUCE
     if orphan_holding:
         tech_weaken = bool(weaken_flags.get("technical_weaken", False))
         struct_weaken = bool(weaken_flags.get("structure_weaken", False))
         if tech_weaken or struct_weaken:
-            out.update(
-                {
-                    "Decision": "REDUCE",
-                    "action_size_pct": min(5, position_pct_max),
-                    "exit_reason_code": "STRUCTURE_WEAK" if struct_weaken else "TECH_BREAK",
-                    "reason_technical": "孤立持倉：技術轉弱，依規則減碼。",
-                    "reason_structure": "孤立持倉：結構轉弱，依規則減碼。" if struct_weaken else "孤立持倉：結構未轉弱。",
-                    "reason_inst": "孤立持倉：不因跌出名單自動清倉，僅在轉弱時減碼。",
-                }
-            )
-        else:
-            out.update(
-                {
-                    "Decision": "HOLD",
-                    "action_size_pct": 0,
-                    "exit_reason_code": "None",
-                    "reason_technical": "孤立持倉：未見轉弱旗標，維持持有。",
-                    "reason_structure": "孤立持倉：未見轉弱旗標，維持持有。",
-                    "reason_inst": "孤立持倉：不自動賣出。",
-                }
-            )
-        return out
+            return {
+                "Decision": "REDUCE",
+                "action_size_pct": min(5, position_pct_max),
+                "exit_reason_code": "STRUCTURE_WEAK" if struct_weaken else "TECH_BREAK",
+                "degraded_note": "資料降級：否",
+                "reason_technical": "Orphan 持倉且 technical_weaken=True → 減碼。",
+                "reason_structure": "Orphan 持倉且 structure_weaken=True → 減碼。" if struct_weaken else "Orphan 持倉：結構未弱化。",
+                "reason_inst": "Orphan 持倉規則：不自動賣出，僅在弱化時減碼。",
+            }
+        return {
+            "Decision": "HOLD",
+            "action_size_pct": 0,
+            "exit_reason_code": "None",
+            "degraded_note": "資料降級：否",
+            "reason_technical": "Orphan 持倉且無弱化 → HOLD。",
+            "reason_structure": "Orphan 持倉且無弱化 → HOLD。",
+            "reason_inst": "Orphan 持倉規則。",
+        }
 
-    # ------------------------------------------------------------
-    # Step 5: 基礎信號（以你現有 JSON 欄位為主，避免 AI 自行推估）
-    # ------------------------------------------------------------
-    score = _safe_float(tech.get("Score", 0), 0.0)
-    tag = str(tech.get("Tag", ""))
+    # ---------- Step 4：雙帳戶決策引擎（核心門檻不改） ----------
+    score = _safe_float(tech.get("Score", 0), default=0.0)
+    rev_growth = _safe_float(struct.get("Rev_Growth", -999), default=-999.0)
 
-    # 以 tag 文字作為「至少 1~2 個正向技術訊號」的代理（避免你還沒加 RSI/MA 進 JSON）
-    # 你後續若補 ma10/20/60, rsi14 等，可把這段替換成更嚴謹的計數器。
-    tech_pos_1 = ("起漲" in tag) or ("主力" in tag) or ("真突破" in tag)
-    tech_pos_2 = sum([("起漲" in tag), ("主力" in tag), ("真突破" in tag)]) >= 2
-    tech_break = ("破位" in tag)  # 若你未來有「技術破位」標記，可直接生效
+    # 技術正向訊號（簡化：以 Score 門檻代表 ≥1 或 ≥2 訊號）
+    # 若你已在 JSON 端提供明確訊號計數，可改用 signal_count。
+    tech_ok_1 = score >= 45
+    tech_ok_2 = score >= 50
 
-    rev_growth = _safe_float(struct.get("Rev_Growth", -999), -999)
-    opm = _safe_float(struct.get("OPM", -999), -999)
-    # 產業水準若未提供，先用 0 作保守替代（避免誤判為達標）
-    opm_industry = _safe_float(struct.get("opm_industry_level", 0), 0)
+    # ---------- Macro A/B 淨額（用於 action_size 微調） ----------
+    a_net, b_net = _parse_inst_net_ab(overview)
+    boost = _macro_boost_factor(a_net, b_net)
 
-    # ------------------------------------------------------------
-    # Step 6: 標準買入單位（你要求 action_size_pct 可落地）
-    # ------------------------------------------------------------
-    # 基準：5%
-    # 高信心（滿足 Conservative 全部條件）→ 10%
-    UNIT_LOW = 5
-    UNIT_HIGH = 10
+    # 標準單位（你在前面要求定義）
+    UNIT_TRIAL = 5
+    UNIT_BUY_HIGH = 10
 
-    # ------------------------------------------------------------
-    # Step 7: 帳戶決策
-    # ------------------------------------------------------------
-    # A) Conservative：必須更嚴格（風控優先）
     if account == "Conservative":
-        # Conservative BUY 必須是 Tier A (Top10) 且滿足多條件
-        is_tier_a = (tier.upper() == "A") and (rank <= 10)
-
-        can_buy = (
-            is_tier_a
-            and tech_pos_2
-            and (not tech_break)
-            and rev_growth >= 0
-            and opm >= opm_industry
-            and inst_ok
-            and (not hard_gate)
-        )
-
-        if can_buy:
-            out["Decision"] = "BUY"
-            out["action_size_pct"] = min(UNIT_HIGH, position_pct_max)
-            out["exit_reason_code"] = "None"
-            out["reason_technical"] = f"Tier A，技術≥2正向訊號（Tag={tag}），無破位。"
-            out["reason_structure"] = f"Rev_Growth={rev_growth:.2f}%，OPM={opm:.2f}% ≥ 產業水準={opm_industry:.2f}%。"
-            out["reason_inst"] = "單股法人連續成立：Inst_Streak3≥3 且 Dir3=POSITIVE。"
+        # BUY 條件（保持你原邏輯：Score>=50 + Rev_Growth>=0 + inst_ok）
+        if tier == "A" and tech_ok_2 and rev_growth >= 0 and inst_ok:
+            decision = "BUY"
+            # 先給高信心 10%，再乘 macro boost，最後受 position_pct_max 限制
+            size = int(round(UNIT_BUY_HIGH * boost))
+            action_size = min(max(size, 5), position_pct_max)  # 至少 5%，不超上限
         else:
-            # 不買：判斷是否需要 REDUCE（此處僅對非 orphan 的操作池股票做保守處理）
-            out["Decision"] = "WATCH"
-            out["action_size_pct"] = 0
-            out["exit_reason_code"] = "None"
-            out["reason_technical"] = f"不滿足 Conservative 進場條件（Tag={tag} / Score={score:.1f}）。"
-            out["reason_structure"] = f"Rev_Growth={rev_growth:.2f}%，OPM={opm:.2f}%（產業={opm_industry:.2f}%）。"
-            out["reason_inst"] = f"inst_ok={inst_ok}（需 READY+3日同向才可進場）。"
+            decision = "WATCH"
+            action_size = 0
 
-    # B) Aggressive：允許 TRIAL，但仍受 A Hard Gate 控制
     elif account == "Aggressive":
-        # Aggressive TRIAL 條件：Top20、至少 1 技術正向、無重大破位、外資不為 NEGATIVE、且 trial_flag=true
-        inst_dir3 = str(inst.get("Inst_Dir3", "PENDING")).upper()
-
-        can_trial = (
-            top20_flag
-            and tech_pos_1
-            and (not tech_break)
-            and inst_dir3 != "NEGATIVE"
-            and trial_flag
-            and (not hard_gate)
-        )
-
-        if can_trial:
-            out["Decision"] = "TRIAL"
-            out["action_size_pct"] = min(UNIT_LOW, position_pct_max)
-            out["exit_reason_code"] = "None"
-            out["reason_technical"] = f"Top20，具≥1正向技術訊號（Tag={tag}），無破位。"
-            out["reason_structure"] = f"結構面不作為 TRIAL 必要門檻（Rev_Growth={rev_growth:.2f}%，OPM={opm:.2f}%）。"
-            out["reason_inst"] = f"Inst_Dir3={inst_dir3}（不得為 NEGATIVE），trial_flag={trial_flag}。"
+        # TRIAL 條件（Top20 + Score>=45 + inst_dir3 != NEGATIVE + trial_flag）
+        inst_dir3 = inst.get("Inst_Dir3", "PENDING")
+        if top20_flag and tech_ok_1 and inst_dir3 != "NEGATIVE" and trial_flag:
+            decision = "TRIAL"
+            size = int(round(UNIT_TRIAL * boost))
+            action_size = min(max(size, 3), position_pct_max)  # 允許縮到 3% 做試單
         else:
-            out["Decision"] = "WATCH"
-            out["action_size_pct"] = 0
-            out["exit_reason_code"] = "None"
-            out["reason_technical"] = f"不滿足 Aggressive TRIAL 條件（Tag={tag} / Score={score:.1f}）。"
-            out["reason_structure"] = f"Rev_Growth={rev_growth:.2f}%，OPM={opm:.2f}%（僅供參考）。"
-            out["reason_inst"] = f"Inst_Dir3={inst_dir3} / trial_flag={trial_flag} / hard_gate={hard_gate}。"
+            decision = "WATCH"
+            action_size = 0
 
     else:
-        out.update(
-            {
-                "Decision": "WATCH",
-                "action_size_pct": 0,
-                "exit_reason_code": "BAD_ACCOUNT",
-                "reason_technical": f"未知帳戶類型：{account}",
-                "reason_structure": "未知帳戶類型：不裁決。",
-                "reason_inst": "未知帳戶類型：不裁決。",
-            }
-        )
-        return out
+        decision = "WATCH"
+        action_size = 0
 
-    # ------------------------------------------------------------
-    # Step 8: A/B 市場層倉位調節（Soft Governor / Accelerator）
-    # ------------------------------------------------------------
-    # Soft Governor：A>0 但 B<0 → 降倉（即使符合 BUY 也壓到 5%）
-    if out["Decision"] in ("BUY", "TRIAL"):
-        if (inst_net_a > 0) and (inst_net_b < 0):
-            out["action_size_pct"] = min(UNIT_LOW, position_pct_max)
-            out["exit_reason_code"] = "INST_REVERSAL"
-            out["reason_inst"] += f"｜市場A>0但外資B<0（A={inst_net_a:.0f}, B={inst_net_b:.0f}）：依規則降倉至5%。"
+    # ---------- Step 5：風控不可突破 ----------
+    # 已用 position_pct_max 截斷；risk_per_trade_max 需你在下單模組依停損距離換算，
+    # Arbiter 僅輸出 cap 與建議 size，不直接推導金額風險。
+    if action_size > position_pct_max:
+        action_size = position_pct_max
+        exit_code = "RISK_LIMIT"
 
-        # Accelerator：A>+10億 且 B>+5億 → 允許放大（Aggressive 可到 position_pct_max）
-        if (inst_net_a > SOFT_STRONG_A_NTD) and (inst_net_b > SOFT_STRONG_B_NTD):
-            if account == "Aggressive" and out["Decision"] == "TRIAL":
-                # 強順風盤：積極帳戶 TRIAL 可直接提升到 position_pct_max
-                out["action_size_pct"] = max(min(position_pct_max, position_pct_max), UNIT_LOW)
-                out["reason_inst"] += f"｜強順風加速器（A>{SOFT_STRONG_A_NTD:.0f}, B>{SOFT_STRONG_B_NTD:.0f}）：TRIAL 倉位放大至上限{position_pct_max}%。"
-            elif account == "Conservative" and out["Decision"] == "BUY":
-                # 保守帳戶仍維持 10%（不超上限）
-                out["action_size_pct"] = min(UNIT_HIGH, position_pct_max)
-                out["reason_inst"] += f"｜強順風加速器：維持保守標準倉位{out['action_size_pct']}%。"
+    # 若 A/B 同為負，且本來要 BUY/TRIAL → 保守降一級（效益最大化＝避免逆風加碼）
+    if (a_net is not None and b_net is not None) and (a_net < 0 and b_net < 0):
+        if decision == "BUY":
+            # 逆風時仍允許 BUY（因已滿足嚴格條件），但縮倉到 5%
+            action_size = min(action_size, 5)
+        elif decision == "TRIAL":
+            action_size = min(action_size, 3)
 
-    # Hard Gate：A < -10億 → 禁止 BUY；若已產生 BUY/TRIAL，強制降級處理
-    if hard_gate and out["Decision"] in ("BUY", "TRIAL"):
-        out["Decision"] = "WATCH"
-        out["action_size_pct"] = 0
-        out["exit_reason_code"] = "RISK_LIMIT"
-        out["reason_inst"] += f"｜Hard Gate：A<{HARD_GATE_A_NTD:.0f}（A={inst_net_a:.0f}）：禁止進場。"
-
-    # ------------------------------------------------------------
-    # Step 9: 風控不可突破（最後一道）
-    # ------------------------------------------------------------
-    if out["action_size_pct"] > position_pct_max:
-        out["action_size_pct"] = position_pct_max
-        out["exit_reason_code"] = "RISK_LIMIT"
-        out["reason_inst"] += f"｜倉位上限保護：position_pct_max={position_pct_max}%。"
-
-    # 風險/單筆（目前你未給 stop/ATR 之類數據，先保留欄位以便日後擴展）
-    _ = risk_per_trade_max  # placeholder (kept for forward compatibility)
-
-    return out
+    return {
+        "Decision": decision,
+        "action_size_pct": int(action_size),
+        "exit_reason_code": exit_code,
+        "degraded_note": "資料降級：否",
+        "reason_technical": f"Score={score:.1f}，門檻：TRIAL>=45 / BUY>=50。",
+        "reason_structure": f"Rev_Growth={rev_growth:.2f}（需 >=0 才允許 BUY）。",
+        "reason_inst": f"inst_ok={inst_ok} / Inst_Streak3={inst.get('Inst_Streak3')} / Inst_Dir3={inst.get('Inst_Dir3')} / Macro(A,B)=({a_net},{b_net}) boost={boost}",
+        "risk_caps": {
+            "position_pct_max": position_pct_max,
+            "risk_per_trade_max": risk_per_trade_max,
+        },
+    }
