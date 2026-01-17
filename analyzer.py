@@ -1,12 +1,8 @@
 # =========================
 # analyzer.py
-# Predator V15.5.3 Patch (Inst pass-through + Rev_Growth rename)
+# Predator V15.5.4 Patch (Inst pass-through + Rev_Growth rename)
 # =========================
 # -*- coding: utf-8 -*-
-"""
-Filename: analyzer.py
-Version: Predator V15.5.3 (Inst-Aware + Rev_Growth)
-"""
 import pandas as pd
 import numpy as np
 import json
@@ -60,6 +56,7 @@ def calc_ma_bias_penalty(ma_bias) -> float:
 
 
 def enrich_fundamentals(symbol: str) -> dict:
+    # QoQ 改名為 Rev_Growth（避免口徑誤判）
     data = {"OPM": 0, "Rev_Growth": 0, "PE": 0, "Sector": "Unknown"}
     try:
         info = (yf.Ticker(symbol).info) or {}
@@ -158,7 +155,7 @@ def run_analysis(df: pd.DataFrame, session: str = SESSION_EOD):
             latest["Score"] = round(float(ers), 2)
             latest["_Is_Weighted"] = bool(is_weighted)
 
-            # 保留籌碼欄位（上游已合併）
+            # 籌碼欄位保留（上游已 merge）
             latest["Inst_Net"] = float(latest.get("Inst_Net", 0) or 0)
             latest["Inst_Status"] = str(latest.get("Inst_Status", "N/A"))
 
@@ -175,7 +172,7 @@ def run_analysis(df: pd.DataFrame, session: str = SESSION_EOD):
             fundamentals = enrich_fundamentals(symbol)
             row["Structure"] = fundamentals
 
-            # 結構濾網：Rev_Growth < 0 剔除（你要放寬可註解）
+            # 可選濾網：Rev_Growth < 0 剔除（你要放寬可註解）
             try:
                 if fundamentals.get("Rev_Growth", 0) is not None and float(fundamentals.get("Rev_Growth", 0)) < 0:
                     continue
@@ -242,7 +239,7 @@ def generate_ai_json(df_top10: pd.DataFrame, market: str = "tw-share", session: 
 
     payload = {
         "meta": {
-            "system": "Predator V15.5.3",
+            "system": "Predator V15.5.4",
             "market": market,
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
             "session": session,
