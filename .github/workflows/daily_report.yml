@@ -1,22 +1,69 @@
-name: Predator Daily Analysis V14.0
+name: Predator Daily Analysis V15.6.3
+
 on:
   schedule:
-    - cron: '30 0 * * 1-5' # 08:30 台北
-    - cron: '0 3 * * 1-5'  # 11:00 台北
-    - cron: '30 8 * * 1-5' # 16:30 台北
+    - cron: '30 0 * * 1-5' # 08:30 台北 (UTC 00:30)
+    - cron: '0 3 * * 1-5'  # 11:00 台北 (UTC 03:00)
+    - cron: '30 8 * * 1-5' # 16:30 台北 (UTC 08:30)
   workflow_dispatch:
+
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.10' # 🚀 強制要求 3.10
+          python-version: '3.10'
+
       - name: Install Dependencies
-        run: pip install pandas yfinance numpy requests beautifulsoup4 streamlit resend matplotlib
-      - name: Run Predator
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # 1) 先更新市場 CSV（關鍵）
+      - name: Update market CSV (tw-share)
+        run: |
+          python downloader_tw.py --market tw-share
+          ls -la
+          echo "CSV Date max:"
+          python - << 'PY'
+          import pandas as pd
+          df = pd.read_csv("data_tw-share.csv")
+          df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+          print(df["Date"].max())
+          PY
+
+      # 2) 再跑你的 CLI 報告（如果 main.py --cli 真的存在）
+      - name: Run Predator CLI
         env:
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
-        run: python main.py --cli
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+        run: |
+          python main.py --cli
+
+      # 3) 若 CSV 有更新，把它推回 repo（關鍵）
+      - name: Commit & Push updated CSV
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # 只提交 CSV 與你想要追蹤的輸出（可自行增減）
+          git add data_tw-share.csv data_tw.csv || true
+
+          # 沒變更就跳過
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Update market CSV (auto)"
+          git push
