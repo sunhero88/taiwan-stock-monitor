@@ -1,4 +1,5 @@
 name: Predator Daily Analysis V15.6.3
+
 on:
   schedule:
     - cron: '30 0 * * 1-5' # 08:30 台北 (UTC+8)
@@ -12,6 +13,11 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      TZ: Asia/Taipei
+      FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+      RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -30,19 +36,11 @@ jobs:
             pip install pandas yfinance numpy requests beautifulsoup4 streamlit resend matplotlib
           fi
 
-      # ① 嘗試更新 CSV（你 repo 有 downloader_tw.py）
+      # ① 更新 CSV（關鍵：避免資料卡在舊日期）
       - name: Update TW market CSV
         run: |
-          python downloader_tw.py --market tw-share || true
+          python downloader_tw.py --market tw-share
           ls -la
-
-      # ② 跑 CLI 產出 JSON（你原本 workflow 就是這樣呼叫）
-      - name: Run Predator (CLI)
-        env:
-          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
-          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
-        run: |
-          python main.py --cli --market tw-share --session EOD
 
       # ✅ 建議1：CSV 落後就 fail（避免靜默失效）
       - name: Fail if CSV is stale
@@ -50,8 +48,7 @@ jobs:
           python - << 'PY'
           import pandas as pd
           import datetime as dt
-          import os
-          import sys
+          import os, sys
 
           fname = "data_tw-share.csv"
           if not os.path.exists(fname):
@@ -70,16 +67,23 @@ jobs:
               sys.exit(2)
 
           latest_date = latest.date()
-          today_utc = dt.datetime.utcnow().date()  # runner 是 UTC
+
+          # runner 時區是 UTC，直接用 UTC 今天
+          today_utc = dt.datetime.utcnow().date()
           lag_days = (today_utc - latest_date).days
 
-          # 門檻：>=2 才 fail（較不會誤殺連假/休市）
+          # 門檻：>=2 才 fail（降低連假/休市誤殺）
           if lag_days >= 2:
               print(f"[FAIL] CSV stale: latest={latest_date}, today_utc={today_utc}, lag_days={lag_days}")
               sys.exit(1)
 
           print(f"[OK] CSV fresh: latest={latest_date}, today_utc={today_utc}, lag_days={lag_days}")
           PY
+
+      # ② 跑 CLI（建議盤後用 EOD；盤中可改 INTRADAY）
+      - name: Run Predator (CLI)
+        run: |
+          python main.py --cli --market tw-share --session EOD
 
       # ③ 若 CSV 有變更就 commit/push（讓 repo 真正更新）
       - name: Commit updated CSV (if changed)
