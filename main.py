@@ -4,19 +4,23 @@ from __future__ import annotations
 
 import os
 import json
-from datetime import datetime, date
+import argparse
+from datetime import datetime
+from functools import lru_cache
 
 import pandas as pd
 import streamlit as st
+import yfinance as yf
+import requests
 
 from analyzer import run_analysis, generate_ai_json, SESSION_INTRADAY, SESSION_EOD
 from finmind_institutional import fetch_finmind_institutional
 from institutional_utils import calc_inst_3d
 
-# ✅ 新增：載入 Arbiter
-from arbiter import arbitrate
 
-
+# -----------------------------
+# Utilities
+# -----------------------------
 def _fmt_date(dt) -> str:
     try:
         return pd.to_datetime(dt).strftime("%Y-%m-%d")
@@ -33,16 +37,42 @@ def _load_market_csv(market: str) -> pd.DataFrame:
             fname = "data_tw.csv"
         else:
             raise FileNotFoundError(f"找不到資料檔：{fname} / data_tw-share.csv / data_tw.csv")
+
     df = pd.read_csv(fname)
     return df
 
 
-def _compute_market_amount_today(df: pd.DataFrame, latest_date) -> str:
+def _normalize_date_column(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    把 Date 欄位轉成「不帶時區」的 datetime（避免 00:00/UTC 造成困擾）
+    """
     d = df.copy()
     d["Date"] = pd.to_datetime(d["Date"], errors="coerce")
+
+    # 若未帶 tz，tz_localize 會噴錯，故用 try
+    try:
+        # 若是 tz-aware，移除 tz
+        if getattr(d["Date"].dt, "tz", None) is not None:
+            d["Date"] = d["Date"].dt.tz_convert(None)
+    except Exception:
+        pass
+
+    # 進一步：把時間歸零（只保留日期），避免出現 00:00 誤會
+    try:
+        d["Date"] = d["Date"].dt.normalize()
+    except Exception:
+        pass
+
+    return d
+
+
+def _compute_market_amount_today(df: pd.DataFrame, latest_date) -> str:
+    d = df.copy()
+    d = _normalize_date_column(d)
     d = d[d["Date"] == latest_date].copy()
     if d.empty:
         return "待更新"
+
     d["Close"] = pd.to_numeric(d.get("Close"), errors="coerce").fillna(0)
     d["Volume"] = pd.to_numeric(d.get("Volume"), errors="coerce").fillna(0)
     amt = float((d["Close"] * d["Volume"]).sum())
@@ -93,43 +123,175 @@ def _decide_inst_status(inst_df: pd.DataFrame, symbols: list[str], trade_date: s
     return ("READY" if ready_any else "PENDING"), dates_3d
 
 
-def _calc_data_mode(trade_date: str, session: str) -> tuple[str, int]:
+# -----------------------------
+# Stock name (寫入 JSON / UI)
+# -----------------------------
+@lru_cache(maxsize=512)
+def _get_stock_name(symbol: str) -> str:
     """
-    用「資料日期 vs 今天」判定 data_mode：
-      - 若 trade_date < 今天：STALE（落後天數 lag_days）
-      - 否則：
-          session == INTRADAY -> INTRADAY
-          session == EOD      -> EOD
+    以 yfinance Ticker.info 取 shortName/longName
+    取不到就回傳 symbol
     """
     try:
-        td = pd.to_datetime(trade_date).date()
-        today = date.today()
-        lag_days = int((today - td).days)
-        if lag_days >= 1:
-            return "STALE", lag_days
+        info = yf.Ticker(symbol).info or {}
+        name = info.get("shortName") or info.get("longName") or ""
+        name = str(name).strip()
+        return name if name else symbol
     except Exception:
-        # 無法判定就當作 EOD（保守做法也可改 STALE）
-        return "EOD", 0
-
-    return ("INTRADAY" if session == SESSION_INTRADAY else "EOD"), 0
+        return symbol
 
 
+def _attach_stock_names(df_top: pd.DataFrame) -> pd.DataFrame:
+    d = df_top.copy()
+    d["Name"] = d["Symbol"].astype(str).map(_get_stock_name)
+    return d
+
+
+# -----------------------------
+# Indices (TW + US)
+# -----------------------------
+def fetch_indices_snapshot(trade_date: str) -> list[dict]:
+    """
+    用 yfinance 抓指數快照（近 5 日，取最後兩天算漲跌）
+    回傳 list[dict]，寫入 macro.indices
+    """
+    index_map = {
+        "^TWII": "台股加權指數",
+        "^DJI": "道瓊工業指數",
+        "^IXIC": "那斯達克指數",
+    }
+
+    out = []
+    for ticker, name in index_map.items():
+        try:
+            df = yf.download(ticker, period="7d", interval="1d", progress=False)
+            if df is None or df.empty:
+                continue
+
+            df = df.dropna()
+            last_close = float(df["Close"].iloc[-1])
+            prev_close = float(df["Close"].iloc[-2]) if len(df) >= 2 else last_close
+            chg = last_close - prev_close
+            chg_pct = (chg / prev_close * 100.0) if prev_close != 0 else 0.0
+
+            out.append(
+                {
+                    "symbol": ticker,
+                    "name": name,
+                    "close": round(last_close, 2),
+                    "chg": round(chg, 2),
+                    "chg_pct": round(chg_pct, 2),
+                    "asof": str(df.index[-1].date()),
+                }
+            )
+        except Exception:
+            continue
+
+    return out
+
+
+# -----------------------------
+# Market Institutional A/B (三大法人 / 外資)
+# -----------------------------
+def fetch_twse_market_inst_net_ab(trade_date: str) -> dict:
+    """
+    嘗試用 TWSE 公開 rwd 端點抓「三大法人買賣超」合計。
+    抓不到就回 A=0, B=0（不讓流程失敗）
+
+    A = 外資 + 投信 + 自營商（含避險）合計
+    B = 外資
+    """
+    yyyymmdd = trade_date.replace("-", "")
+    urls = [
+        # 常見 TWSE rwd 端點（zh）
+        f"https://www.twse.com.tw/rwd/zh/fund/T86?date={yyyymmdd}&selectType=ALL&response=json",
+        # 有些環境會用 en
+        f"https://www.twse.com.tw/rwd/en/fund/T86?date={yyyymmdd}&selectType=ALL&response=json",
+    ]
+
+    for url in urls:
+        try:
+            r = requests.get(url, timeout=20)
+            r.raise_for_status()
+            js = r.json()
+
+            # js 常見欄位：fields / data
+            data = js.get("data") or []
+            fields = js.get("fields") or []
+
+            if not data or not fields:
+                continue
+
+            # 嘗試找「外資」「投信」「自營商」相關欄位
+            # 這裡採「寬鬆解析」：先把每列轉成 dict，再用關鍵字判斷
+            a_sum = 0.0
+            b_sum = 0.0
+
+            for row in data:
+                d = {fields[i]: row[i] for i in range(min(len(fields), len(row)))}
+                name = str(d.get("單位名稱") or d.get("Institutional investors") or d.get("name") or "").strip()
+
+                # 淨額欄位名稱在不同語系可能不同，這裡用多候選
+                net_raw = (
+                    d.get("買賣超股數")
+                    or d.get("Net buy/sell")
+                    or d.get("net")
+                    or d.get("Buy/Sell")
+                    or 0
+                )
+
+                # 轉數字（可能帶逗號）
+                try:
+                    net = float(str(net_raw).replace(",", "").replace(" ", ""))
+                except Exception:
+                    net = 0.0
+
+                # 外資
+                if ("外資" in name) or ("Foreign" in name):
+                    b_sum += net
+                    a_sum += net
+                # 投信
+                elif ("投信" in name) or ("Investment Trust" in name):
+                    a_sum += net
+                # 自營商（含避險）
+                elif ("自營商" in name) or ("Dealer" in name):
+                    a_sum += net
+
+            return {"A": float(a_sum), "B": float(b_sum)}
+        except Exception:
+            continue
+
+    return {"A": 0.0, "B": 0.0}
+
+
+def _fmt_inst_net_ab_text(ab: dict) -> str:
+    """
+    以「億元」顯示更直觀：A/B 以 100,000,000 換算
+    """
+    try:
+        a = float(ab.get("A", 0.0))
+        b = float(ab.get("B", 0.0))
+        a_yi = a / 100_000_000
+        b_yi = b / 100_000_000
+        return f"A:{a_yi:.2f}億 | B:{b_yi:.2f}億"
+    except Exception:
+        return "A:0 | B:0"
+
+
+# -----------------------------
+# Market comment (一般投資人版)
+# -----------------------------
 def generate_market_comment_retail(macro_overview: dict) -> str:
-    """
-    一般投資人可讀版：「今日市場狀態判斷」一句話（可回溯到欄位）
-    """
     amount = macro_overview.get("amount")
     inst_status = macro_overview.get("inst_status", "PENDING")
     degraded_mode = bool(macro_overview.get("degraded_mode", False))
     kill_switch = bool(macro_overview.get("kill_switch", False))
     v14_watch = bool(macro_overview.get("v14_watch", False))
-    data_mode = str(macro_overview.get("data_mode", "EOD") or "EOD")
-    lag_days = int(macro_overview.get("lag_days", 0) or 0)
+    inst_net = str(macro_overview.get("inst_net", "") or "")
 
     if kill_switch or v14_watch:
-        return "今日市場風險警示已觸發（系統防護中），建議以資金保全為主，避免新增部位。"
+        return "今日市場風險指標觸發保護機制，系統以資金保全為優先：不建議進場加碼，僅處理必要的持倉風控。"
 
-    # 流動性粗判（成交額）
     liquidity_ok = False
     try:
         if amount not in (None, "", "待更新"):
@@ -137,111 +299,45 @@ def generate_market_comment_retail(macro_overview: dict) -> str:
     except Exception:
         liquidity_ok = False
 
-    liquidity_text = "成交量維持在正常水準；" if liquidity_ok else "成交量偏低；"
+    liquidity_text = "成交金額在常態區間，" if liquidity_ok else "成交金額偏低，"
 
-    # data_mode
-    if data_mode == "STALE":
-        mode_text = f"資料落後 {lag_days} 天（STALE），建議僅做持倉風控，避免用舊資料進場；"
-    elif data_mode == "INTRADAY":
-        mode_text = "目前為盤中資料（INTRADAY），建議以小額試單或觀察為主；"
-    else:
-        mode_text = "目前為盤後資料（EOD），可依條件進行策略執行；"
-
-    # 法人
+    # 法人資訊可用性
     if inst_status in ("UNAVAILABLE", "PENDING"):
-        inst_text = "法人動向未能確認，策略以保守為主。"
+        inst_text = "法人資料目前不可用或不足（三大法人無法可靠判讀），建議以觀察或小額試單為主。"
     elif inst_status == "READY":
-        inst_text = "法人動向可用，可搭配個股條件提高進場效率。"
+        inst_text = f"法人資料可用（{inst_net}），可搭配個股條件做較積極的倉位調整。"
     else:
-        inst_text = "法人資訊狀態不完整，建議審慎。"
+        inst_text = "法人資料狀態不完整，建議以風控為先。"
 
-    # 降級補述
-    if degraded_mode and inst_status != "READY":
-        inst_text += "（degraded_mode=1）"
-
-    return liquidity_text + mode_text + inst_text
+    strategy_text = "整體策略以保守為主。" if (degraded_mode and inst_status != "READY") else "倉位可依個股訊號彈性調整。"
+    return liquidity_text + inst_text + strategy_text
 
 
-def _apply_arbiter_final_decision(payload: dict) -> dict:
-    """
-    對 payload["stocks"] 逐一寫入 FinalDecision：
-      FinalDecision = {
-        "Conservative": arbitrate(stock, macro_overview, "Conservative"),
-        "Aggressive":   arbitrate(stock, macro_overview, "Aggressive")
-      }
-    """
-    if not isinstance(payload, dict):
-        return payload
-    if "stocks" not in payload or "macro" not in payload:
-        return payload
-    macro_overview = (payload.get("macro") or {}).get("overview") or {}
-
-    for s in payload.get("stocks", []) or []:
-        try:
-            s["FinalDecision"] = {
-                "Conservative": arbitrate(s, macro_overview, account="Conservative"),
-                "Aggressive": arbitrate(s, macro_overview, account="Aggressive"),
-            }
-        except Exception as e:
-            # Arbiter 出錯時：不要讓整包 crash，保留錯誤資訊以利定位
-            s["FinalDecision"] = {
-                "Conservative": {
-                    "Decision": "WATCH",
-                    "action_size_pct": 0,
-                    "exit_reason_code": "ARBITER_ERROR",
-                    "degraded_note": "資料降級：是（Arbiter 執行失敗）",
-                    "reason_technical": f"{type(e).__name__}: {str(e)}",
-                    "reason_structure": "ARBITER_ERROR",
-                    "reason_inst": "ARBITER_ERROR",
-                },
-                "Aggressive": {
-                    "Decision": "WATCH",
-                    "action_size_pct": 0,
-                    "exit_reason_code": "ARBITER_ERROR",
-                    "degraded_note": "資料降級：是（Arbiter 執行失敗）",
-                    "reason_technical": f"{type(e).__name__}: {str(e)}",
-                    "reason_structure": "ARBITER_ERROR",
-                    "reason_inst": "ARBITER_ERROR",
-                },
-            }
-
-    return payload
-
-
-def app():
-    st.set_page_config(page_title="Sunhero｜股市智能超盤中控台", layout="wide")
-    st.title("Sunhero｜股市智能超盤中控台")
-
-    market = st.sidebar.selectbox("Market", ["tw-share", "tw"], index=0)
-    session = st.sidebar.selectbox("Session", [SESSION_INTRADAY, SESSION_EOD], index=0)
-
-    run_btn = st.sidebar.button("Run")
-
-    if not run_btn:
-        st.info("按左側 Run 產生 Top 清單與 JSON。")
-        return
-
-    # 1) Load market data
+# -----------------------------
+# Core build payload (shared by UI/CLI)
+# -----------------------------
+def build_payload(market: str, session: str) -> tuple[pd.DataFrame, dict, str]:
     df = _load_market_csv(market)
-    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df = _normalize_date_column(df)
 
     latest_date = df["Date"].max()
     trade_date = _fmt_date(latest_date)
 
-    # 2) Run analyzer
     df_top, err = run_analysis(df, session=session)
     if err:
-        st.error(f"Analyzer error: {err}")
-        return
+        raise RuntimeError(f"Analyzer error: {err}")
 
-    # 3) Fetch institutional (FinMind)
-    start_date = (pd.to_datetime(trade_date) - pd.Timedelta(days=45)).strftime("%Y-%m-%d")
-    end_date = trade_date
+    # 股票名稱
+    df_top = _attach_stock_names(df_top)
 
+    # 法人（FinMind：若 402 就標 UNAVAILABLE）
     symbols = df_top["Symbol"].astype(str).tolist()
 
     inst_fetch_error = None
+    inst_df = pd.DataFrame(columns=["date", "symbol", "net_amount"])
     try:
+        start_date = (pd.to_datetime(trade_date) - pd.Timedelta(days=45)).strftime("%Y-%m-%d")
+        end_date = trade_date
         inst_df = fetch_finmind_institutional(
             symbols=symbols,
             start_date=start_date,
@@ -249,78 +345,131 @@ def app():
             token=os.getenv("FINMIND_TOKEN", None),
         )
     except Exception as e:
-        inst_df = pd.DataFrame(columns=["date", "symbol", "net_amount"])
         inst_fetch_error = f"{type(e).__name__}: {str(e)}"
-        st.warning(f"個股法人資料抓取失敗：{inst_fetch_error}")
 
-    # 4) Determine macro inst_status + inst_dates_3d
     inst_status, inst_dates_3d = _decide_inst_status(inst_df, symbols, trade_date)
 
-    # 402 Payment Required => UNAVAILABLE
     if inst_fetch_error and ("402" in inst_fetch_error or "Payment Required" in inst_fetch_error):
         inst_status = "UNAVAILABLE"
         inst_dates_3d = []
 
-    # 5) Merge institutional into df_top
+    # 合併個股法人（就算空 DF 也不會壞）
     df_top2 = _merge_institutional_into_df_top(df_top, inst_df, trade_date=trade_date)
 
-    # 6) Macro overview
+    # 成交金額
     amount_str = _compute_market_amount_today(df, latest_date)
 
-    # degraded_mode：PENDING 才視為降級；UNAVAILABLE 交由 Arbiter 的 data_mode/inst_missing 去處理
-    degraded_mode = (inst_status == "PENDING")
+    # 指數快照（TW + US）
+    indices = fetch_indices_snapshot(trade_date)
 
-    # ✅ data_mode / lag_days（關鍵）
-    data_mode, lag_days = _calc_data_mode(trade_date, session=session)
+    # 市場三大法人 A/B（抓不到也不影響）
+    ab = fetch_twse_market_inst_net_ab(trade_date)
+    inst_net_text = _fmt_inst_net_ab_text(ab)
+
+    # degraded_mode：法人 UNAVAILABLE 不等於「系統降級」，交給 Arbiter 的 NA 規則即可；
+    # PENDING 才視作暫時不足
+    degraded_mode = (inst_status == "PENDING")
 
     macro_overview = {
         "amount": amount_str,
-        "inst_net": "A:0 | B:0",
+        "inst_net": inst_net_text,
         "trade_date": trade_date,
         "inst_status": inst_status,
         "inst_dates_3d": inst_dates_3d,
         "kill_switch": False,
         "v14_watch": False,
         "degraded_mode": degraded_mode,
-        # ✅ 新增：供 Arbiter 使用
-        "data_mode": data_mode,
-        "lag_days": lag_days,
     }
 
-    # ✅ 在產生 JSON 前：生成市場文字判斷
     market_comment = generate_market_comment_retail(macro_overview)
     macro_overview["market_comment"] = market_comment
 
-    macro_data = {"overview": macro_overview, "indices": []}
+    macro_data = {
+        "overview": macro_overview,
+        "indices": indices,
+    }
 
-    # 7) Generate base JSON (Analyzer output)
     json_text = generate_ai_json(df_top2, market=market, session=session, macro_data=macro_data)
+    payload = json.loads(json_text)
 
-    # 8) ✅ 寫回 FinalDecision（Arbiter output）
+    # ✅ 把股票名稱也寫入 JSON（每檔 stock 加上 Name）
+    # analyzer.generate_ai_json 現在未必帶 Name，這裡保底寫入
+    name_map = {r["Symbol"]: r.get("Name", r["Symbol"]) for r in df_top2.to_dict("records")}
+    for s in payload.get("stocks", []):
+        sym = s.get("Symbol")
+        s["Name"] = name_map.get(sym, sym)
+
+    json_text2 = json.dumps(payload, ensure_ascii=False, indent=2)
+
+    return df_top2, macro_data, json_text2
+
+
+# -----------------------------
+# Streamlit App
+# -----------------------------
+def app():
+    st.set_page_config(page_title="Sunhero｜股市智能超盤中控台", layout="wide")
+    st.title("Sunhero｜股市智能超盤中控台")
+
+    market = st.sidebar.selectbox("Market", ["tw-share", "tw"], index=0)
+    session = st.sidebar.selectbox("Session", [SESSION_INTRADAY, SESSION_EOD], index=0)
+    run_btn = st.sidebar.button("Run")
+
+    if not run_btn:
+        st.info("按左側 Run 產生 Top 清單與 JSON。")
+        return
+
     try:
-        payload = json.loads(json_text)
-        if isinstance(payload, dict) and "error" not in payload:
-            payload = _apply_arbiter_final_decision(payload)
-            json_text = json.dumps(payload, ensure_ascii=False, indent=2)
+        df_top2, macro_data, json_text = build_payload(market=market, session=session)
     except Exception as e:
-        st.warning(f"FinalDecision 寫回失敗：{type(e).__name__}: {str(e)}")
+        st.error(f"{type(e).__name__}: {str(e)}")
+        return
 
-    # UI
+    macro_overview = (macro_data.get("overview") or {})
+    market_comment = macro_overview.get("market_comment", "")
+
     st.subheader("今日市場狀態判斷（一般投資人版）")
     st.info(market_comment)
 
-    st.subheader("Top List（Analyzer）")
+    st.subheader("Macro 指數快照")
+    st.dataframe(pd.DataFrame(macro_data.get("indices", [])))
+
+    st.subheader("Top List（含股票名稱）")
     st.dataframe(df_top2)
 
-    st.subheader("AI JSON（含 FinalDecision）")
+    st.subheader("AI JSON (Arbiter Input)")
     st.code(json_text, language="json")
 
-    # optional: save
+    trade_date = macro_overview.get("trade_date", datetime.now().strftime("%Y-%m-%d"))
     outname = f"ai_payload_{market}_{trade_date.replace('-', '')}_{session.lower()}.json"
     with open(outname, "w", encoding="utf-8") as f:
         f.write(json_text)
     st.success(f"JSON 已輸出：{outname}")
 
 
+# -----------------------------
+# CLI
+# -----------------------------
+def cli_run(market: str, session: str):
+    df_top2, macro_data, json_text = build_payload(market=market, session=session)
+    trade_date = (macro_data.get("overview") or {}).get("trade_date", datetime.now().strftime("%Y-%m-%d"))
+    outname = f"ai_payload_{market}_{trade_date.replace('-', '')}_{session.lower()}.json"
+    with open(outname, "w", encoding="utf-8") as f:
+        f.write(json_text)
+
+    # CLI 版：印出一句市場判斷 + 檔名
+    print((macro_data.get("overview") or {}).get("market_comment", ""))
+    print(f"JSON 已輸出：{outname}")
+
+
 if __name__ == "__main__":
-    app()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--cli", action="store_true", help="Run in CLI mode (for GitHub Actions)")
+    parser.add_argument("--market", default="tw-share", help="tw-share / tw")
+    parser.add_argument("--session", default=SESSION_INTRADAY, help="INTRADAY / EOD")
+    args = parser.parse_args()
+
+    if args.cli:
+        cli_run(market=args.market, session=args.session)
+    else:
+        app()
