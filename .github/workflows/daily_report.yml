@@ -1,10 +1,9 @@
 name: Predator Daily Analysis V15.6.3
-
 on:
   schedule:
-    - cron: '30 0 * * 1-5' # 08:30 台北 (UTC 00:30)
-    - cron: '0 3 * * 1-5'  # 11:00 台北 (UTC 03:00)
-    - cron: '30 8 * * 1-5' # 16:30 台北 (UTC 08:30)
+    - cron: '30 0 * * 1-5' # 08:30 台北 (UTC+8)
+    - cron: '0 3 * * 1-5'  # 11:00 台北
+    - cron: '30 8 * * 1-5' # 16:30 台北
   workflow_dispatch:
 
 permissions:
@@ -15,55 +14,82 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
-        with:
-          fetch-depth: 0
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install pandas yfinance numpy requests beautifulsoup4 streamlit resend matplotlib
+          fi
 
-      # 1) 先更新市場 CSV（關鍵）
-      - name: Update market CSV (tw-share)
+      # ① 嘗試更新 CSV（你 repo 有 downloader_tw.py）
+      - name: Update TW market CSV
         run: |
-          python downloader_tw.py --market tw-share
+          python downloader_tw.py --market tw-share || true
           ls -la
-          echo "CSV Date max:"
-          python - << 'PY'
-          import pandas as pd
-          df = pd.read_csv("data_tw-share.csv")
-          df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-          print(df["Date"].max())
-          PY
 
-      # 2) 再跑你的 CLI 報告（如果 main.py --cli 真的存在）
-      - name: Run Predator CLI
+      # ② 跑 CLI 產出 JSON（你原本 workflow 就是這樣呼叫）
+      - name: Run Predator (CLI)
         env:
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
           FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
         run: |
-          python main.py --cli
+          python main.py --cli --market tw-share --session EOD
 
-      # 3) 若 CSV 有更新，把它推回 repo（關鍵）
-      - name: Commit & Push updated CSV
+      # ✅ 建議1：CSV 落後就 fail（避免靜默失效）
+      - name: Fail if CSV is stale
+        run: |
+          python - << 'PY'
+          import pandas as pd
+          import datetime as dt
+          import os
+          import sys
+
+          fname = "data_tw-share.csv"
+          if not os.path.exists(fname):
+              print(f"[FAIL] Missing file: {fname}")
+              sys.exit(2)
+
+          df = pd.read_csv(fname)
+          if "Date" not in df.columns:
+              print("[FAIL] CSV missing Date column")
+              sys.exit(2)
+
+          df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+          latest = df["Date"].max()
+          if pd.isna(latest):
+              print("[FAIL] Date parse failed (all NaT)")
+              sys.exit(2)
+
+          latest_date = latest.date()
+          today_utc = dt.datetime.utcnow().date()  # runner 是 UTC
+          lag_days = (today_utc - latest_date).days
+
+          # 門檻：>=2 才 fail（較不會誤殺連假/休市）
+          if lag_days >= 2:
+              print(f"[FAIL] CSV stale: latest={latest_date}, today_utc={today_utc}, lag_days={lag_days}")
+              sys.exit(1)
+
+          print(f"[OK] CSV fresh: latest={latest_date}, today_utc={today_utc}, lag_days={lag_days}")
+          PY
+
+      # ③ 若 CSV 有變更就 commit/push（讓 repo 真正更新）
+      - name: Commit updated CSV (if changed)
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          # 只提交 CSV 與你想要追蹤的輸出（可自行增減）
           git add data_tw-share.csv data_tw.csv || true
-
-          # 沒變更就跳過
           if git diff --cached --quiet; then
-            echo "No changes to commit."
-            exit 0
+            echo "No CSV changes to commit."
+          else
+            git commit -m "Update market CSV"
+            git push
           fi
-
-          git commit -m "Update market CSV (auto)"
-          git push
