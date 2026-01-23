@@ -1,0 +1,24 @@
+{
+  "asof": "2026-01-22",
+  "source_note": "財報狗/玩股網：OPM=2025Q3；EPS=TTM；Price=1/22",
+  "items": [
+    {
+      "Symbol": "2603.TW",
+      "Name": "長榮",
+      "OPM_latest_q": 22.73,
+      "OPM_q": "2025Q3",
+      "EPS_TTM": 41.92,
+      "Price_asof": 192.54,
+      "Valuation_Tag": "🟢 極度低估 (Deep Value)"
+    },
+    {
+      "Symbol": "2609.TW",
+      "Name": "陽明",
+      "OPM_latest_q": 10.49,
+      "OPM_q": "2025Q3",
+      "EPS_TTM": 7.83,
+      "Price_asof": 55.50,
+      "Valuation_Tag": "🟡"
+    }
+  ]
+}
