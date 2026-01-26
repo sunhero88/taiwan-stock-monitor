@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 from datetime import datetime
 
 import pandas as pd
@@ -13,17 +12,13 @@ from analyzer import run_analysis, generate_ai_json, SESSION_INTRADAY, SESSION_E
 from finmind_institutional import fetch_finmind_institutional
 from institutional_utils import calc_inst_3d
 
+# ✅ 新增：全市場成交金額（上市+上櫃）與盤中量能正規化
+from market_amount import fetch_amount_total, intraday_norm
+
 
 # =========================
 # 0) 航運股估值（手動覆蓋層）
 # =========================
-# 你提供的資料（財報狗 + 玩股網）→ 先以「可回溯」方式寫入 override 區塊
-# - opm_q: 最新單季 OPM（%）
-# - eps_ttm: 近四季 EPS (TTM)
-# - price_ref: 你引用的價格（例：1/22）
-# - pe_calc: 以 price_ref / eps_ttm 計算的 PE
-# - label: 你給的評語標籤（Deep Value / etc.）
-# - source: 記錄資料來源與季度（便於索引）
 SHIPPING_VALUATION = {
     "2603.TW": {
         "name_zh": "長榮",
@@ -52,6 +47,9 @@ SHIPPING_VALUATION = {
 }
 
 
+# =========================
+# Utils
+# =========================
 def _fmt_date(dt) -> str:
     try:
         return pd.to_datetime(dt).strftime("%Y-%m-%d")
@@ -59,170 +57,40 @@ def _fmt_date(dt) -> str:
         return datetime.now().strftime("%Y-%m-%d")
 
 
-def _project_root() -> Path:
-    """
-    Streamlit Cloud / 本機都穩定：
-    以 main.py 的位置當作專案根目錄（避免工作目錄變動造成找不到檔案）
-    """
-    return Path(__file__).resolve().parent
+def _find_existing_path(candidates: list[str]) -> str | None:
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    return None
 
 
 def _load_market_csv(market: str) -> pd.DataFrame:
     """
-    強化版 loader：同時支援「根目錄舊路徑」與「data/ 新路徑」
-    你搬檔案到 data/ 後，不會再因路徑寫死而 FileNotFoundError。
+    你的 repo 目前可能出現：
+      - data_tw-share.csv / data_tw.csv（放在根目錄）
+      - data/data_tw-share.csv / data/data_tw.csv（放在 data/ 目錄）
     """
-    base = _project_root()
-
-    # 你目前 repo 的檔名慣例是：
-    # - data_tw-share.csv
-    # - data_tw.csv
-    # 但原本函式也有 data_{market}.csv 的寫法，所以保留相容性
     fname = f"data_{market}.csv"
-
-    # 依序嘗試（新路徑優先）
     candidates = [
-        base / "data" / fname,
-        base / fname,
-        base / "data" / "data_tw-share.csv",
-        base / "data_tw-share.csv",
-        base / "data" / "data_tw.csv",
-        base / "data_tw.csv",
+        fname,
+        os.path.join("data", fname),
+        "data_tw-share.csv",
+        os.path.join("data", "data_tw-share.csv"),
+        "data_tw.csv",
+        os.path.join("data", "data_tw.csv"),
     ]
-
-    for p in candidates:
-        if p.exists():
-            return pd.read_csv(p)
-
-    tried = "\n".join([str(p) for p in candidates])
-    raise FileNotFoundError(
-        f"找不到資料檔。market={market}\n已嘗試路徑：\n{tried}"
-    )
+    hit = _find_existing_path(candidates)
+    if not hit:
+        raise FileNotFoundError(f"找不到資料檔：{fname} / data_tw-share.csv / data_tw.csv（或 data/ 目錄下）")
+    return pd.read_csv(hit)
 
 
-def _compute_market_amount_today(df: pd.DataFrame, latest_date) -> str:
-    d = df.copy()
-    d["Date"] = pd.to_datetime(d["Date"], errors="coerce")
-    d = d[d["Date"] == latest_date].copy()
-    if d.empty:
-        return "待更新"
-    d["Close"] = pd.to_numeric(d.get("Close"), errors="coerce").fillna(0)
-    d["Volume"] = pd.to_numeric(d.get("Volume"), errors="coerce").fillna(0)
-    amt = float((d["Close"] * d["Volume"]).sum())
-    return f"{amt:,.0f}"
-
-
-def _merge_institutional_into_df_top(df_top: pd.DataFrame, inst_df: pd.DataFrame, trade_date: str) -> pd.DataFrame:
-    """
-    把 calc_inst_3d 的結果塞回 df_top 的 Institutional 欄位（dict）
-    """
-    df_out = df_top.copy()
-    inst_records = []
-
-    for _, r in df_out.iterrows():
-        symbol = str(r.get("Symbol", ""))
-        inst_calc = calc_inst_3d(inst_df, symbol=symbol, trade_date=trade_date)
-
-        inst_records.append(
-            {
-                "Symbol": symbol,
-                "Institutional": {
-                    "Inst_Visual": inst_calc.get("Inst_Status", "PENDING"),
-                    "Inst_Net_3d": float(inst_calc.get("Inst_Net_3d", 0.0)),
-                    "Inst_Streak3": int(inst_calc.get("Inst_Streak3", 0)),
-                    "Inst_Dir3": inst_calc.get("Inst_Dir3", "PENDING"),
-                    "Inst_Status": inst_calc.get("Inst_Status", "PENDING"),
-                },
-            }
-        )
-
-    inst_map = {x["Symbol"]: x["Institutional"] for x in inst_records}
-
-    # 原碼這行是 df_out["Symbol"].map(inst_map)（Symbol/Symbol 大小寫一致性更安全）
-    df_out["Institutional"] = df_out["Symbol"].astype(str).map(inst_map)
-    return df_out
-
-
-def _decide_inst_status(inst_df: pd.DataFrame, symbols: list[str], trade_date: str) -> tuple[str, list[str]]:
-    """
-    給 macro.overview.inst_status + inst_dates_3d
-    規則：只要有任何一檔能滿足「三日資料齊全」→ READY
-    否則 PENDING
-    """
-    ready_any = False
-    dates_3d = []
-
-    for sym in symbols:
-        r = calc_inst_3d(inst_df, symbol=sym, trade_date=trade_date)
-        if r.get("Inst_Status") == "READY":
-            ready_any = True
-
-    try:
-        if not inst_df.empty:
-            dates_3d = sorted(inst_df["date"].astype(str).unique().tolist())[-3:]
-    except Exception:
-        dates_3d = []
-
-    return ("READY" if ready_any else "PENDING"), dates_3d
-
-
-def generate_market_comment_retail(macro_overview: dict) -> str:
-    """
-    依據 Macro Overview 自動生成「今日市場狀態判斷」（一般投資人可讀版）
-    設計原則：
-    - 每一句可回溯至實際欄位
-    - 與 Arbiter 行為一致
-    注意：Arbiter 端仍應忽略 market_comment（你已在 Arbiter 規則中明確要求）
-    """
-    amount = macro_overview.get("amount")
-    inst_status = macro_overview.get("inst_status", "PENDING")
-    degraded_mode = bool(macro_overview.get("degraded_mode", False))
-    kill_switch = bool(macro_overview.get("kill_switch", False))
-    v14_watch = bool(macro_overview.get("v14_watch", False))
-
-    # 系統級風控
-    if kill_switch or v14_watch:
-        return "今日市場不確定性偏高，系統已啟動風控保護（禁止進場），建議以資金保全為優先。"
-
-    # 流動性（成交金額門檻可自行調整）
-    liquidity_ok = False
-    amount_num = None
-    try:
-        if amount not in (None, "", "待更新"):
-            amount_num = float(str(amount).replace(",", ""))
-            liquidity_ok = amount_num > 300_000_000_000  # 3000 億
-    except Exception:
-        liquidity_ok = False
-
-    liquidity_text = "成交金額維持在正常水準，" if liquidity_ok else "成交金額偏低，"
-
-    # 法人狀態
-    if inst_status in ("UNAVAILABLE", "PENDING"):
-        inst_text = "法人資料尚不足以判讀方向，建議以觀察或小額試單為主，不宜貿然重倉。"
-    elif inst_status == "READY":
-        inst_text = "法人資料可用，可搭配個股條件做較積極的倉位調整。"
-    else:
-        inst_text = "法人資料狀態不完整，建議審慎應對。"
-
-    # 降級說明
-    strategy_text = "整體策略以保守為主。" if (degraded_mode and inst_status != "READY") else "倉位可依個股訊號彈性調整。"
-
-    # 加上數字（更像可追溯的判斷）
-    if amount_num is not None:
-        amount_eok = amount_num / 100_000_000  # 換算億
-        liquidity_text = f"{liquidity_text}（成交金額約 {amount_eok:,.0f} 億）"
-
-    return liquidity_text + inst_text + strategy_text
-
-
-# =========================
-# 1) 航運估值注入（寫入 df_top2 的 Structure/Valuation 區塊）
-# =========================
 def _apply_shipping_valuation_overrides(df_top: pd.DataFrame) -> pd.DataFrame:
     """
-    將 SHIPPING_VALUATION 以「Overlay」形式注入到 df_top 的 Structure 旁邊
-    - 不覆蓋原本 yfinance 算出的 OPM/PE/Rev_Growth（避免污染）
-    - 新增欄位 Valuation_Override（dict），並補 Name（中文名）
+    航運估值 overlay：
+    - 不污染原本 yfinance 的 Structure 欄位
+    - 新增 Valuation_Override（dict）
+    - 補 Name（中文名）
     """
     out = df_top.copy()
 
@@ -232,7 +100,6 @@ def _apply_shipping_valuation_overrides(df_top: pd.DataFrame) -> pd.DataFrame:
         if not info:
             return row
 
-        # 補名稱（以你要求：代碼 + 名稱）
         if not row.get("Name"):
             row["Name"] = info.get("name_zh", sym)
 
@@ -249,37 +116,172 @@ def _apply_shipping_valuation_overrides(df_top: pd.DataFrame) -> pd.DataFrame:
         }
         return row
 
-    out = out.apply(_inject, axis=1)
-    return out
+    return out.apply(_inject, axis=1)
 
 
+def _merge_institutional_into_df_top(df_top: pd.DataFrame, inst_df: pd.DataFrame, trade_date: str) -> pd.DataFrame:
+    """
+    把 calc_inst_3d 的結果塞回 df_top 的 Institutional 欄位（dict）
+    """
+    df_out = df_top.copy()
+    inst_map: dict[str, dict] = {}
+
+    for _, r in df_out.iterrows():
+        symbol = str(r.get("Symbol", ""))
+        inst_calc = calc_inst_3d(inst_df, symbol=symbol, trade_date=trade_date)
+        inst_map[symbol] = {
+            "Inst_Visual": inst_calc.get("Inst_Status", "PENDING"),
+            "Inst_Net_3d": float(inst_calc.get("Inst_Net_3d", 0.0)),
+            "Inst_Streak3": int(inst_calc.get("Inst_Streak3", 0)),
+            "Inst_Dir3": inst_calc.get("Inst_Dir3", "PENDING"),
+            "Inst_Status": inst_calc.get("Inst_Status", "PENDING"),
+        }
+
+    df_out["Institutional"] = df_out["Symbol"].astype(str).map(inst_map)
+    return df_out
+
+
+def _decide_inst_status(inst_df: pd.DataFrame, symbols: list[str], trade_date: str) -> tuple[str, list[str]]:
+    """
+    macro.overview.inst_status + inst_dates_3d
+    規則：只要有任何一檔能滿足「三日資料齊全」→ READY；否則 PENDING
+    """
+    ready_any = False
+    dates_3d: list[str] = []
+
+    for sym in symbols:
+        r = calc_inst_3d(inst_df, symbol=sym, trade_date=trade_date)
+        if r.get("Inst_Status") == "READY":
+            ready_any = True
+
+    try:
+        if not inst_df.empty and "date" in inst_df.columns:
+            dates_3d = sorted(inst_df["date"].astype(str).unique().tolist())[-3:]
+    except Exception:
+        dates_3d = []
+
+    return ("READY" if ready_any else "PENDING"), dates_3d
+
+
+def _load_avg20_amount_total(trade_date: str) -> int | None:
+    """
+    讀取你自己落地的市場成交金額歷史檔（建議你後續固定建立）：
+      data/tw_market_turnover.csv
+    欄位建議：
+      date, amount_total
+    這裡回傳近 20 日中位數（更抗極端值），若不足就回傳 None。
+    """
+    candidates = [
+        os.path.join("data", "tw_market_turnover.csv"),
+        "tw_market_turnover.csv",
+    ]
+    fp = _find_existing_path(candidates)
+    if not fp:
+        return None
+
+    try:
+        d = pd.read_csv(fp)
+        if "date" not in d.columns or "amount_total" not in d.columns:
+            return None
+
+        d["date"] = pd.to_datetime(d["date"], errors="coerce")
+        d["amount_total"] = pd.to_numeric(d["amount_total"], errors="coerce")
+        d = d.dropna(subset=["date", "amount_total"]).sort_values("date")
+
+        td = pd.to_datetime(trade_date, errors="coerce")
+        if pd.isna(td):
+            return None
+
+        d = d[d["date"] <= td].tail(20)
+        if len(d) < 10:
+            return None
+
+        return int(d["amount_total"].median())
+    except Exception:
+        return None
+
+
+def generate_market_comment_retail(macro_overview: dict) -> str:
+    """
+    依據 Macro Overview 自動生成「今日市場狀態判斷」（一般投資人可讀版）
+    注意：你已規範 market_comment 僅供人類閱讀，Arbiter 必須忽略。
+    """
+    amount_total = macro_overview.get("amount_total")
+    inst_status = macro_overview.get("inst_status", "PENDING")
+    degraded_mode = bool(macro_overview.get("degraded_mode", False))
+    kill_switch = bool(macro_overview.get("kill_switch", False))
+    v14_watch = bool(macro_overview.get("v14_watch", False))
+
+    if kill_switch or v14_watch:
+        return "今日市場不確定性偏高，系統已啟動風控保護（禁止進場），建議以資金保全為優先。"
+
+    # 成交金額（以「上市+上櫃合計」為主）
+    amount_num = None
+    try:
+        if isinstance(amount_total, str) and amount_total not in ("待更新", "", None):
+            amount_num = float(amount_total.replace(",", ""))
+        elif isinstance(amount_total, (int, float)):
+            amount_num = float(amount_total)
+    except Exception:
+        amount_num = None
+
+    # 量能文字（不再用固定 3000億門檻，而是偏向「描述 + 盤中正規化提示」）
+    liquidity_text = "成交金額待更新，" if amount_num is None else "成交金額偏低，"
+    if amount_num is not None:
+        amount_eok = amount_num / 100_000_000  # 元→億
+        liquidity_text = f"{liquidity_text}（成交金額約 {amount_eok:,.0f} 億）"
+
+    # 法人狀態
+    if inst_status in ("UNAVAILABLE", "PENDING"):
+        inst_text = "法人資料尚不足以判讀方向，建議以觀察或小額試單為主，不宜貿然重倉。"
+    elif inst_status == "READY":
+        inst_text = "法人資料可用，但仍需以個股條件與風控規則為主。"
+    else:
+        inst_text = "法人資料狀態不完整，建議審慎應對。"
+
+    # 降級說明
+    strategy_text = "整體策略以保守為主。" if degraded_mode else "倉位可依個股訊號彈性調整。"
+
+    # 若有盤中正規化（提供提示但不下結論）
+    norm = macro_overview.get("amount_norm")
+    norm_hint = ""
+    if isinstance(norm, dict):
+        cum_ratio = norm.get("amount_norm_cum_ratio")
+        label = norm.get("amount_norm_label")
+        if cum_ratio is not None and label in ("LOW", "NORMAL", "HIGH"):
+            norm_hint = f"（盤中量能正規化：{label}，累積比率≈{cum_ratio}）"
+
+    return liquidity_text + inst_text + strategy_text + norm_hint
+
+
+# =========================
+# App
+# =========================
 def app():
     st.set_page_config(page_title="Sunhero｜股市智能超盤中控台", layout="wide")
     st.title("Sunhero｜股市智能超盤中控台")
 
     market = st.sidebar.selectbox("Market", ["tw-share", "tw"], index=0)
     session = st.sidebar.selectbox("Session", [SESSION_INTRADAY, SESSION_EOD], index=0)
-
     run_btn = st.sidebar.button("Run")
 
     if not run_btn:
         st.info("按左側 Run 產生 Top 清單與 JSON。")
         return
 
-    # 1) Load market data
+    # 1) Load market data（個股池資料，用於選股矩陣/技術分數）
     df = _load_market_csv(market)
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-
     latest_date = df["Date"].max()
     trade_date = _fmt_date(latest_date)
 
-    # 2) Run analyzer
+    # 2) Run analyzer（產生 Top 清單）
     df_top, err = run_analysis(df, session=session)
     if err:
         st.error(f"Analyzer error: {err}")
         return
 
-    # 2.1) ✅ 航運估值 overlay（先進 df_top，讓後面 JSON 也吃到）
+    # 2.1) 航運估值 overlay
     df_top = _apply_shipping_valuation_overrides(df_top)
 
     # 3) Fetch institutional (FinMind)
@@ -311,12 +313,53 @@ def app():
     # 5) Merge institutional into df_top
     df_top2 = _merge_institutional_into_df_top(df_top, inst_df, trade_date=trade_date)
 
-    # 6) Macro overview
-    amount_str = _compute_market_amount_today(df, latest_date)
+    # 6) ✅ 全市場成交金額（上市+上櫃合計）+ 盤中量能正規化
+    amount_err = None
+    amount_twse = amount_tpex = amount_total = None
+    src_twse = src_tpex = None
 
-    degraded_mode = (inst_status == "PENDING")  # UNAVAILABLE 不強制 degraded（交給 Arbiter NA 規則）
+    try:
+        amt = fetch_amount_total()
+        amount_twse = amt.amount_twse
+        amount_tpex = amt.amount_tpex
+        amount_total = amt.amount_total
+        src_twse = amt.source_twse
+        src_tpex = amt.source_tpex
+    except Exception as e:
+        amount_err = f"{type(e).__name__}: {e}"
+        st.warning(f"全市場成交金額抓取失敗（amount_total 會顯示待更新）：{amount_err}")
+
+    # 6.1) 讀取近20日基準（建議你後續固定落地 tw_market_turnover.csv）
+    avg20_amount_total = _load_avg20_amount_total(trade_date)
+
+    # 6.2) 記住上一筆 amount_total，供「保守型切片量」用（此處以『每次 Run』為一筆）
+    prev_key = "amount_total_prev_int"
+    amount_total_prev = st.session_state.get(prev_key)
+
+    norm = None
+    if isinstance(amount_total, int) and amount_total > 0 and isinstance(avg20_amount_total, int) and avg20_amount_total > 0:
+        norm = intraday_norm(
+            amount_total_now=amount_total,
+            amount_total_prev=amount_total_prev,
+            avg20_amount_total=avg20_amount_total,
+        )
+
+    if isinstance(amount_total, int):
+        st.session_state[prev_key] = amount_total
+
+    # 7) macro_overview（注意：amount_total 才是「市場成交金額口徑」）
+    degraded_mode = (inst_status == "PENDING")  # UNAVAILABLE 不強制 degraded（交給 Arbiter 規則）
+
     macro_overview = {
-        "amount": amount_str,
+        "amount_twse": f"{amount_twse:,}" if isinstance(amount_twse, int) else "待更新",
+        "amount_tpex": f"{amount_tpex:,}" if isinstance(amount_tpex, int) else "待更新",
+        "amount_total": f"{amount_total:,}" if isinstance(amount_total, int) else "待更新",
+        "amount_sources": {
+            "twse": src_twse,
+            "tpex": src_tpex,
+            "error": amount_err,
+        },
+        "avg20_amount_total_median": f"{avg20_amount_total:,}" if isinstance(avg20_amount_total, int) else None,
         "inst_net": "A:0.00億 | B:0.00億",
         "trade_date": trade_date,
         "inst_status": inst_status,
@@ -324,11 +367,13 @@ def app():
         "kill_switch": False,
         "v14_watch": False,
         "degraded_mode": degraded_mode,
-        # 你之前已要求接 data_mode，這裡先給穩定值（若你已有 freshness 模組可改成動態）
         "data_mode": "INTRADAY" if session == SESSION_INTRADAY else "EOD",
     }
 
-    # 7) 產生市場一句話（給人類讀；Arbiter 端要忽略）
+    if norm:
+        macro_overview["amount_norm"] = norm
+
+    # 8) 產生市場一句話（僅供人類閱讀；Arbiter 必須忽略 market_comment）
     market_comment = generate_market_comment_retail(macro_overview)
     macro_overview["market_comment"] = market_comment
 
@@ -337,16 +382,27 @@ def app():
         "indices": [],
     }
 
-    # 8) Generate JSON for Arbiter
+    # 9) Generate JSON for Arbiter
     json_text = generate_ai_json(df_top2, market=market, session=session, macro_data=macro_data)
 
     # =========================
     # UI
     # =========================
-    st.subheader("今日市場狀態判斷（一般投資人版）")
+    st.subheader("全市場成交金額（上市+上櫃合計）")
+    col1, col2, col3 = st.columns(3)
+    col1.metric("上市 TWSE 成交金額(元)", macro_overview["amount_twse"])
+    col2.metric("上櫃 TPEx 成交金額(元)", macro_overview["amount_tpex"])
+    col3.metric("合計 amount_total(元)", macro_overview["amount_total"])
+
+    with st.expander("成交金額來源與除錯資訊"):
+        st.write(macro_overview.get("amount_sources", {}))
+        st.write({"avg20_amount_total_median": macro_overview.get("avg20_amount_total_median")})
+        st.write({"amount_norm": macro_overview.get("amount_norm")})
+
+    st.subheader("今日市場狀態判斷（一般投資人版；僅供閱讀）")
     st.info(market_comment)
 
-    # ✅ 航運估值卡（只顯示命中者）
+    # 航運估值卡（只顯示命中者）
     hit = df_top2[df_top2["Symbol"].isin(list(SHIPPING_VALUATION.keys()))].copy()
     if not hit.empty:
         st.subheader("航運股估值快照（財報狗/玩股網）")
@@ -356,7 +412,6 @@ def app():
         def _render(v: dict) -> str:
             if not isinstance(v, dict):
                 return ""
-            # 用關鍵數據呈現（OPM / EPS / 價格 / PE）
             return (
                 f"OPM({v.get('opm_q_period')}): {v.get('opm_q')}% | "
                 f"EPS(TTM): {v.get('eps_ttm')} | "
@@ -374,19 +429,11 @@ def app():
     st.subheader("AI JSON (Arbiter Input)")
     st.code(json_text, language="json")
 
-    # optional: save（建議放 reports/；若資料夾不存在就自動建立）
-    reports_dir = _project_root() / "reports"
-    try:
-        reports_dir.mkdir(parents=True, exist_ok=True)
-    except Exception:
-        # 若你不想建資料夾或權限受限，就退回根目錄
-        reports_dir = _project_root()
-
+    # optional: save
     outname = f"ai_payload_{market}_{trade_date.replace('-', '')}_{session.lower()}.json"
-    outpath = reports_dir / outname
-    with open(outpath, "w", encoding="utf-8") as f:
+    with open(outname, "w", encoding="utf-8") as f:
         f.write(json_text)
-    st.success(f"JSON 已輸出：{outpath.as_posix()}")
+    st.success(f"JSON 已輸出：{outname}")
 
 
 if __name__ == "__main__":
