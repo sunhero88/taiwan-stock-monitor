@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from datetime import datetime
 
 import pandas as pd
@@ -58,19 +59,45 @@ def _fmt_date(dt) -> str:
         return datetime.now().strftime("%Y-%m-%d")
 
 
+def _project_root() -> Path:
+    """
+    Streamlit Cloud / 本機都穩定：
+    以 main.py 的位置當作專案根目錄（避免工作目錄變動造成找不到檔案）
+    """
+    return Path(__file__).resolve().parent
+
+
 def _load_market_csv(market: str) -> pd.DataFrame:
-    # 你的 repo 目前是 data_tw-share.csv / data_tw.csv
+    """
+    強化版 loader：同時支援「根目錄舊路徑」與「data/ 新路徑」
+    你搬檔案到 data/ 後，不會再因路徑寫死而 FileNotFoundError。
+    """
+    base = _project_root()
+
+    # 你目前 repo 的檔名慣例是：
+    # - data_tw-share.csv
+    # - data_tw.csv
+    # 但原本函式也有 data_{market}.csv 的寫法，所以保留相容性
     fname = f"data_{market}.csv"
-    if not os.path.exists(fname):
-        # fallback
-        if os.path.exists("data_tw-share.csv"):
-            fname = "data_tw-share.csv"
-        elif os.path.exists("data_tw.csv"):
-            fname = "data_tw.csv"
-        else:
-            raise FileNotFoundError(f"找不到資料檔：{fname} / data_tw-share.csv / data_tw.csv")
-    df = pd.read_csv(fname)
-    return df
+
+    # 依序嘗試（新路徑優先）
+    candidates = [
+        base / "data" / fname,
+        base / fname,
+        base / "data" / "data_tw-share.csv",
+        base / "data_tw-share.csv",
+        base / "data" / "data_tw.csv",
+        base / "data_tw.csv",
+    ]
+
+    for p in candidates:
+        if p.exists():
+            return pd.read_csv(p)
+
+    tried = "\n".join([str(p) for p in candidates])
+    raise FileNotFoundError(
+        f"找不到資料檔。market={market}\n已嘗試路徑：\n{tried}"
+    )
 
 
 def _compute_market_amount_today(df: pd.DataFrame, latest_date) -> str:
@@ -110,7 +137,9 @@ def _merge_institutional_into_df_top(df_top: pd.DataFrame, inst_df: pd.DataFrame
         )
 
     inst_map = {x["Symbol"]: x["Institutional"] for x in inst_records}
-    df_out["Institutional"] = df_out["Symbol"].map(inst_map)
+
+    # 原碼這行是 df_out["Symbol"].map(inst_map)（Symbol/Symbol 大小寫一致性更安全）
+    df_out["Institutional"] = df_out["Symbol"].astype(str).map(inst_map)
     return df_out
 
 
@@ -143,6 +172,7 @@ def generate_market_comment_retail(macro_overview: dict) -> str:
     設計原則：
     - 每一句可回溯至實際欄位
     - 與 Arbiter 行為一致
+    注意：Arbiter 端仍應忽略 market_comment（你已在 Arbiter 規則中明確要求）
     """
     amount = macro_overview.get("amount")
     inst_status = macro_overview.get("inst_status", "PENDING")
@@ -203,7 +233,6 @@ def _apply_shipping_valuation_overrides(df_top: pd.DataFrame) -> pd.DataFrame:
             return row
 
         # 補名稱（以你要求：代碼 + 名稱）
-        # Name 欄位若已存在（例如你後面已經做 Name = yfinance longName），此處不強制覆蓋
         if not row.get("Name"):
             row["Name"] = info.get("name_zh", sym)
 
@@ -299,7 +328,7 @@ def app():
         "data_mode": "INTRADAY" if session == SESSION_INTRADAY else "EOD",
     }
 
-    # 7) 產生市場一句話
+    # 7) 產生市場一句話（給人類讀；Arbiter 端要忽略）
     market_comment = generate_market_comment_retail(macro_overview)
     macro_overview["market_comment"] = market_comment
 
@@ -345,11 +374,19 @@ def app():
     st.subheader("AI JSON (Arbiter Input)")
     st.code(json_text, language="json")
 
-    # optional: save
+    # optional: save（建議放 reports/；若資料夾不存在就自動建立）
+    reports_dir = _project_root() / "reports"
+    try:
+        reports_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        # 若你不想建資料夾或權限受限，就退回根目錄
+        reports_dir = _project_root()
+
     outname = f"ai_payload_{market}_{trade_date.replace('-', '')}_{session.lower()}.json"
-    with open(outname, "w", encoding="utf-8") as f:
+    outpath = reports_dir / outname
+    with open(outpath, "w", encoding="utf-8") as f:
         f.write(json_text)
-    st.success(f"JSON 已輸出：{outname}")
+    st.success(f"JSON 已輸出：{outpath.as_posix()}")
 
 
 if __name__ == "__main__":
