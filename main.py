@@ -4,442 +4,498 @@ from __future__ import annotations
 
 import os
 import json
-from datetime import datetime, timedelta, timezone, time
-from typing import Optional, Tuple, List, Dict, Any
+import math
+import inspect
+from dataclasses import asdict
+from datetime import datetime, timedelta, timezone, date
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
+import numpy as np
 import streamlit as st
 import yfinance as yf
 
-from analyzer import run_analysis, generate_ai_json, SESSION_INTRADAY, SESSION_EOD
-from institutional_utils import calc_inst_3d
-
-# 付費牆/不可用時會降級，不讓整個 app 爆
-try:
-    from finmind_institutional import fetch_finmind_institutional
-except Exception:
-    fetch_finmind_institutional = None
-
-from market_amount import fetch_amount_total, intraday_norm
+# 你目前 repo 有 market_amount.py（你貼過完整碼）
+from market_amount import fetch_amount_total, intraday_norm, MarketAmount
 
 TZ_TAIPEI = timezone(timedelta(hours=8))
-TRADING_START = time(9, 0)
-TRADING_END = time(13, 30)
 
+APP_TITLE = "Sunhero｜股市智能超盤中控台"
+APP_VERSION = "V15.7（免費/模擬期 Route A）"
 
-# =========================
-# 0) 基本工具
-# =========================
-def _now_taipei() -> datetime:
+# ----------------------------
+# 0) 工具：時間/交易日
+# ----------------------------
+def now_taipei() -> datetime:
     return datetime.now(tz=TZ_TAIPEI)
 
+def is_weekend(d: date) -> bool:
+    return d.weekday() >= 5
 
-def _fmt_date(dt) -> str:
-    try:
-        return pd.to_datetime(dt).strftime("%Y-%m-%d")
-    except Exception:
-        return _now_taipei().strftime("%Y-%m-%d")
+def prev_trading_day(d: date) -> date:
+    # 免費/模擬期：先用「週末排除」當交易日近似（不引入付費行事曆）
+    x = d
+    while is_weekend(x):
+        x = x - timedelta(days=1)
+    return x
 
-
-def _find_market_csv(market: str) -> str:
+def resolve_trade_date(session: str, now: Optional[datetime] = None) -> date:
     """
-    同時支援：
-    - root: data_tw-share.csv / data_tw.csv
-    - data/: data/data_tw-share.csv / data/data_tw.csv
+    你的需求：開盤前要看到「昨日 EOD」。
+    - 若現在時間 < 09:00：trade_date = 前一個交易日（週末排除）
+    - 盤中/盤後：trade_date = 今天（週末排除）
     """
-    candidates = [
-        f"data_{market}.csv",
-        os.path.join("data", f"data_{market}.csv"),
-        "data_tw-share.csv",
-        os.path.join("data", "data_tw-share.csv"),
-        "data_tw.csv",
-        os.path.join("data", "data_tw.csv"),
-    ]
-    for p in candidates:
-        if os.path.exists(p):
-            return p
-    raise FileNotFoundError(f"找不到資料檔：{candidates}")
+    now = now or now_taipei()
+    today = now.date()
+    today = prev_trading_day(today)
 
+    if now.hour < 9:
+        # 開盤前：看昨日
+        y = today - timedelta(days=1)
+        return prev_trading_day(y)
 
-def _load_market_csv(market: str) -> pd.DataFrame:
-    path = _find_market_csv(market)
-    df = pd.read_csv(path)
-    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-    df["Close"] = pd.to_numeric(df.get("Close"), errors="coerce")
-    df["Volume"] = pd.to_numeric(df.get("Volume"), errors="coerce")
-    return df
+    # 盤中/盤後
+    return today
 
+# ----------------------------
+# 1) 中文名稱：免費策略
+# ----------------------------
+DEFAULT_NAME_MAP_TW = {
+    "2330.TW": "台積電",
+    "2317.TW": "鴻海",
+    "2454.TW": "聯發科",
+    "2308.TW": "台達電",
+    "2382.TW": "廣達",
+    "3231.TW": "緯創",
+    "2603.TW": "長榮",
+    "2609.TW": "陽明",
+}
 
-def _get_latest_trade_date(df: pd.DataFrame) -> datetime:
-    d = df.dropna(subset=["Date"]).copy()
-    if d.empty:
-        return _now_taipei()
-    return pd.to_datetime(d["Date"].max()).to_pydatetime()
-
-
-# =========================
-# 1) 全球市場摘要（美股/半導體/匯率/日經）
-# =========================
-def _load_global_market_summary() -> pd.DataFrame:
+def load_name_map() -> Dict[str, str]:
     """
-    優先讀 data/global_market_summary.csv
-    若不存在 => 即時用 yfinance 抓（免費）
+    免費/穩定優先：
+    1) configs/stock_name_map.csv（你可自行維護）
+       欄位：Symbol,Name
+    2) fallback：DEFAULT_NAME_MAP_TW
     """
-    p = os.path.join("data", "global_market_summary.csv")
-    if os.path.exists(p):
-        g = pd.read_csv(p)
-        return g
+    path = os.path.join("configs", "stock_name_map.csv")
+    m = dict(DEFAULT_NAME_MAP_TW)
+    if os.path.exists(path):
+        try:
+            df = pd.read_csv(path)
+            if "Symbol" in df.columns and "Name" in df.columns:
+                for _, r in df.iterrows():
+                    s = str(r["Symbol"]).strip()
+                    n = str(r["Name"]).strip()
+                    if s and n:
+                        m[s] = n
+        except Exception:
+            pass
+    return m
 
-    items = [
-        ("US", "SOX_Semi", "^SOX"),
-        ("US", "TSM_ADR", "TSM"),
-        ("US", "NVIDIA", "NVDA"),
-        ("US", "Apple", "AAPL"),
-        ("ASIA", "Nikkei_225", "^N225"),
-        ("ASIA", "USD_JPY", "JPY=X"),
-        ("ASIA", "USD_TWD", "TWD=X"),
-    ]
+# ----------------------------
+# 2) 全球市場摘要（免費）
+# ----------------------------
+GLOBAL_SYMBOLS = [
+    ("US", "SOX_Semi", "^SOX"),
+    ("US", "TSM_ADR", "TSM"),
+    ("US", "NVIDIA", "NVDA"),
+    ("US", "Apple", "AAPL"),
+    ("ASIA", "Nikkei_225", "^N225"),
+    ("ASIA", "USD_JPY", "JPY=X"),
+    ("ASIA", "USD_TWD", "TWD=X"),  # yfinance 的匯率符號有時不穩；抓不到就顯示 NaN
+]
+
+@st.cache_data(ttl=300)
+def fetch_global_summary() -> pd.DataFrame:
     rows = []
-    for mkt, name, sym in items:
+    for market, label, sym in GLOBAL_SYMBOLS:
         try:
             t = yf.Ticker(sym)
-            info = t.fast_info
-            last = float(info.get("last_price") or 0.0)
-            prev = float(info.get("previous_close") or 0.0)
-            chg = ((last - prev) / prev * 100.0) if prev > 0 else 0.0
-            rows.append({"Market": mkt, "Symbol": name, "Change": round(chg, 4), "Value": round(last, 4)})
+            hist = t.history(period="5d", interval="1d", auto_adjust=False)
+            if hist is None or hist.empty:
+                rows.append((market, label, np.nan, np.nan))
+                continue
+            # 最新收盤 vs 前一日
+            close = float(hist["Close"].iloc[-1])
+            prev = float(hist["Close"].iloc[-2]) if len(hist) >= 2 else close
+            chg_pct = (close / prev - 1.0) * 100.0 if prev != 0 else 0.0
+            rows.append((market, label, round(chg_pct, 4), round(close, 4)))
         except Exception:
-            rows.append({"Market": mkt, "Symbol": name, "Change": None, "Value": None})
-    return pd.DataFrame(rows)
+            rows.append((market, label, np.nan, np.nan))
+    return pd.DataFrame(rows, columns=["Market", "Symbol", "Change(%)", "Value"])
 
+# ----------------------------
+# 3) 台股候選 Universe（Route A）
+# ----------------------------
+DEFAULT_UNIVERSE_TW = [
+    "2330.TW", "2317.TW", "2454.TW", "2308.TW",
+    "2382.TW", "3231.TW", "2603.TW", "2609.TW",
+]
 
-# =========================
-# 2) 中文名稱（免費：yfinance shortName）
-# =========================
-@st.cache_data(ttl=60 * 60 * 12)
-def _fetch_name_zh(symbol: str) -> str:
-    try:
-        t = yf.Ticker(symbol)
-        info = t.info or {}
-        name = info.get("shortName") or info.get("longName") or ""
-        return str(name) if name else ""
-    except Exception:
-        return ""
-
-
-def _ensure_names(df_top: pd.DataFrame) -> pd.DataFrame:
-    out = df_top.copy()
-    if "Name" not in out.columns:
-        out["Name"] = ""
-    for i, r in out.iterrows():
-        if not str(r.get("Name", "")).strip():
-            sym = str(r.get("Symbol", "")).strip()
-            out.at[i, "Name"] = _fetch_name_zh(sym)
-    return out
-
-
-# =========================
-# 3) 持倉強制納入（20 + N）
-# =========================
-def _parse_holdings(text: str) -> List[str]:
-    if not text:
+def parse_holdings(raw: str) -> List[str]:
+    """
+    允許輸入：
+    - 2330 / 2317 → 轉成 2330.TW / 2317.TW
+    - 2330.TW → 原樣
+    以逗號/空白分隔
+    """
+    if not raw:
         return []
-    parts = [x.strip() for x in text.replace("，", ",").split(",")]
-    out = []
-    for p in parts:
-        if not p:
+    tokens = []
+    for part in raw.replace(" ", ",").split(","):
+        s = part.strip()
+        if not s:
             continue
-        if p.isdigit():
-            out.append(f"{p}.TW")
-        else:
-            out.append(p)
+        if s.isdigit() and len(s) == 4:
+            s = f"{s}.TW"
+        tokens.append(s)
+    # 去重但保持順序
+    out = []
     seen = set()
-    dedup = []
-    for s in out:
+    for s in tokens:
         if s not in seen:
             seen.add(s)
-            dedup.append(s)
-    return dedup
-
-
-def _append_holdings_rows(df_top: pd.DataFrame, df_all: pd.DataFrame, holdings: List[str]) -> pd.DataFrame:
-    if not holdings:
-        return df_top
-
-    out = df_top.copy()
-    if "orphan_holding" not in out.columns:
-        out["orphan_holding"] = False
-
-    top_syms = set(out["Symbol"].astype(str).tolist())
-
-    latest_dt = df_all["Date"].max()
-    d = df_all[df_all["Date"] == latest_dt].copy()
-
-    for sym in holdings:
-        if sym in top_syms:
-            continue
-
-        one = d[d["Symbol"].astype(str) == sym].copy()
-        if one.empty:
-            row = {"Symbol": sym, "Name": _fetch_name_zh(sym), "orphan_holding": True}
-            out = pd.concat([out, pd.DataFrame([row])], ignore_index=True)
-            continue
-
-        close = float(one["Close"].iloc[0]) if pd.notna(one["Close"].iloc[0]) else None
-        vol = float(one["Volume"].iloc[0]) if pd.notna(one["Volume"].iloc[0]) else None
-        row = {
-            "Symbol": sym,
-            "Name": _fetch_name_zh(sym),
-            "Close": close,
-            "Volume": vol,
-            "orphan_holding": True,
-        }
-        out = pd.concat([out, pd.DataFrame([row])], ignore_index=True)
-
+            out.append(s)
     return out
 
+# ----------------------------
+# 4) 指標計算（免費：yfinance）
+# ----------------------------
+@st.cache_data(ttl=300)
+def download_prices(symbols: List[str], period: str = "6mo") -> pd.DataFrame:
+    if not symbols:
+        return pd.DataFrame()
+    data = yf.download(
+        tickers=symbols,
+        period=period,
+        interval="1d",
+        group_by="column",
+        auto_adjust=False,
+        progress=False,
+        threads=True
+    )
+    return data
 
-# =========================
-# 4) 法人狀態（免費/模擬期：付費牆則 UNAVAILABLE）
-# =========================
-def _decide_inst_status(inst_df: pd.DataFrame, symbols: List[str], trade_date: str) -> Tuple[str, List[str], Optional[str]]:
-    if inst_df is None or inst_df.empty:
-        return "UNAVAILABLE", [], None
+def compute_features(data: pd.DataFrame, symbols: List[str], trade_date: date) -> pd.DataFrame:
+    """
+    回傳欄位：
+    Symbol, Name, Date, Close, Volume, MA20, MA60, MA_Bias(%), Vol_Ratio, Score, Predator_Tag
+    """
+    if data is None or data.empty:
+        return pd.DataFrame(columns=[
+            "Symbol","Name","Date","Close","Volume","MA_Bias","Vol_Ratio","Score","Predator_Tag"
+        ])
 
-    ready_any = False
+    name_map = load_name_map()
+    rows = []
+
+    # yfinance download 回來是 MultiIndex 欄位：('Close', '2330.TW') 或相反格式
+    # 這裡用 data["Close"][sym] 兼容常見格式
     for sym in symbols:
-        r = calc_inst_3d(inst_df, symbol=sym, trade_date=trade_date)
-        if r.get("Inst_Status") == "READY":
-            ready_any = True
-            break
+        try:
+            close = data["Close"][sym].dropna()
+            vol = data["Volume"][sym].dropna() if "Volume" in data else pd.Series(dtype=float)
 
-    dates_3d = []
+            if close.empty:
+                continue
+
+            # 找到 <= trade_date 的最後一筆（避免你看到 3 天前）
+            close_idx = close.index.date
+            mask = [d <= trade_date for d in close_idx]
+            close_use = close[mask]
+            if close_use.empty:
+                continue
+
+            last_dt = close_use.index[-1]
+            last_close = float(close_use.iloc[-1])
+
+            # volume 同步到同一天（可能缺）
+            last_vol = float(vol.loc[last_dt]) if (not vol.empty and last_dt in vol.index) else np.nan
+
+            ma20 = float(close_use.rolling(20).mean().iloc[-1]) if len(close_use) >= 20 else float(close_use.mean())
+            ma60 = float(close_use.rolling(60).mean().iloc[-1]) if len(close_use) >= 60 else float(close_use.mean())
+            ma_ref = ma20 if ma20 and not math.isnan(ma20) else ma60
+            ma_bias = ((last_close / ma_ref) - 1.0) * 100.0 if ma_ref else 0.0
+
+            # 20D 平均量
+            if not vol.empty:
+                vol_use = vol.loc[close_use.index]
+                v20 = float(vol_use.rolling(20).mean().iloc[-1]) if len(vol_use) >= 20 else float(vol_use.mean())
+                vol_ratio = (last_vol / v20) if (v20 and not math.isnan(last_vol)) else np.nan
+            else:
+                vol_ratio = np.nan
+
+            # 免費期 Score：以趨勢 + 量比做簡化
+            # 你要的是「能運作、可解釋、避免亂 LOW」
+            score = (ma_bias * 1.0) + (0.0 if math.isnan(vol_ratio) else (vol_ratio - 1.0) * 10.0)
+
+            # Tag（可在你後續 Arbiter 進一步嚴格化）
+            if ma_bias > 2 and (not math.isnan(vol_ratio) and vol_ratio > 1.2):
+                tag = "🟢起漲(確認)"
+            elif ma_bias > 0:
+                tag = "🟢起漲(觀望)"
+            else:
+                tag = "○觀察(觀望)"
+
+            rows.append({
+                "Symbol": sym,
+                "Name": name_map.get(sym, ""),
+                "Date": last_dt.date().isoformat(),
+                "Close": round(last_close, 4),
+                "Volume": (None if math.isnan(last_vol) else int(last_vol)),
+                "MA_Bias": round(ma_bias, 4),
+                "Vol_Ratio": (None if math.isnan(vol_ratio) else round(float(vol_ratio), 4)),
+                "Score": round(float(score), 2),
+                "Predator_Tag": tag,
+            })
+        except Exception:
+            continue
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    df = df.sort_values("Score", ascending=False).reset_index(drop=True)
+    df["Rank"] = np.arange(1, len(df) + 1)
+    return df
+
+# ----------------------------
+# 5) 安全呼叫 fetch_amount_total（防止參數不一致）
+# ----------------------------
+def safe_fetch_amount_total(trade_date: date, verify_ssl: bool) -> Dict:
+    """
+    兼容你 market_amount.py 可能是：
+    - fetch_amount_total() 無參數
+    - 或 fetch_amount_total(trade_date=..., verify_ssl=...)
+    - 或回傳 MarketAmount dataclass / dict
+    """
     try:
-        dates_3d = sorted(inst_df["date"].astype(str).unique().tolist())[-3:]
-    except Exception:
-        dates_3d = []
+        sig = inspect.signature(fetch_amount_total)
+        kwargs = {}
+        if "trade_date" in sig.parameters:
+            kwargs["trade_date"] = trade_date
+        if "verify_ssl" in sig.parameters:
+            kwargs["verify_ssl"] = verify_ssl
 
-    return ("READY" if ready_any else "PENDING"), dates_3d, (max(dates_3d) if dates_3d else None)
+        raw = fetch_amount_total(**kwargs)
 
+        # 統一成 dict
+        if isinstance(raw, dict):
+            return raw
+        if isinstance(raw, MarketAmount):
+            d = asdict(raw)
+            d["error"] = None
+            return d
 
-def _merge_institutional_into_df(df_top: pd.DataFrame, inst_df: pd.DataFrame, trade_date: str) -> pd.DataFrame:
-    out = df_top.copy()
-
-    if inst_df is None or inst_df.empty:
-        out["Institutional"] = [{"Inst_Status": "PENDING"} for _ in range(len(out))]
-        return out
-
-    inst_map: Dict[str, Any] = {}
-    for _, r in out.iterrows():
-        sym = str(r.get("Symbol", ""))
-        calc = calc_inst_3d(inst_df, symbol=sym, trade_date=trade_date)
-        inst_map[sym] = {
-            "Inst_Visual": calc.get("Inst_Status", "PENDING"),
-            "Inst_Net_3d": float(calc.get("Inst_Net_3d", 0.0)),
-            "Inst_Streak3": int(calc.get("Inst_Streak3", 0)),
-            "Inst_Dir3": calc.get("Inst_Dir3", "PENDING"),
-            "Inst_Status": calc.get("Inst_Status", "PENDING"),
+        # object 兼容
+        return {
+            "amount_twse": getattr(raw, "amount_twse", None),
+            "amount_tpex": getattr(raw, "amount_tpex", None),
+            "amount_total": getattr(raw, "amount_total", None),
+            "source_twse": getattr(raw, "source_twse", None),
+            "source_tpex": getattr(raw, "source_tpex", None),
+            "error": getattr(raw, "error", None),
+        }
+    except Exception as e:
+        return {
+            "amount_twse": None,
+            "amount_tpex": None,
+            "amount_total": None,
+            "source_twse": None,
+            "source_tpex": None,
+            "error": f"{type(e).__name__}: {e}",
         }
 
-    out["Institutional"] = out["Symbol"].astype(str).map(inst_map).fillna({"Inst_Status": "PENDING"})
-    return out
-
-
-# =========================
-# 5) 市場一句話（可讀版）
-# =========================
-def generate_market_comment(macro_overview: dict) -> str:
-    amount_total = macro_overview.get("amount_total")
-    amount_label = macro_overview.get("amount_norm_label", "UNKNOWN")
-    inst_status = macro_overview.get("inst_status", "UNAVAILABLE")
-    degraded_mode = bool(macro_overview.get("degraded_mode", False))
-
-    parts = []
-
-    if amount_total and str(amount_total).isdigit():
-        yi = int(amount_total) / 100_000_000
-        parts.append(f"成交金額（上市+上櫃）約 {yi:,.0f} 億；量能判定 {amount_label}。")
-    else:
-        parts.append("成交金額待更新。")
-
-    if inst_status == "READY":
-        parts.append("法人資料可用。")
-    elif inst_status == "PENDING":
-        parts.append("法人資料不足（未滿 3 日）。")
-    else:
-        parts.append("法人資料不可用（免費模擬期常見：付費牆/來源中斷）。")
-
-    if degraded_mode:
-        parts.append("裁決層已進入資料降級：禁止 BUY/TRIAL。")
-    else:
-        parts.append("裁決層允許依模式評估進場（仍以風控條件為準）。")
-
-    return " ".join(parts)
-
-
-# =========================
-# 6) 主程式
-# =========================
+# ----------------------------
+# 6) UI
+# ----------------------------
 def app():
-    st.set_page_config(page_title="Sunhero｜股市智能超盤中控台", layout="wide")
-    st.title("Sunhero｜股市智能超盤中控台")
-    st.caption("V15.7（免費/模擬期）｜開盤前顯示昨日 EOD + 最新全球市場摘要")
+    st.set_page_config(page_title=APP_TITLE, layout="wide")
+    st.title(APP_TITLE)
+    st.caption(f"{APP_VERSION}｜資料來源：yfinance +（可用時）TWSE/TPEx｜FinMind（付費則停用）")
 
     # Sidebar
-    market = st.sidebar.selectbox("Market", ["tw-share", "tw"], index=0)
-    session = st.sidebar.selectbox("Session", [SESSION_INTRADAY, SESSION_EOD], index=0)
+    st.sidebar.header("控制台")
+    market = st.sidebar.selectbox("Market", ["tw-share"], index=0)
+    session = st.sidebar.selectbox("Session", ["INTRADAY", "EOD"], index=0)
 
-    holdings_text = st.sidebar.text_input("持倉股（逗號分隔，例：2330,2317 或 2330.TW）", value="")
-    holdings = _parse_holdings(holdings_text)
-
-    verify_ssl = st.sidebar.checkbox("SSL 驗證（若抓官方資料出現奇怪憑證錯誤可關閉）", value=True)
-    run_btn = st.sidebar.button("Run")
-
-    if not run_btn:
-        st.info("按左側 Run 產生昨日/最新資料、Top20(+持倉) 與 AI JSON。")
-        return
-
-    # 1) Load market data
-    df = _load_market_csv(market)
-
-    # 2) 顯示交易日（以資料檔最新日期為準：開盤前就是昨日 EOD）
-    effective_dt = _get_latest_trade_date(df)
-    trade_date = _fmt_date(effective_dt)
-    st.info(f"目前台北時間：{_now_taipei().strftime('%Y-%m-%d %H:%M')}｜顯示交易日：{trade_date}")
-
-    # 3) 全球市場摘要
-    st.subheader("全球市場摘要（美股/日經/匯率）")
-    g = _load_global_market_summary()
-    st.dataframe(g, use_container_width=True)
-
-    # 4) 市場成交金額（上市+上櫃）
-    st.subheader("市場成交金額（上市 + 上櫃 = amount_total）")
-    ma = fetch_amount_total(
-        trade_date=pd.to_datetime(trade_date).to_pydatetime().replace(tzinfo=TZ_TAIPEI),
-        verify_ssl=verify_ssl,
+    holdings_raw = st.sidebar.text_input(
+        "持倉股（逗號分隔，例如：2330,2317 或 2330.TW）",
+        value=""
     )
+    holdings = parse_holdings(holdings_raw)
+
+    verify_ssl = st.sidebar.checkbox("SSL 驗證（若官方資料抓不到可先關閉）", value=True)
+
+    run = st.sidebar.button("Run", type="primary")
+
+    # --- 每次 Run 才刷新 cache（避免你一直看到舊資料）
+    if run:
+        st.cache_data.clear()
+
+    # --- trade_date：開盤前看昨日
+    trade_d = resolve_trade_date(session=session, now=now_taipei())
+
+    # 顯示當前時間與 trade_date
+    info_bar = st.container()
+    with info_bar:
+        st.info(
+            f"目前台北時間：{now_taipei().strftime('%Y-%m-%d %H:%M')}｜"
+            f"顯示交易日：{trade_d.isoformat()}（開盤前自動顯示昨日 EOD）"
+        )
+
+    # ----------------------------
+    # A) 全球市場摘要
+    # ----------------------------
+    st.subheader("全球市場摘要（美股/日經/匯率）")
+    gdf = fetch_global_summary()
+    st.dataframe(gdf, use_container_width=True)
+
+    # ----------------------------
+    # B) 市場成交金額（上市 + 上櫃）
+    # ----------------------------
+    st.subheader("市場成交金額（上市 + 上櫃 = amount_total）")
+
+    ma = safe_fetch_amount_total(trade_date=trade_d, verify_ssl=verify_ssl)
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("TWSE 上市", "待更新" if ma.amount_twse is None else f"{ma.amount_twse/100_000_000:,.0f} 億")
-    c2.metric("TPEx 上櫃", "待更新" if ma.amount_tpex is None else f"{ma.amount_tpex/100_000_000:,.0f} 億")
-    c3.metric("Total 合計", "待更新" if ma.amount_total is None else f"{ma.amount_total/100_000_000:,.0f} 億")
+    def _fmt_amt(v):
+        if v is None or (isinstance(v, float) and math.isnan(v)) or v == 0:
+            return "待更新"
+        return f"{int(v)/100_000_000:,.0f} 億"
+
+    c1.metric("TWSE 上市", _fmt_amt(ma.get("amount_twse")))
+    c2.metric("TPEx 上櫃", _fmt_amt(ma.get("amount_tpex")))
+    c3.metric("Total 合計", _fmt_amt(ma.get("amount_total")))
+
+    # 免費期：沒有可靠免費的 20D median（除非你把歷史 amount 落地）
     c4.metric("20D Median(代理)", "None")
 
-    amount_sources = {"twse": ma.source_twse, "tpex": ma.source_tpex, "error": ma.error}
-    st.caption(f"來源/錯誤：{amount_sources}")
+    st.caption(
+        f"來源/錯誤：{{'twse': {ma.get('source_twse')}, 'tpex': {ma.get('source_tpex')}, 'error': {ma.get('error')}}}"
+    )
 
-    # 5) INTRADAY 量能正規化（模擬期：無 20D 代理值 => UNKNOWN）
+    # ----------------------------
+    # C) INTRADAY 量能正規化（你要避免早盤動不動 LOW）
+    # ----------------------------
     st.subheader("INTRADAY 量能正規化（避免早盤誤判 LOW）")
-    norm = {"progress": None, "amount_norm_cum_ratio": None, "amount_norm_slice_ratio": None, "amount_norm_label": "UNKNOWN"}
-    st.code(json.dumps({
-        "progress": norm["progress"],
-        "cum_ratio(穩健型用)": norm["amount_norm_cum_ratio"],
-        "slice_ratio(保守型用)": norm["amount_norm_slice_ratio"],
-        "label": norm["amount_norm_label"],
-    }, ensure_ascii=False, indent=2), language="json")
 
-    # 6) Analyzer：產生 Top 清單
-    df_top, err = run_analysis(df, session=session)
-    if err:
-        st.error(f"Analyzer error: {err}")
-        return
+    # 免費期：若你沒有把 20D amount_total 的歷史存成檔案/DB，就只能 UNKNOWN
+    # 先設 None（不會炸），你日後可把 avg20_amount_total_median 接回來
+    avg20_amount_total_median = None
+    amount_prev = None  # 若你做 5 分鐘輪詢可帶入 prev
 
-    # 7) 補中文名
-    df_top = _ensure_names(df_top)
+    norm = intraday_norm(
+        amount_total_now=ma.get("amount_total") or 0,
+        amount_total_prev=amount_prev,
+        avg20_amount_total=avg20_amount_total_median,
+        alpha=0.65,
+    )
+    st.json({
+        "progress": norm.get("progress"),
+        "cum_ratio(穩健型用)": norm.get("amount_norm_cum_ratio"),
+        "slice_ratio(保守型用)": norm.get("amount_norm_slice_ratio"),
+        "label": norm.get("amount_norm_label"),
+    })
 
-    # 8) Top20 + 持倉（20+N）
-    df_top = _append_holdings_rows(df_top, df_all=df, holdings=holdings)
+    # ----------------------------
+    # D) Top20（Route A：免費/模擬期推薦）
+    # ----------------------------
+    st.subheader("Top List（Route A：Universe + 持倉 → 動態排名）")
 
-    # 9) 法人（FinMind 402 付費牆 => UNAVAILABLE，不崩）
-    symbols = df_top["Symbol"].astype(str).tolist()
-    inst_df = pd.DataFrame(columns=["date", "symbol", "net_amount"])
-    inst_fetch_error = None
+    # Universe + 持倉（你問過 20+1 的問題：這裡就是 20 + 持倉）
+    universe = list(DEFAULT_UNIVERSE_TW)
+    for s in holdings:
+        if s not in universe:
+            universe.append(s)
 
-    if fetch_finmind_institutional is None:
-        inst_fetch_error = "FinMind module import failed"
+    data = download_prices(universe, period="6mo")
+    df = compute_features(data, universe, trade_date=trade_d)
+
+    # Top20 + 持倉全部展示
+    # 你若要只顯示 Top20，可以 df.head(20)，但持倉仍要顯示，所以用標記
+    holdings_set = set(holdings)
+
+    if not df.empty:
+        df["Is_Holding"] = df["Symbol"].apply(lambda x: x in holdings_set)
+        # Top20 旗標：免費 Route A 的「Top20」指的是「此 Universe 的 Top20」
+        df["Top20_Flag"] = df["Rank"].apply(lambda r: r <= 20)
+        st.dataframe(df, use_container_width=True)
     else:
-        try:
-            start_date = (pd.to_datetime(trade_date) - pd.Timedelta(days=45)).strftime("%Y-%m-%d")
-            end_date = trade_date
-            inst_df = fetch_finmind_institutional(
-                symbols=symbols,
-                start_date=start_date,
-                end_date=end_date,
-                token=os.getenv("FINMIND_TOKEN", None),
-            )
-        except Exception as e:
-            inst_fetch_error = f"{type(e).__name__}: {str(e)}"
+        st.warning("無法取得候選股價格資料（可能是 yfinance 暫時失效或網路問題）。")
 
+    # ----------------------------
+    # E) Arbiter Input（你問：AI JSON 內有哪些數據）
+    # ----------------------------
+    st.subheader("Arbiter Input（JSON）")
+
+    # inst_status：免費期（FinMind 付費 402）→ UNAVAILABLE
     inst_status = "UNAVAILABLE"
-    inst_dates_3d: List[str] = []
-    data_date_finmind: Optional[str] = None
+    inst_dates_3d = []
 
-    if inst_fetch_error:
-        inst_status = "UNAVAILABLE"
-    else:
-        inst_status, inst_dates_3d, data_date_finmind = _decide_inst_status(inst_df, symbols, trade_date)
+    # degraded_mode：資料黑洞防線
+    amount_ok = (ma.get("amount_total") is not None and (ma.get("amount_total") or 0) > 0)
+    amount_label = norm.get("amount_norm_label", "UNKNOWN")
 
-    df_top2 = _merge_institutional_into_df(df_top, inst_df, trade_date=trade_date)
+    # 你的裁決要求：成交金額缺失 OR label UNKNOWN → 禁止 BUY/TRIAL
+    degraded_mode = (not amount_ok) or (amount_label == "UNKNOWN") or (inst_status != "READY")
 
-    # 10) V15.7 裁決層：degraded_mode 絕對防線
-    amount_ok = (ma.amount_total is not None and ma.amount_total > 0)
-
-    degraded_mode = False
+    market_comment = []
     if not amount_ok:
-        degraded_mode = True
-    if inst_status == "UNAVAILABLE":
-        degraded_mode = True
+        market_comment.append("成交金額待更新")
+    if amount_label == "UNKNOWN":
+        market_comment.append("量能正規化標籤=UNKNOWN（缺 20D 代理）")
+    if inst_status != "READY":
+        market_comment.append("法人資料不可用（免費期）")
 
-    macro_overview = {
-        "amount_twse": "待更新" if ma.amount_twse is None else str(ma.amount_twse),
-        "amount_tpex": "待更新" if ma.amount_tpex is None else str(ma.amount_tpex),
-        "amount_total": "待更新" if ma.amount_total is None else str(ma.amount_total),
-        "amount_sources": amount_sources,
-        "avg20_amount_total_median": None,
-        "progress": norm["progress"],
-        "amount_norm_cum_ratio": norm["amount_norm_cum_ratio"],
-        "amount_norm_slice_ratio": norm["amount_norm_slice_ratio"],
-        "amount_norm_label": norm["amount_norm_label"],
-        "inst_net": "A:0.00億 | B:0.00億",
-        "trade_date": trade_date,
-        "inst_status": inst_status,
-        "inst_dates_3d": inst_dates_3d,
-        "data_date_finmind": data_date_finmind,
-        "kill_switch": False,
-        "v14_watch": False,
-        "degraded_mode": degraded_mode,
-        "data_mode": "INTRADAY" if session == SESSION_INTRADAY else "EOD",
-        "amount": "待更新" if ma.amount_total is None else str(ma.amount_total),
+    if degraded_mode:
+        market_comment.append("裁決層進入資料降級：禁止 BUY/TRIAL")
+
+    arbiter = {
+        "meta": {
+            "system": "Predator V15.7 (Route A Free/Sim)",
+            "market": market,
+            "timestamp": now_taipei().strftime("%Y-%m-%d %H:%M"),
+            "session": session,
+        },
+        "macro": {
+            "overview": {
+                "amount_twse": ma.get("amount_twse"),
+                "amount_tpex": ma.get("amount_tpex"),
+                "amount_total": ma.get("amount_total"),
+                "amount_sources": {
+                    "twse": ma.get("source_twse"),
+                    "tpex": ma.get("source_tpex"),
+                    "error": ma.get("error"),
+                },
+                "avg20_amount_total_median": avg20_amount_total_median,
+                "progress": norm.get("progress"),
+                "amount_norm_cum_ratio": norm.get("amount_norm_cum_ratio"),
+                "amount_norm_slice_ratio": norm.get("amount_norm_slice_ratio"),
+                "amount_norm_label": amount_label,
+                "trade_date": trade_d.isoformat(),
+                "inst_status": inst_status,
+                "inst_dates_3d": inst_dates_3d,
+                "kill_switch": False,
+                "v14_watch": False,
+                "degraded_mode": degraded_mode,
+                "data_mode": session,
+                "market_comment": "；".join(market_comment) if market_comment else "資料正常",
+            }
+        },
+        "toplist": [] if df.empty else df.head(20).to_dict(orient="records"),
+        "holdings": holdings,
+        "global_summary": gdf.to_dict(orient="records"),
     }
 
-    macro_overview["market_comment"] = generate_market_comment(macro_overview)
+    st.json(arbiter)
 
-    st.subheader("今日市場狀態判斷（V15.7 裁決）")
-    st.info(macro_overview["market_comment"])
-
-    if inst_fetch_error:
-        st.warning(f"個股法人資料抓取失敗（模擬期可接受）：{inst_fetch_error}")
-
-    # 11) Assemble JSON for Arbiter
-    macro_data = {"overview": macro_overview, "indices": []}
-    json_text = generate_ai_json(df_top2, market=market, session=session, macro_data=macro_data)
-
-    # 12) Top List（含中文名）
-    st.subheader("Top List（Top20 + 持倉 20+N）")
-    st.dataframe(df_top2, use_container_width=True)
-
-    st.subheader("AI JSON（Arbiter Input）")
-    st.code(json_text, language="json")
-
-    # 13) save（雲端可能限制寫入，失敗也不致命）
-    outname = f"ai_payload_{market}_{trade_date.replace('-', '')}_{session.lower()}.json"
-    try:
-        with open(outname, "w", encoding="utf-8") as f:
-            f.write(json_text)
-        st.success(f"JSON 已輸出：{outname}")
-    except Exception as e:
-        st.warning(f"JSON 寫檔失敗（雲端環境可能限制寫入）：{type(e).__name__}: {str(e)}")
-
+    # 最後提示：你要的「昨日台股 + 最新美股」的可靠性關鍵
+    st.caption(
+        "說明：開盤前顯示昨日 EOD（trade_date 自動回退）；"
+        "全球摘要採 yfinance 最新收盤；"
+        "成交金額若官方抓不到將顯示待更新但不影響 UI。"
+    )
 
 if __name__ == "__main__":
     app()
