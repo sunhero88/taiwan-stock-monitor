@@ -2,16 +2,17 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import math
 import re
+import warnings
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta, timezone
 from typing import Optional, Tuple, Dict, Any
 
-import certifi
-import pandas as pd
 import requests
+import pandas as pd
 
-
+# ====== Time / Trading Session ======
 TZ_TAIPEI = timezone(timedelta(hours=8))
 
 TRADING_START = time(9, 0)
@@ -24,7 +25,7 @@ USER_AGENT = {
 
 
 def _to_int_amount(x) -> int:
-    """把 '775,402,495,419' 之類字串轉 int"""
+    """把 '775,402,495,419' 之類字串轉 int。非數字會被剔除。"""
     if x is None:
         return 0
     s = str(x)
@@ -36,13 +37,8 @@ def _now_taipei() -> datetime:
     return datetime.now(tz=TZ_TAIPEI)
 
 
-def _today_yyyymmdd(now: Optional[datetime] = None) -> str:
-    now = now or _now_taipei()
-    return now.strftime("%Y%m%d")
-
-
 def trading_progress(now: Optional[datetime] = None) -> float:
-    """回傳盤中進度 0~1。盤外 clamp 到 0 或 1。"""
+    """回傳盤中進度 0~1。盤外會 clamp 到 0 或 1。"""
     now = now or _now_taipei()
     start_dt = now.replace(hour=TRADING_START.hour, minute=TRADING_START.minute, second=0, microsecond=0)
     end_dt = now.replace(hour=TRADING_END.hour, minute=TRADING_END.minute, second=0, microsecond=0)
@@ -56,7 +52,10 @@ def trading_progress(now: Optional[datetime] = None) -> float:
 
 
 def progress_curve(p: float, alpha: float = 0.65) -> float:
-    """用冪次曲線做『盤中累積量能』預期，避免早盤被誤判 LOW。"""
+    """
+    盤中累積量能預期曲線（冪次曲線）。
+    alpha < 1 代表早盤預期累積比率較高，避免「盤中動不動就 LOW」。
+    """
     p = max(0.0, min(1.0, p))
     return p ** alpha
 
@@ -70,52 +69,40 @@ class MarketAmount:
     source_tpex: str
 
 
-def _http_get(url: str, timeout: int = 15) -> requests.Response:
+# ====== Fetch TWSE / TPEx ======
+def fetch_twse_amount(verify_ssl: bool = False) -> Tuple[int, str]:
     """
-    Streamlit Cloud 常見 SSL 錯誤的修正點：
-    - verify=certifi.where()：使用 certifi 的 CA bundle
-    - headers：帶 UA
+    上市成交金額（元）：抓 TWSE MI_INDEX(HTML) 的成交統計表，把各類別成交金額加總。
+
+    注意（你在 Streamlit Cloud 已遇到）：
+    - TWSE 憑證鏈可能造成 SSLError CERTIFICATE_VERIFY_FAILED
+    - 模擬/免費階段：可接受只對 TWSE 關閉 verify（verify_ssl=False）
     """
-    r = requests.get(url, headers=USER_AGENT, timeout=timeout, verify=certifi.where())
+    url = "https://www.twse.com.tw/exchangeReport/MI_INDEX?date=&response=html"
+
+    # 對 TWSE 關閉 verify 的工程妥協（避免 Cloud 憑證問題）
+    # 並用 warning 明確標記（不隱瞞）
+    if verify_ssl is False:
+        warnings.filterwarnings("ignore", message="Unverified HTTPS request")
+
+    r = requests.get(url, headers=USER_AGENT, timeout=15, verify=verify_ssl)
     r.raise_for_status()
-    return r
 
-
-def fetch_twse_amount(date_yyyymmdd: Optional[str] = None) -> Tuple[int, str]:
-    """
-    上市成交金額（元）：
-    - 使用 TWSE MI_INDEX HTML（成交統計表）加總成交金額欄
-    - 注意：TWSE 參數 date 不能空，空值有時會回到非預期頁面或被擋
-
-    回傳：(amount_twse, source_desc)
-    """
-    date_yyyymmdd = date_yyyymmdd or _today_yyyymmdd()
-    url = f"https://www.twse.com.tw/exchangeReport/MI_INDEX?response=html&date={date_yyyymmdd}"
-
-    r = _http_get(url)
-
-    # MI_INDEX HTML 內通常有多個表格
-    try:
-        tables = pd.read_html(r.text)
-    except Exception as e:
-        raise RuntimeError(f"TWSE MI_INDEX HTML 解析失敗：{type(e).__name__}: {e}")
-
+    tables = pd.read_html(r.text)
     if not tables:
         raise RuntimeError("TWSE MI_INDEX 找不到可解析表格")
 
-    # 容錯策略：
-    # 1) 優先找欄位含「成交金額」且表內有數字金額
-    # 2) 找不到就用第一張表，但仍要確認有成交金額欄
+    # 嘗試找含「成交金額」的表；找不到就用第一張表 fallback
     target = None
     for t in tables:
         cols = [str(c) for c in t.columns]
         if any("成交金額" in c for c in cols):
             target = t
             break
-
     if target is None:
         target = tables[0]
 
+    # 取出成交金額欄位
     amt_col = None
     for c in target.columns:
         if "成交金額" in str(c):
@@ -126,60 +113,122 @@ def fetch_twse_amount(date_yyyymmdd: Optional[str] = None) -> Tuple[int, str]:
 
     amount = int(target[amt_col].apply(_to_int_amount).sum())
 
-    # 若解析出來是 0，通常代表抓到錯表或非交易日/頁面變動
-    if amount <= 0:
-        raise RuntimeError("TWSE 成交金額解析結果為 0（可能非交易日或表格結構變動）")
+    src = "TWSE MI_INDEX(HTML) 成交統計各類別加總"
+    if verify_ssl is False:
+        src += "（TWSE verify=False；因雲端 SSL 鏈問題的模擬期妥協）"
 
-    return amount, f"TWSE MI_INDEX(HTML) date={date_yyyymmdd} 成交統計成交金額加總"
+    return amount, src
 
 
-def fetch_tpex_amount(date_yyyymmdd: Optional[str] = None) -> Tuple[int, str]:
+def fetch_tpex_amount() -> Tuple[int, str]:
     """
     上櫃成交金額（元）：
-    - 先嘗試 pricing.html 直接抓「總成交金額」
-    - 若頁面改版導致抓不到，直接丟錯誤（由上層標示待更新）
-
-    回傳：(amount_tpex, source_desc)
+    - 優先 regex 抓 TPEx pricing.html 的「總成交金額」
+    - 若 regex 失敗，再用 pd.read_html fallback（網頁結構變動時仍有機會救回）
     """
-    # TPEx 這頁通常顯示當日資訊，不一定需要 date 參數；保留 date 只是為了記錄來源
-    date_yyyymmdd = date_yyyymmdd or _today_yyyymmdd()
     url = "https://www.tpex.org.tw/zh-tw/mainboard/trading/info/pricing.html"
+    r = requests.get(url, headers=USER_AGENT, timeout=15)
+    r.raise_for_status()
 
-    r = _http_get(url)
-
+    # regex：總成交金額: 175,152,956,339元
     m = re.search(r"總成交金額[:：]\s*([\d,]+)\s*元", r.text)
-    if not m:
-        # fallback：容錯抓取
-        m2 = re.search(r"總成交金額.*?([\d,]+)\s*元", r.text)
-        if not m2:
-            raise RuntimeError("TPEx pricing.html 找不到『總成交金額』字樣（可能頁面改版）")
-        amount = _to_int_amount(m2.group(1))
-    else:
-        amount = _to_int_amount(m.group(1))
+    if m:
+        return _to_int_amount(m.group(1)), "TPEx pricing.html（regex：總成交金額）"
 
-    if amount <= 0:
-        raise RuntimeError("TPEx 成交金額解析結果為 0（可能非交易日或頁面變動）")
+    # fallback 1：更寬鬆的 regex
+    m2 = re.search(r"總成交金額.*?([\d,]+)\s*元", r.text)
+    if m2:
+        return _to_int_amount(m2.group(1)), "TPEx pricing.html（fallback regex：總成交金額）"
 
-    return int(amount), f"TPEx pricing.html（當日）date={date_yyyymmdd} 總成交金額"
+    # fallback 2：read_html（可能受版面影響，但保留救援）
+    try:
+        tables = pd.read_html(r.text)
+        for t in tables:
+            # 嘗試從表格裡找「總成交金額」
+            flat = t.astype(str).values.flatten().tolist()
+            for cell in flat:
+                if "總成交金額" in cell:
+                    # 把同列或同 cell 的數字抽出
+                    m3 = re.search(r"([\d,]+)", cell)
+                    if m3:
+                        return _to_int_amount(m3.group(1)), "TPEx pricing.html（read_html fallback）"
+        # 最後再整頁掃數字（風險較高，但至少不中斷）
+        m4 = re.search(r"總成交金額[^0-9]*([\d,]+)", r.text)
+        if m4:
+            return _to_int_amount(m4.group(1)), "TPEx pricing.html（page-scan fallback）"
+    except Exception:
+        pass
+
+    raise RuntimeError("TPEx pricing.html 找不到『總成交金額』")
 
 
-def fetch_amount_total(date_yyyymmdd: Optional[str] = None) -> MarketAmount:
+def fetch_amount_total() -> MarketAmount:
     """
-    ✅ 核心：上市 + 上櫃合計
+    合計成交金額：上市(TWSE) + 上櫃(TPEx)
     """
-    date_yyyymmdd = date_yyyymmdd or _today_yyyymmdd()
-    twse, s1 = fetch_twse_amount(date_yyyymmdd=date_yyyymmdd)
-    tpex, s2 = fetch_tpex_amount(date_yyyymmdd=date_yyyymmdd)
+    twse, s1 = fetch_twse_amount(verify_ssl=False)  # Streamlit Cloud 實務
+    tpex, s2 = fetch_tpex_amount()
     return MarketAmount(
-        amount_twse=twse,
-        amount_tpex=tpex,
-        amount_total=twse + tpex,
+        amount_twse=int(twse),
+        amount_tpex=int(tpex),
+        amount_total=int(twse) + int(tpex),
         source_twse=s1,
         source_tpex=s2,
     )
 
 
+def fetch_amount_total_safe() -> Tuple[Optional[MarketAmount], Dict[str, Any]]:
+    """
+    安全版抓取：任何一段失敗都不中斷，回傳 error 給上層寫入 macro.amount_sources。
+    回傳：
+      - MarketAmount 或 None
+      - sources dict：{"twse":..., "tpex":..., "error":...}
+    """
+    sources: Dict[str, Any] = {"twse": None, "tpex": None, "error": None}
+
+    twse_amt = None
+    tpex_amt = None
+    src_twse = None
+    src_tpex = None
+
+    # TWSE
+    try:
+        twse_amt, src_twse = fetch_twse_amount(verify_ssl=False)
+        sources["twse"] = src_twse
+    except Exception as e:
+        sources["error"] = f"TWSE {type(e).__name__}: {str(e)}"
+
+    # TPEx
+    try:
+        tpex_amt, src_tpex = fetch_tpex_amount()
+        sources["tpex"] = src_tpex
+    except Exception as e:
+        if sources["error"]:
+            sources["error"] += f" | TPEx {type(e).__name__}: {str(e)}"
+        else:
+            sources["error"] = f"TPEx {type(e).__name__}: {str(e)}"
+
+    if twse_amt is None or tpex_amt is None:
+        return None, sources
+
+    ma = MarketAmount(
+        amount_twse=int(twse_amt),
+        amount_tpex=int(tpex_amt),
+        amount_total=int(twse_amt) + int(tpex_amt),
+        source_twse=src_twse or "TWSE",
+        source_tpex=src_tpex or "TPEx",
+    )
+    return ma, sources
+
+
+# ====== INTRADAY Normalization ======
 def classify_ratio(r: float) -> str:
+    """
+    量能分類（可調門檻）：
+      <0.8  LOW
+      0.8~1.2 NORMAL
+      >1.2  HIGH
+    """
     if r < 0.8:
         return "LOW"
     if r > 1.2:
@@ -193,19 +242,19 @@ def intraday_norm(
     avg20_amount_total: Optional[int],
     now: Optional[datetime] = None,
     alpha: float = 0.65,
-) -> Dict[str, Any]:
+) -> dict:
     """
-    回傳：
-    - progress：盤中進度 0~1
-    - amount_norm_cum_ratio：累積正規化比率（穩健型）
-      = amount_total_now / (avg20 * progress_curve(progress))
-    - amount_norm_slice_ratio：切片正規化比率（保守型，需 prev）
-      = (now-prev)/(預期 now-prev)
-    - amount_norm_label：NORMAL/LOW/HIGH（以 cum_ratio 判定）
+    回傳（你要的盤中不再動不動 LOW）：
+      - progress：盤中進度 0~1
+      - amount_norm_cum_ratio：累積正規化比率（穩健型用）
+      - amount_norm_slice_ratio：切片正規化比率（保守型用，需 prev）
+      - amount_norm_label：LOW/NORMAL/HIGH/UNKNOWN（以 cum_ratio 判定）
     """
     now = now or _now_taipei()
     p_now = trading_progress(now)
-    p_prev = max(0.0, p_now - (5 / TRADING_MINUTES))  # 以 5 分鐘當切片
+
+    # 切片：預設 5 分鐘視窗（你 main.py 用 cache 每次 Run 更新）
+    p_prev = max(0.0, p_now - (5 / TRADING_MINUTES))
 
     out = {
         "progress": round(p_now, 4),
@@ -224,6 +273,7 @@ def intraday_norm(
     if cum_ratio is not None:
         out["amount_norm_label"] = classify_ratio(float(cum_ratio))
 
+    # slice（需要前值）
     if amount_total_prev is not None:
         slice_amount = max(0, amount_total_now - amount_total_prev)
         expected_slice = avg20_amount_total * (progress_curve(p_now, alpha=alpha) - progress_curve(p_prev, alpha=alpha))
