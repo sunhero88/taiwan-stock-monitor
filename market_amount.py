@@ -2,267 +2,298 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
-from datetime import datetime, time, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date
 from typing import Optional, Tuple, Dict, Any
 
 import requests
 
 TZ_TAIPEI = timezone(timedelta(hours=8))
 
-TRADING_START = time(9, 0)
-TRADING_END = time(13, 30)
-TRADING_MINUTES = 270  # 09:00~13:30
-
 USER_AGENT = {
     "User-Agent": "Mozilla/5.0 (compatible; SunheroStockBot/1.0; +https://github.com/)"
 }
 
-
-def _now_taipei() -> datetime:
-    return datetime.now(tz=TZ_TAIPEI)
+CACHE_PATH = "data/market_amount_cache.json"
 
 
-def trading_progress(now: Optional[datetime] = None) -> float:
-    """回傳盤中進度 0~1。盤外 clamp 到 0 或 1。"""
-    now = now or _now_taipei()
-    start_dt = now.replace(hour=TRADING_START.hour, minute=TRADING_START.minute, second=0, microsecond=0)
-    end_dt = now.replace(hour=TRADING_END.hour, minute=TRADING_END.minute, second=0, microsecond=0)
-
-    if now <= start_dt:
-        return 0.0
-    if now >= end_dt:
-        return 1.0
-    elapsed = (now - start_dt).total_seconds() / 60.0
-    return max(0.0, min(1.0, elapsed / TRADING_MINUTES))
+def _today_taipei() -> date:
+    return datetime.now(tz=TZ_TAIPEI).date()
 
 
-def progress_curve(p: float, alpha: float = 0.65) -> float:
-    """用冪次曲線做『盤中累積量能』預期，避免早盤誤判 LOW。"""
-    p = max(0.0, min(1.0, p))
-    return p ** alpha
+def _yyyymmdd(d: date) -> str:
+    return d.strftime("%Y%m%d")
 
 
-def classify_ratio(r: float) -> str:
-    if r < 0.8:
-        return "LOW"
-    if r > 1.2:
-        return "HIGH"
-    return "NORMAL"
+def _roc_yyy_mm_dd(d: date) -> str:
+    # TPEx 有些 API 用民國年格式：114/01/29
+    roc_year = d.year - 1911
+    return f"{roc_year:03d}/{d.month:02d}/{d.day:02d}"
+
+
+def _safe_int(x: Any) -> int:
+    if x is None:
+        return 0
+    s = str(x)
+    s = re.sub(r"[^\d]", "", s)
+    return int(s) if s else 0
 
 
 @dataclass
 class MarketAmount:
+    trade_date: str          # YYYYMMDD
     amount_twse: Optional[int]
     amount_tpex: Optional[int]
     amount_total: Optional[int]
     source_twse: Optional[str]
     source_tpex: Optional[str]
-    error: Optional[str] = None
+    warning: Optional[str] = None
 
 
-def _safe_int(x: Any) -> Optional[int]:
+def _load_cache() -> Optional[Dict[str, Any]]:
     try:
-        if x is None:
-            return None
-        return int(x)
+        with open(CACHE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
     except Exception:
         return None
 
 
-# -----------------------------
-# 免費來源（多路備援）
-# 優先順序：
-# 1) TWSE JSON / TPEx JSON（若成功 => 最接近官方）
-# 2) Yahoo 股市首頁（同頁通常有 上市成交 / 上櫃成交）
-# -----------------------------
+def _save_cache(payload: Dict[str, Any]) -> None:
+    # Streamlit Cloud 若資料夾不存在，會炸；所以要確保 data/ 有在 repo
+    try:
+        import os
+        os.makedirs("data", exist_ok=True)
+        with open(CACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+    except Exception:
+        # cache 寫入失敗不應中斷程式
+        pass
 
-def fetch_twse_amount_official(date_yyyymmdd: str, verify_ssl: bool = True) -> Tuple[int, str]:
+
+# -------------------------
+# TWSE：官方 JSON（建議）
+# -------------------------
+def fetch_twse_amount_json(trade_date: date, verify_ssl: bool = True, timeout: int = 15) -> Tuple[int, str]:
     """
-    TWSE 官方：MI_INDEX response=json
-    注意：不同日期/版本 fields 可能變動，所以採「欄位名稱搜尋 + 加總」策略。
+    取「上市成交金額(元)」：TWSE MI_INDEX JSON
+    目標：取出「成交統計」表中的「成交金額(元)」欄並加總
     """
-    url = f"https://www.twse.com.tw/exchangeReport/MI_INDEX?response=json&date={date_yyyymmdd}&type=ALL"
-    r = requests.get(url, headers=USER_AGENT, timeout=15, verify=verify_ssl)
+    ymd = _yyyymmdd(trade_date)
+    url = f"https://www.twse.com.tw/exchangeReport/MI_INDEX?response=json&date={ymd}&type=ALL"
+    r = requests.get(url, headers=USER_AGENT, timeout=timeout, verify=verify_ssl)
     r.raise_for_status()
-    j = r.json()
+    js = r.json()
 
-    # 可能在 j['data1'] 或 j['data']，欄位在 j['fields1'] 或 j['fields']
-    fields = j.get("fields1") or j.get("fields") or []
-    data = j.get("data1") or j.get("data") or []
+    stat = js.get("stat", "")
+    if "沒有符合條件" in stat or "查無資料" in stat:
+        raise RuntimeError(f"TWSE 無資料: {stat}")
+
+    # MI_INDEX JSON 常見欄位：fields1 + data1（成交統計）
+    fields = js.get("fields1") or []
+    data = js.get("data1") or []
+
+    if not fields or not data:
+        # fallback：有些版本欄位名不同
+        fields = js.get("fields") or fields
+        data = js.get("data") or data
+
+    if not fields or not data:
+        raise RuntimeError("TWSE MI_INDEX(JSON) 結構異常，找不到 fields/data")
 
     # 找「成交金額」欄位 index
-    col_idx = None
+    amt_idx = None
     for i, f in enumerate(fields):
         if "成交金額" in str(f):
-            col_idx = i
+            amt_idx = i
             break
-    if col_idx is None:
-        raise RuntimeError("TWSE JSON 找不到『成交金額』欄位")
+    if amt_idx is None:
+        raise RuntimeError("TWSE MI_INDEX(JSON) 找不到『成交金額』欄位")
 
     total = 0
     for row in data:
-        if not isinstance(row, (list, tuple)) or len(row) <= col_idx:
+        if not isinstance(row, list) or len(row) <= amt_idx:
             continue
-        s = str(row[col_idx])
-        s = re.sub(r"[^\d]", "", s)
-        if s:
-            total += int(s)
+        total += _safe_int(row[amt_idx])
 
     if total <= 0:
-        raise RuntimeError("TWSE JSON 成交金額加總為 0（可能欄位結構改版）")
+        raise RuntimeError("TWSE 成交金額加總為 0，疑似欄位變更或資料異常")
 
-    return total, "TWSE MI_INDEX (response=json) 成交金額欄位加總"
+    return total, f"TWSE MI_INDEX(JSON) date={ymd} 成交統計加總"
 
 
-def fetch_tpex_amount_official(date_roc_slash: str, verify_ssl: bool = True) -> Tuple[int, str]:
+# -------------------------
+# TPEx：優先 OpenAPI，失敗才網頁 regex
+# -------------------------
+def fetch_tpex_amount_openapi(trade_date: date, verify_ssl: bool = True, timeout: int = 15) -> Tuple[int, str]:
     """
-    TPEx 官方：stk_quote_result.php（每日行情摘要）
-    date_roc_slash 例：114/01/28（民國/斜線）
-    回傳資料常含總成交金額欄位（可能在 'aaData' or 'tables'）
+    嘗試用 TPEx OpenAPI 取得上櫃總成交金額(元)
+    注意：TPEx OpenAPI 的端點可能調整，這裡做多重 fallback。
     """
-    url = f"https://www.tpex.org.tw/web/stock/aftertrading/daily_close_quotes/stk_quote_result.php?l=zh-tw&d={date_roc_slash}&_=0"
-    r = requests.get(url, headers=USER_AGENT, timeout=15, verify=verify_ssl)
+    # fallback 1：常見 openapi endpoint（若失效會拋例外，交給上層回溯）
+    # 這個端點在不同時期可能不同；用「可失敗」設計即可。
+    ymd = _roc_yyy_mm_dd(trade_date)
+
+    candidates = [
+        # 某些版本提供「盤後資訊」彙總（JSON）
+        f"https://www.tpex.org.tw/openapi/v1/tpex_mainboard_pricing?date={ymd}",
+        f"https://www.tpex.org.tw/openapi/v1/tpex_pricing?date={ymd}",
+    ]
+
+    last_err = None
+    for url in candidates:
+        try:
+            r = requests.get(url, headers=USER_AGENT, timeout=timeout, verify=verify_ssl)
+            r.raise_for_status()
+            js = r.json()
+
+            # js 可能是 list[dict] 或 dict
+            # 我們尋找任何 key 包含「總成交金額」
+            if isinstance(js, dict):
+                items = [js]
+            elif isinstance(js, list):
+                items = js
+            else:
+                items = []
+
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                for k, v in it.items():
+                    if "總成交金額" in str(k) or "成交金額" in str(k):
+                        amt = _safe_int(v)
+                        if amt > 0:
+                            return amt, f"TPEx OpenAPI {url}"
+            # 若找不到，視為失敗繼續試下一個
+            last_err = RuntimeError(f"TPEx OpenAPI 格式未含成交金額: {url}")
+
+        except Exception as e:
+            last_err = e
+            continue
+
+    raise RuntimeError(f"TPEx OpenAPI 全部失敗: {last_err}")
+
+
+def fetch_tpex_amount_web(trade_date: date, verify_ssl: bool = True, timeout: int = 15) -> Tuple[int, str]:
+    """
+    TPEx 網頁 regex（最後手段）
+    """
+    url = "https://www.tpex.org.tw/zh-tw/mainboard/trading/info/pricing.html"
+    r = requests.get(url, headers=USER_AGENT, timeout=timeout, verify=verify_ssl)
     r.raise_for_status()
-    j = r.json()
+    text = r.text
 
-    # 常見：j['aaData'] 為個股表；總成交金額有時在 j['reportDate'] 周邊或其他欄位
-    # 這裡採較保守：從整包 JSON 轉字串找「總成交金額」或「成交金額」樣式數字
-    txt = str(j)
-    m = re.search(r"(總成交金額|成交金額).{0,20}?([0-9][0-9,]{5,})", txt)
+    m = re.search(r"總成交金額[:：]\s*([\d,]+)\s*元", text)
     if not m:
-        raise RuntimeError("TPEx JSON 找不到『總成交金額/成交金額』資訊（可能結構改版）")
-    amt = re.sub(r"[^\d]", "", m.group(2))
-    if not amt:
-        raise RuntimeError("TPEx JSON 成交金額解析失敗")
-    return int(amt), "TPEx stk_quote_result.php (JSON) 解析總成交金額"
+        m = re.search(r"總成交金額.*?([\d,]+)\s*元", text)
+    if not m:
+        raise RuntimeError("TPEx pricing.html 找不到『總成交金額』")
+
+    amt = _safe_int(m.group(1))
+    if amt <= 0:
+        raise RuntimeError("TPEx 總成交金額解析為 0")
+    return amt, "TPEx pricing.html regex 總成交金額"
 
 
-def fetch_amount_from_yahoo_home(verify_ssl: bool = True) -> Tuple[int, int, str, str]:
-    """
-    Yahoo 股市首頁常同頁提供：
-    - 上市 成交 xxxx.xx 億
-    - 上櫃 成交 xxxx.xx 億
-    若頁面改成 JS 動態，可能失敗，所以只做備援。
-    """
-    url = "https://tw.stock.yahoo.com/"
-    r = requests.get(url, headers=USER_AGENT, timeout=15, verify=verify_ssl)
-    r.raise_for_status()
-    html = r.text
-
-    # 嘗試抓「上市」區塊的成交（億）
-    # 以你截圖的呈現，常見 "成交5714.84億" 這種格式
-    m_twse = re.search(r"上市[\s\S]{0,300}?成交\s*([0-9]+(?:\.[0-9]+)?)\s*億", html)
-    m_tpex = re.search(r"上櫃[\s\S]{0,300}?成交\s*([0-9]+(?:\.[0-9]+)?)\s*億", html)
-
-    if not m_twse or not m_tpex:
-        raise RuntimeError("Yahoo 首頁未找到 上市/上櫃 成交（可能改為動態載入）")
-
-    twse_yi = float(m_twse.group(1))
-    tpex_yi = float(m_tpex.group(1))
-
-    twse_amt = int(twse_yi * 100_000_000)  # 1 億 = 1e8
-    tpex_amt = int(tpex_yi * 100_000_000)
-
-    return twse_amt, tpex_amt, "Yahoo 股市首頁（上市成交）", "Yahoo 股市首頁（上櫃成交）"
+def fetch_tpex_amount(trade_date: date, verify_ssl: bool = True, timeout: int = 15) -> Tuple[int, str]:
+    # 顯式多路徑：OpenAPI -> Web
+    try:
+        return fetch_tpex_amount_openapi(trade_date, verify_ssl=verify_ssl, timeout=timeout)
+    except Exception:
+        return fetch_tpex_amount_web(trade_date, verify_ssl=verify_ssl, timeout=timeout)
 
 
-def fetch_amount_total(
-    trade_date: Optional[datetime] = None,
+# -------------------------
+# 回溯：找最後可用交易日
+# -------------------------
+def fetch_amount_total_latest(
+    base_date: Optional[date] = None,
+    lookback_days: int = 10,
     verify_ssl: bool = True,
+    timeout: int = 15,
 ) -> MarketAmount:
     """
-    回傳 amount_twse / amount_tpex / amount_total
-    - trade_date：預設取台北時間「今日」，但在開盤前你可能希望抓「昨日」=> 由 main.py 決定傳入哪天
-    - verify_ssl：若 Streamlit Cloud 或中繼 SSL 出現奇怪憑證錯誤，可暫時設 False（模擬期可接受）
+    目標：取得「最新可用交易日」的成交金額（上市+上櫃）
+    - 若 base_date 是今天：會從今天往回找
+    - 成功後寫入 cache
+    - 全失敗：回傳 cache（若有），並附 warning
     """
-    td = trade_date or _now_taipei()
-    ymd = td.strftime("%Y%m%d")
+    base_date = base_date or _today_taipei()
 
-    # TPEx 要民國格式：114/01/28
-    roc_year = td.year - 1911
-    roc = f"{roc_year:03d}/{td.month:02d}/{td.day:02d}"
+    last_err = None
+    for i in range(lookback_days + 1):
+        d = base_date - timedelta(days=i)
+        ymd = _yyyymmdd(d)
 
-    # 1) 官方優先（若 SSL 失敗，可由 main.py 改 verify_ssl=False）
-    try:
-        twse, s1 = fetch_twse_amount_official(ymd, verify_ssl=verify_ssl)
-        tpex, s2 = fetch_tpex_amount_official(roc, verify_ssl=verify_ssl)
-        return MarketAmount(
-            amount_twse=twse,
-            amount_tpex=tpex,
-            amount_total=twse + tpex,
-            source_twse=s1,
-            source_tpex=s2,
-            error=None,
-        )
-    except Exception as e1:
-        # 2) Yahoo 備援
+        twse_amt = None
+        tpex_amt = None
+        s_twse = None
+        s_tpex = None
+
+        # TWSE
         try:
-            twse2, tpex2, s1b, s2b = fetch_amount_from_yahoo_home(verify_ssl=verify_ssl)
+            twse_amt, s_twse = fetch_twse_amount_json(d, verify_ssl=verify_ssl, timeout=timeout)
+        except Exception as e:
+            last_err = e
+
+        # TPEx
+        try:
+            tpex_amt, s_tpex = fetch_tpex_amount(d, verify_ssl=verify_ssl, timeout=timeout)
+        except Exception as e:
+            last_err = e
+
+        # 成功條件：至少一邊有值，且總和 > 0（模擬期允許 TPEx 暫缺，但會提示）
+        if (twse_amt and twse_amt > 0) or (tpex_amt and tpex_amt > 0):
+            total = None
+            if (twse_amt and twse_amt > 0) and (tpex_amt and tpex_amt > 0):
+                total = twse_amt + tpex_amt
+                warn = None
+            else:
+                total = (twse_amt or 0) + (tpex_amt or 0)
+                warn = "成交金額來源不完整（TWSE 或 TPEx 缺一），僅供參考；裁決層需視規則降級。"
+
+            payload = {
+                "trade_date": ymd,
+                "amount_twse": twse_amt,
+                "amount_tpex": tpex_amt,
+                "amount_total": total,
+                "source_twse": s_twse,
+                "source_tpex": s_tpex,
+                "cached_at": datetime.now(tz=TZ_TAIPEI).strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            _save_cache(payload)
+
             return MarketAmount(
-                amount_twse=twse2,
-                amount_tpex=tpex2,
-                amount_total=twse2 + tpex2,
-                source_twse=s1b,
-                source_tpex=s2b,
-                error=f"Official failed: {type(e1).__name__}: {str(e1)}",
-            )
-        except Exception as e2:
-            return MarketAmount(
-                amount_twse=None,
-                amount_tpex=None,
-                amount_total=None,
-                source_twse=None,
-                source_tpex=None,
-                error=f"Official failed: {type(e1).__name__}: {str(e1)} | Yahoo failed: {type(e2).__name__}: {str(e2)}",
+                trade_date=ymd,
+                amount_twse=twse_amt,
+                amount_tpex=tpex_amt,
+                amount_total=total,
+                source_twse=s_twse,
+                source_tpex=s_tpex,
+                warning=warn,
             )
 
+    # 全失敗 -> 用 cache
+    cache = _load_cache()
+    if cache:
+        return MarketAmount(
+            trade_date=cache.get("trade_date", ""),
+            amount_twse=cache.get("amount_twse"),
+            amount_tpex=cache.get("amount_tpex"),
+            amount_total=cache.get("amount_total"),
+            source_twse=cache.get("source_twse"),
+            source_tpex=cache.get("source_tpex"),
+            warning=f"官方抓取失敗（{last_err}），已回退快取資料。",
+        )
 
-def intraday_norm(
-    amount_total_now: int,
-    amount_total_prev: Optional[int],
-    avg20_amount_total: Optional[int],
-    now: Optional[datetime] = None,
-    alpha: float = 0.65,
-) -> Dict[str, Any]:
-    """
-    INTRADAY 量能正規化（V15.7）
-
-    - 穩健型看：累積正規化 (amount_norm_cum_ratio)
-    - 保守型看：切片正規化 (amount_norm_slice_ratio) => 需 prev
-    - 試投型：忽略量能（由 arbiter 再決定）
-
-    回傳：
-    - progress：盤中進度 0~1
-    - amount_norm_cum_ratio：累積比率
-    - amount_norm_slice_ratio：切片比率
-    - amount_norm_label：NORMAL/LOW/HIGH（以 cum_ratio 判定）
-    """
-    now = now or _now_taipei()
-    p_now = trading_progress(now)
-    p_prev = max(0.0, p_now - (5 / TRADING_MINUTES))
-
-    out: Dict[str, Any] = {
-        "progress": round(p_now, 4),
-        "amount_norm_cum_ratio": None,
-        "amount_norm_slice_ratio": None,
-        "amount_norm_label": "UNKNOWN",
-    }
-
-    if not avg20_amount_total or avg20_amount_total <= 0:
-        return out
-
-    expected_cum = avg20_amount_total * progress_curve(p_now, alpha=alpha)
-    cum_ratio = (amount_total_now / expected_cum) if expected_cum > 0 else None
-    out["amount_norm_cum_ratio"] = None if cum_ratio is None else round(float(cum_ratio), 4)
-    if cum_ratio is not None:
-        out["amount_norm_label"] = classify_ratio(float(cum_ratio))
-
-    if amount_total_prev is not None:
-        slice_amount = max(0, amount_total_now - amount_total_prev)
-        expected_slice = avg20_amount_total * (progress_curve(p_now, alpha=alpha) - progress_curve(p_prev, alpha=alpha))
-        slice_ratio = (slice_amount / expected_slice) if expected_slice > 0 else None
-        out["amount_norm_slice_ratio"] = None if slice_ratio is None else round(float(slice_ratio), 4)
-
-    return out
+    # 連 cache 都沒有
+    return MarketAmount(
+        trade_date="",
+        amount_twse=None,
+        amount_tpex=None,
+        amount_total=None,
+        source_twse=None,
+        source_tpex=None,
+        warning=f"官方抓取失敗且無快取（{last_err}）",
+    )
