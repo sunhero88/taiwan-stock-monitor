@@ -12,7 +12,6 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 
-# ✅ 這行是你現在掛掉的核心：務必確保 market_amount.py 在同層
 from market_amount import TZ_TAIPEI, fetch_amount_total_latest, MarketAmount
 
 
@@ -51,6 +50,22 @@ def is_tw_market_open(now: Optional[datetime] = None) -> bool:
     now = now or now_taipei()
     t = now.time()
     return TRADING_START <= t <= TRADING_END
+
+
+def resolve_session(mode: str, now: datetime) -> str:
+    """
+    mode:
+      - AUTO: 盤中 -> INTRADAY；盤外 -> EOD（盤前/盤後一律顯示昨日/最近可用EOD）
+      - INTRADAY: 強制盤中
+      - EOD: 強制盤後（最新可用交易日收盤）
+    """
+    mode = (mode or "AUTO").upper()
+    if mode == "INTRADAY":
+        return "INTRADAY"
+    if mode == "EOD":
+        return "EOD"
+    # AUTO
+    return "INTRADAY" if is_tw_market_open(now) else "EOD"
 
 
 def load_universe() -> List[str]:
@@ -174,8 +189,8 @@ def build_arbiter_input(
     fx_df: pd.DataFrame,
     top_df: pd.DataFrame,
     holdings: List[str],
+    session: str,
 ) -> Dict[str, Any]:
-
     inst_status = "UNAVAILABLE"  # 免費模擬期：不接 FinMind
     degraded_mode = (not (amount.amount_total and amount.amount_total > 0)) or bool(amount.warning)
 
@@ -214,7 +229,7 @@ def build_arbiter_input(
         "meta": {
             "system": "Predator V15.7 (Free/Sim)",
             "timestamp": now_taipei().strftime("%Y-%m-%d %H:%M"),
-            "session": "PREOPEN" if not is_tw_market_open() else "INTRADAY",
+            "session": session,
             "market": "tw-share",
         },
         "macro": {
@@ -233,7 +248,7 @@ def build_arbiter_input(
                 },
                 "inst_status": inst_status,
                 "degraded_mode": degraded_mode,
-                "data_mode": "EOD" if not is_tw_market_open() else "INTRADAY",
+                "data_mode": session,
             },
             "global": {
                 "us": us_df.to_dict(orient="records"),
@@ -248,9 +263,25 @@ def app():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
 
+    now = now_taipei()
+
     with st.sidebar:
         st.subheader("設定")
-        verify_ssl = st.checkbox("SSL 驗證（官方資料）", value=True, help="Streamlit Cloud 若遇證書問題可暫時關閉（僅模擬期）")
+
+        session_mode = st.selectbox(
+            "Session",
+            ["AUTO", "INTRADAY", "EOD"],
+            index=0,
+            help="AUTO：盤中/盤外自動判斷；EOD：強制顯示昨日/最近可用收盤；INTRADAY：強制盤中"
+        )
+
+        session = resolve_session(session_mode, now)
+
+        verify_ssl = st.checkbox(
+            "SSL 驗證（官方資料）",
+            value=True,
+            help="Streamlit Cloud 若遇證書問題可暫時關閉（僅模擬期）"
+        )
         lookback = st.slider("官方資料回溯天數", min_value=3, max_value=20, value=10, step=1)
         st.divider()
 
@@ -264,10 +295,10 @@ def app():
 
         st.caption("免費模擬期：法人資料（FinMind）不使用，避免 402 付費門檻。")
 
-    now = now_taipei()
-    st.info(f"目前台北時間：{now.strftime('%Y-%m-%d %H:%M')}｜模式：{'盤前(顯示昨日/最近可用EOD)' if not is_tw_market_open(now) else '盤中'}")
+    mode_text = "盤中" if session == "INTRADAY" else "盤後(EOD)/盤前顯示EOD"
+    st.info(f"目前台北時間：{now.strftime('%Y-%m-%d %H:%M')}｜Session：{session}（{mode_text}）")
 
-    # 全球：美股/匯率
+    # 全球：美股/匯率（EOD為主）
     colA, colB = st.columns([2, 2])
 
     with colA:
@@ -345,13 +376,14 @@ def app():
 
     st.divider()
 
-    st.subheader("AI JSON（Arbiter Input）— 穩定可回溯（模擬期免費）")
+    st.subheader("AI JSON（Arbiter Input）— 可回溯（模擬期免費）")
     arbiter_input = build_arbiter_input(
         amount=amount,
         us_df=us_df,
         fx_df=fx_df,
         top_df=top_df,
         holdings=holdings,
+        session=session,
     )
     st.json(arbiter_input)
 
