@@ -10,9 +10,6 @@ from typing import Optional, Tuple, Dict, Any
 import pandas as pd
 import requests
 
-# ✅ 重要：Streamlit Cloud 常遇到 SSL 鏈問題，用 certifi 指定 CA bundle（不關閉驗證）
-import certifi
-
 
 TZ_TAIPEI = timezone(timedelta(hours=8))
 
@@ -25,15 +22,7 @@ USER_AGENT = {
 }
 
 
-def _requests_get(url: str, timeout: int = 15) -> requests.Response:
-    """
-    統一 requests.get：帶 UA + certifi CA bundle，避免 Streamlit Cloud SSL 問題
-    """
-    return requests.get(url, headers=USER_AGENT, timeout=timeout, verify=certifi.where())
-
-
 def _to_int_amount(x) -> int:
-    """把 '775,402,495,419' 之類字串轉 int"""
     if x is None:
         return 0
     s = str(x)
@@ -41,12 +30,20 @@ def _to_int_amount(x) -> int:
     return int(s) if s else 0
 
 
+def _fmt_int(n: Optional[int]) -> str:
+    if n is None:
+        return "待更新"
+    try:
+        return f"{int(n):,}"
+    except Exception:
+        return "待更新"
+
+
 def _now_taipei() -> datetime:
     return datetime.now(tz=TZ_TAIPEI)
 
 
 def trading_progress(now: Optional[datetime] = None) -> float:
-    """回傳盤中進度 0~1。盤外 clamp 到 0 或 1。"""
     now = now or _now_taipei()
     start_dt = now.replace(hour=TRADING_START.hour, minute=TRADING_START.minute, second=0, microsecond=0)
     end_dt = now.replace(hour=TRADING_END.hour, minute=TRADING_END.minute, second=0, microsecond=0)
@@ -60,190 +57,18 @@ def trading_progress(now: Optional[datetime] = None) -> float:
 
 
 def progress_curve(p: float, alpha: float = 0.65) -> float:
-    """用冪次曲線做『盤中累積量能』預期，避免早盤被誤判 LOW。"""
     p = max(0.0, min(1.0, p))
     return p ** alpha
 
 
 @dataclass
 class MarketAmount:
-    amount_twse: int
-    amount_tpex: int
-    amount_total: int
-    source_twse: str
-    source_tpex: str
-
-
-# =========================
-# TWSE：優先 OpenAPI，失敗才退回 MI_INDEX HTML
-# =========================
-def fetch_twse_amount() -> Tuple[int, str]:
-    """
-    上市成交金額（元）
-    優先：TWSE OpenAPI (官方) :contentReference[oaicite:2]{index=2}
-    退回：TWSE MI_INDEX(HTML) 解析
-    """
-    # 1) TWSE OpenAPI（不帶 date 會回當日資料；你可在主程式自己決定 trade_date 版本）
-    try:
-        url_api = "https://openapi.twse.com.tw/v1/exchangeReport/MI_INDEX"
-        r = _requests_get(url_api, timeout=15)
-        r.raise_for_status()
-        j = r.json()
-
-        # OpenAPI 回傳欄位會隨報表而不同；這裡做「可容錯」的字段搜尋：
-        # 常見候選：成交金額(元) / TradeValue / 成交金額
-        candidates = ["成交金額", "成交金額(元)", "TradeValue", "Trade Value", "trade_value", "value"]
-
-        total = 0
-        if isinstance(j, list):
-            for row in j:
-                if not isinstance(row, dict):
-                    continue
-                found = None
-                for k in candidates:
-                    if k in row:
-                        found = row.get(k)
-                        break
-                if found is None:
-                    continue
-                total += _to_int_amount(found)
-
-        if total > 0:
-            return int(total), "TWSE OpenAPI MI_INDEX（成交金額欄位加總）"
-
-    except Exception:
-        # 忽略，走 fallback
-        pass
-
-    # 2) fallback：MI_INDEX HTML
-    url_html = "https://www.twse.com.tw/exchangeReport/MI_INDEX?date=&response=html"
-    r = _requests_get(url_html, timeout=15)
-    r.raise_for_status()
-
-    tables = pd.read_html(r.text)
-    if not tables:
-        raise RuntimeError("TWSE MI_INDEX 找不到可解析表格")
-
-    # 找出含有成交金額欄位的表（容錯）
-    target = None
-    for t in tables:
-        cols = [str(c) for c in t.columns]
-        if any("成交金額" in c for c in cols):
-            target = t
-            break
-    if target is None:
-        target = tables[0]
-
-    amt_col = None
-    for c in target.columns:
-        if "成交金額" in str(c):
-            amt_col = c
-            break
-    if amt_col is None:
-        raise RuntimeError("TWSE 表格找不到『成交金額』欄")
-
-    amount = int(target[amt_col].apply(_to_int_amount).sum())
-    return amount, "TWSE MI_INDEX(HTML) 成交金額欄加總"
-
-
-# =========================
-# TPEx：改用官方 historical market-value 頁（比 pricing.html 穩） :contentReference[oaicite:3]{index=3}
-# =========================
-def fetch_tpex_amount() -> Tuple[int, str]:
-    """
-    上櫃成交金額（元）
-    使用：TPEx 英文頁 Daily Stock Market Value List（表格抓取 Trade Value）
-    """
-    url = "https://www.tpex.org.tw/en-us/mainboard/trading/historical/market-value.html"
-    r = _requests_get(url, timeout=15)
-    r.raise_for_status()
-
-    tables = pd.read_html(r.text)
-    if not tables:
-        raise RuntimeError("TPEx market-value.html 找不到可解析表格")
-
-    # 通常第一個表就是 daily list，但仍做容錯：找含 Trade Value / Trading Value / Value 的欄
-    target = None
-    value_col = None
-    for t in tables:
-        cols = [str(c) for c in t.columns]
-        # 常見欄位名（英文站）
-        for c in t.columns:
-            sc = str(c).lower()
-            if ("trade" in sc and "value" in sc) or ("trading" in sc and "value" in sc) or sc in ("value",):
-                target = t
-                value_col = c
-                break
-        if target is not None:
-            break
-
-    if target is None or value_col is None:
-        # 最後 fallback：嘗試第一張表找含 value 的欄
-        target = tables[0]
-        for c in target.columns:
-            if "value" in str(c).lower():
-                value_col = c
-                break
-
-    if value_col is None:
-        raise RuntimeError("TPEx 表格找不到成交金額/Trade Value 欄位")
-
-    # 取「最新一筆」（有些頁面會列多日，最新可能在第一列或最後一列，這裡兩種都試）
-    col_series = target[value_col].dropna().astype(str)
-    if col_series.empty:
-        raise RuntimeError("TPEx Trade Value 欄位是空的")
-
-    # 嘗試取最大（通常最新成交金額較大；且可避開 NA/文字列）
-    vals = [_to_int_amount(x) for x in col_series.tolist()]
-    amount = max(vals) if vals else 0
-    if amount <= 0:
-        # 如果 max 取不到，退回最後一個非零
-        for v in reversed(vals):
-            if v > 0:
-                amount = v
-                break
-
-    if amount <= 0:
-        raise RuntimeError("TPEx 成交金額解析結果為 0")
-
-    return int(amount), "TPEx market-value.html Trade Value（取表格有效值）"
-
-
-def fetch_amount_total() -> MarketAmount:
-    """
-    ✅ 你指定：上市 + 上櫃合計 = amount_total
-    """
-    twse, s1 = fetch_twse_amount()
-    tpex, s2 = fetch_tpex_amount()
-    return MarketAmount(
-        amount_twse=int(twse),
-        amount_tpex=int(tpex),
-        amount_total=int(twse) + int(tpex),
-        source_twse=s1,
-        source_tpex=s2,
-    )
-
-
-def fetch_amount_total_safe() -> Dict[str, Any]:
-    """
-    不拋錯版：給 main.py 直接塞 macro.overview.amount_sources 用
-    """
-    out = {
-        "amount_twse": None,
-        "amount_tpex": None,
-        "amount_total": None,
-        "sources": {"twse": None, "tpex": None, "error": None},
-    }
-    try:
-        ma = fetch_amount_total()
-        out["amount_twse"] = ma.amount_twse
-        out["amount_tpex"] = ma.amount_tpex
-        out["amount_total"] = ma.amount_total
-        out["sources"]["twse"] = ma.source_twse
-        out["sources"]["tpex"] = ma.source_tpex
-    except Exception as e:
-        out["sources"]["error"] = f"{type(e).__name__}: {str(e)}"
-    return out
+    amount_twse: Optional[int]
+    amount_tpex: Optional[int]
+    amount_total: Optional[int]
+    source_twse: Optional[str]
+    source_tpex: Optional[str]
+    error: Optional[str]
 
 
 def classify_ratio(r: float) -> str:
@@ -261,12 +86,6 @@ def intraday_norm(
     now: Optional[datetime] = None,
     alpha: float = 0.65,
 ) -> dict:
-    """
-    回傳：
-    - amount_norm_cum_ratio：累積正規化比率（穩健型使用）
-    - amount_norm_slice_ratio：切片正規化比率（保守型使用，需 prev）
-    - amount_norm_label：NORMAL/LOW/HIGH（以 cum_ratio 判定）
-    """
     now = now or _now_taipei()
     p_now = trading_progress(now)
     p_prev = max(0.0, p_now - (5 / TRADING_MINUTES))
@@ -287,7 +106,6 @@ def intraday_norm(
     if cum_ratio is not None:
         out["amount_norm_label"] = classify_ratio(float(cum_ratio))
 
-    # slice（需要前值）
     if amount_total_prev is not None:
         slice_amount = max(0, amount_total_now - amount_total_prev)
         expected_slice = avg20_amount_total * (progress_curve(p_now, alpha=alpha) - progress_curve(p_prev, alpha=alpha))
@@ -295,3 +113,123 @@ def intraday_norm(
         out["amount_norm_slice_ratio"] = None if slice_ratio is None else round(float(slice_ratio), 4)
 
     return out
+
+
+# -------------------------
+# 官方抓取：多策略（免費）
+# -------------------------
+def fetch_twse_amount_openapi(trade_date: str) -> Tuple[int, str]:
+    """
+    嘗試 openapi.twse.com.tw（通常比 www.twse.com.tw 更不容易 SSL 炸裂）
+    trade_date: 'YYYY-MM-DD' 或 None（openapi 有時只回最新）
+    """
+    # 多數 openapi 不吃 YYYY-MM-DD，保守做法：先打最新，再用欄位去加總成交金額
+    url = "https://openapi.twse.com.tw/v1/exchangeReport/MI_INDEX"
+    r = requests.get(url, headers=USER_AGENT, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+
+    if not isinstance(data, list) or not data:
+        raise RuntimeError("TWSE openapi 回傳非預期格式")
+
+    # 可能欄位名稱（中英混雜），用『包含 成交金額 或 TradeValue』的欄位加總
+    keys = set()
+    for row in data[:10]:
+        if isinstance(row, dict):
+            keys |= set(row.keys())
+
+    cand = None
+    for k in keys:
+        ks = str(k)
+        if "成交金額" in ks or "TradeValue" in ks or "trade_value" in ks or "Trade Value" in ks:
+            cand = k
+            break
+    if cand is None:
+        raise RuntimeError(f"TWSE openapi 找不到成交金額欄位，keys={list(keys)[:20]}")
+
+    total = 0
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+        total += _to_int_amount(row.get(cand))
+
+    if total <= 0:
+        raise RuntimeError("TWSE openapi 成交金額加總為 0（可能欄位不對或資料型態變更）")
+
+    return total, "TWSE openapi /v1/exchangeReport/MI_INDEX（成交金額欄位加總）"
+
+
+def fetch_tpex_amount_candidates(trade_date: str) -> Tuple[int, str]:
+    """
+    TPEx：用多 pattern 從頁面抓『總成交金額』，避免單點失效
+    """
+    urls = [
+        "https://www.tpex.org.tw/zh-tw/mainboard/trading/info/pricing.html",
+        "https://www.tpex.org.tw/en-us/mainboard/trading/info/pricing.html",
+    ]
+
+    patterns = [
+        r"總成交金額[:：]\s*([\d,]+)\s*元",
+        r"總成交金額.*?([\d,]+)\s*元",
+        r"Total\s*Value\s*[:：]\s*([\d,]+)",
+        r"Total\s*Trading\s*Value\s*[:：]\s*([\d,]+)",
+    ]
+
+    last_err = None
+    for url in urls:
+        try:
+            r = requests.get(url, headers=USER_AGENT, timeout=15)
+            r.raise_for_status()
+            text = r.text
+
+            for p in patterns:
+                m = re.search(p, text, re.IGNORECASE | re.DOTALL)
+                if m:
+                    amt = _to_int_amount(m.group(1))
+                    if amt > 0:
+                        return amt, f"TPEx pricing（pattern={p}）"
+            last_err = f"TPEx pricing 抓不到（url={url}）"
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {str(e)}"
+
+    raise RuntimeError(last_err or "TPEx pricing 無法取得總成交金額")
+
+
+def fetch_amount_total_safe(trade_date: str) -> Dict[str, Any]:
+    """
+    回傳給 main.py 使用的統一格式（即使失敗也要回傳原因，避免整頁掛掉）
+    """
+    sources: Dict[str, Any] = {"twse": None, "tpex": None, "error": None}
+    twse_int = None
+    tpex_int = None
+
+    try:
+        twse_int, s1 = fetch_twse_amount_openapi(trade_date)
+        sources["twse"] = s1
+    except Exception as e:
+        sources["twse"] = None
+        sources["error"] = f"TWSE:{type(e).__name__}: {str(e)}"
+
+    try:
+        tpex_int, s2 = fetch_tpex_amount_candidates(trade_date)
+        sources["tpex"] = s2
+    except Exception as e:
+        sources["tpex"] = None
+        # 不覆蓋 TWSE error，改為串接
+        prev = sources.get("error")
+        add = f"TPEx:{type(e).__name__}: {str(e)}"
+        sources["error"] = add if not prev else (str(prev) + " | " + add)
+
+    total_int = None
+    if isinstance(twse_int, int) and isinstance(tpex_int, int):
+        total_int = twse_int + tpex_int
+
+    return {
+        "amount_twse_int": twse_int,
+        "amount_tpex_int": tpex_int,
+        "amount_total_int": total_int,
+        "amount_twse_fmt": _fmt_int(twse_int),
+        "amount_tpex_fmt": _fmt_int(tpex_int),
+        "amount_total_fmt": _fmt_int(total_int),
+        "sources": sources,
+    }
