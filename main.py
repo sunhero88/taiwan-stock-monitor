@@ -2,119 +2,167 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import json
 import os
-from datetime import datetime
+import json
+from datetime import datetime, timezone, timedelta, time
 
 import pandas as pd
 import streamlit as st
+import yfinance as yf
 
 from analyzer import run_analysis, generate_ai_json, SESSION_INTRADAY, SESSION_EOD
-from finmind_institutional import fetch_finmind_institutional
 from institutional_utils import calc_inst_3d
+from finmind_institutional import fetch_finmind_institutional
 
-# =========================
-# Safe import: market_amount (Streamlit Cloud 不要因匯入失敗整個掛掉)
-# =========================
-MARKET_AMOUNT_OK = False
-MARKET_AMOUNT_IMPORT_ERROR = None
+from market_amount import (
+    fetch_amount_total,
+    intraday_norm,
+    yfinance_amount_proxy,
+)
 
-try:
-    from market_amount import fetch_amount_total, intraday_norm  # noqa: F401
-    MARKET_AMOUNT_OK = True
-except Exception as e:
-    MARKET_AMOUNT_OK = False
-    MARKET_AMOUNT_IMPORT_ERROR = f"{type(e).__name__}: {e}"
+TZ_TAIPEI = timezone(timedelta(hours=8))
 
-    # fallback dummy functions (避免 NameError)
-    def fetch_amount_total():  # type: ignore
-        raise RuntimeError(f"market_amount import failed: {MARKET_AMOUNT_IMPORT_ERROR}")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE_DIR, "data")
 
-    def intraday_norm(*args, **kwargs):  # type: ignore
-        return {
-            "progress": None,
-            "amount_norm_cum_ratio": None,
-            "amount_norm_slice_ratio": None,
-            "amount_norm_label": "UNKNOWN",
-        }
+# 你的 demo 追蹤池（模擬期免費）
+DEFAULT_TICKERS = ["2330.TW", "2317.TW", "2308.TW", "2454.TW", "2382.TW", "3231.TW", "2603.TW", "2609.TW"]
 
-
-# =========================
-# 0) 航運股估值（手動覆蓋層）
-# =========================
-SHIPPING_VALUATION = {
-    "2603.TW": {
-        "name_zh": "長榮",
-        "sector": "航運",
-        "opm_q": 22.73,
-        "opm_q_period": "2025 Q3",
-        "eps_ttm": 41.92,
-        "price_ref": 192.54,
-        "price_ref_date": "2026-01-22",
-        "pe_calc": 4.59,
-        "label": "🟢 極度低估 (Deep Value)",
-        "source": "財報狗/玩股網（最新季報資料庫）",
-    },
-    "2609.TW": {
-        "name_zh": "陽明",
-        "sector": "航運",
-        "opm_q": 10.49,
-        "opm_q_period": "2025 Q3",
-        "eps_ttm": 7.83,
-        "price_ref": 55.57,
-        "price_ref_date": "2026-01-22",
-        "pe_calc": 7.09,
-        "label": "🟡",
-        "source": "財報狗/玩股網（最新季報資料庫）",
-    },
+# 中文名（先用靜態表，避免每次 yfinance info 太慢）
+NAME_ZH_MAP = {
+    "2330.TW": "台積電",
+    "2317.TW": "鴻海",
+    "2308.TW": "台達電",
+    "2454.TW": "聯發科",
+    "2382.TW": "廣達",
+    "3231.TW": "緯創",
+    "2603.TW": "長榮",
+    "2609.TW": "陽明",
 }
 
+def _now_taipei() -> datetime:
+    return datetime.now(tz=TZ_TAIPEI)
 
 def _fmt_date(dt) -> str:
     try:
         return pd.to_datetime(dt).strftime("%Y-%m-%d")
     except Exception:
-        return datetime.now().strftime("%Y-%m-%d")
+        return _now_taipei().strftime("%Y-%m-%d")
 
+def _ensure_dirs():
+    os.makedirs(DATA_DIR, exist_ok=True)
+
+def _candidate_paths(filename: str):
+    # 依序嘗試：根目錄、data/ 目錄
+    return [
+        os.path.join(BASE_DIR, filename),
+        os.path.join(DATA_DIR, filename),
+    ]
 
 def _load_market_csv(market: str) -> pd.DataFrame:
+    """
+    先找 data_{market}.csv（支援 root / data/）
+    找不到就用 yfinance 以 DEFAULT_TICKERS 產生（免費/模擬期保底）
+    """
+    _ensure_dirs()
+
     fname = f"data_{market}.csv"
-    if not os.path.exists(fname):
-        if os.path.exists("data_tw-share.csv"):
-            fname = "data_tw-share.csv"
-        elif os.path.exists("data_tw.csv"):
-            fname = "data_tw.csv"
-        else:
-            raise FileNotFoundError(f"找不到資料檔：{fname} / data_tw-share.csv / data_tw.csv")
-    df = pd.read_csv(fname)
+    # 兼容舊命名
+    fallbacks = [fname, "data_tw-share.csv", "data_tw.csv"]
+
+    for fb in fallbacks:
+        for p in _candidate_paths(fb):
+            if os.path.exists(p):
+                df = pd.read_csv(p)
+                return df
+
+    # 找不到 → 免費保底：用 yfinance 產生近一年日線
+    symbols = DEFAULT_TICKERS if market in ("tw-share", "tw") else DEFAULT_TICKERS
+    data = yf.download(symbols, period="1y", interval="1d", progress=False, auto_adjust=False, threads=True)
+    if data is None or data.empty:
+        raise FileNotFoundError(f"找不到資料檔（{fallbacks}），且 yfinance 無法下載：market={market}")
+
+    df_close = data["Close"].stack().reset_index()
+    df_close.columns = ["Date", "Symbol", "Close"]
+
+    df_vol = data["Volume"].stack().reset_index()
+    df_vol.columns = ["Date", "Symbol", "Volume"]
+
+    df_open = data["Open"].stack().reset_index()
+    df_open.columns = ["Date", "Symbol", "Open"]
+
+    df_high = data["High"].stack().reset_index()
+    df_high.columns = ["Date", "Symbol", "High"]
+
+    df_low = data["Low"].stack().reset_index()
+    df_low.columns = ["Date", "Symbol", "Low"]
+
+    df = df_close.merge(df_vol, on=["Date", "Symbol"], how="left")
+    df = df.merge(df_open, on=["Date", "Symbol"], how="left")
+    df = df.merge(df_high, on=["Date", "Symbol"], how="left")
+    df = df.merge(df_low, on=["Date", "Symbol"], how="left")
+
+    outpath = os.path.join(DATA_DIR, fname)
+    df.to_csv(outpath, index=False, encoding="utf-8")
     return df
 
-
-def _compute_market_amount_from_csv(df: pd.DataFrame, latest_date) -> str:
+def _decide_preopen_session(now: datetime) -> str:
     """
-    舊方法：用你 CSV 裡的 Close*Volume 加總。
-    注意：這不是全市場 amount_total，只是你 CSV 涵蓋的 ticker 子集合。
-    模擬期可保留，但 UI 必須清楚標註。
+    台北時間 < 09:00 → 顯示昨日 EOD（避免 08:17 還在用 INTRADAY 導致日期/量能失真）
     """
-    d = df.copy()
-    d["Date"] = pd.to_datetime(d["Date"], errors="coerce")
-    d = d[d["Date"] == latest_date].copy()
-    if d.empty:
-        return "待更新"
-    d["Close"] = pd.to_numeric(d.get("Close"), errors="coerce").fillna(0)
-    d["Volume"] = pd.to_numeric(d.get("Volume"), errors="coerce").fillna(0)
-    amt = float((d["Close"] * d["Volume"]).sum())
-    return f"{amt:,.0f}"
+    if now.time() < time(9, 0):
+        return SESSION_EOD
+    return SESSION_INTRADAY
 
+def _load_global_summary() -> pd.DataFrame:
+    """
+    讀 data/global_market_summary.csv
+    若沒有 → 用 yfinance 生成（免費保底）
+    """
+    _ensure_dirs()
+    p = os.path.join(DATA_DIR, "global_market_summary.csv")
+    if os.path.exists(p):
+        try:
+            return pd.read_csv(p)
+        except Exception:
+            pass
+
+    # 免費保底：抓你表上的符號
+    # SOX(半導體)用 ^SOX，TSM ADR 用 TSM，NVIDIA=NVDA，Apple=AAPL，日經 ^N225，USDJPY=X? 走 JPY=X，USDTWD=X? 常不穩 → 用 TWD=X
+    items = [
+        ("US", "SOX_Semi", "^SOX"),
+        ("US", "TSM_ADR", "TSM"),
+        ("US", "NVIDIA", "NVDA"),
+        ("US", "Apple", "AAPL"),
+        ("ASIA", "Nikkei_225", "^N225"),
+        ("ASIA", "USD_JPY", "JPY=X"),
+        ("ASIA", "USD_TWD", "TWD=X"),
+    ]
+
+    rows = []
+    for mkt, sym, yf_sym in items:
+        try:
+            hist = yf.download(yf_sym, period="5d", interval="1d", progress=False)
+            if hist is None or hist.empty:
+                continue
+            c = float(hist["Close"].iloc[-1])
+            p0 = float(hist["Close"].iloc[-2]) if len(hist) >= 2 else c
+            chg = (c / p0 - 1.0) * 100.0 if p0 else 0.0
+            rows.append({"Market": mkt, "Symbol": sym, "Change": round(chg, 4), "Value": round(c, 4)})
+        except Exception:
+            continue
+
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df.to_csv(p, index=False, encoding="utf-8")
+    return df
 
 def _merge_institutional_into_df_top(df_top: pd.DataFrame, inst_df: pd.DataFrame, trade_date: str) -> pd.DataFrame:
     df_out = df_top.copy()
     inst_records = []
-
     for _, r in df_out.iterrows():
         symbol = str(r.get("Symbol", ""))
         inst_calc = calc_inst_3d(inst_df, symbol=symbol, trade_date=trade_date)
-
         inst_records.append(
             {
                 "Symbol": symbol,
@@ -127,20 +175,18 @@ def _merge_institutional_into_df_top(df_top: pd.DataFrame, inst_df: pd.DataFrame
                 },
             }
         )
-
     inst_map = {x["Symbol"]: x["Institutional"] for x in inst_records}
     df_out["Institutional"] = df_out["Symbol"].map(inst_map)
     return df_out
 
-
 def _decide_inst_status(inst_df: pd.DataFrame, symbols: list[str], trade_date: str, inst_fetch_error: str | None) -> tuple[str, list[str], str | None]:
     """
-    inst_status 規則（模擬期，免費版）：
-    - 若 API 明確付費/不可用（402）→ UNAVAILABLE
-    - 若資料不足以形成 3D → PENDING
-    - 若至少一檔 READY → READY
+    inst_status：READY / PENDING / UNAVAILABLE
+    - 402 Payment Required → UNAVAILABLE（免費期）
+    - 其他錯誤 → UNAVAILABLE（避免假 READY）
+    - 無錯誤但資料不足 → PENDING
     """
-    if inst_fetch_error and ("402" in inst_fetch_error or "Payment Required" in inst_fetch_error):
+    if inst_fetch_error:
         return "UNAVAILABLE", [], None
 
     ready_any = False
@@ -148,95 +194,78 @@ def _decide_inst_status(inst_df: pd.DataFrame, symbols: list[str], trade_date: s
         r = calc_inst_3d(inst_df, symbol=sym, trade_date=trade_date)
         if r.get("Inst_Status") == "READY":
             ready_any = True
-            break
 
     dates_3d = []
     data_date_finmind = None
     try:
         if not inst_df.empty and "date" in inst_df.columns:
-            ds = sorted(inst_df["date"].astype(str).unique().tolist())
-            dates_3d = ds[-3:]
-            data_date_finmind = ds[-1] if ds else None
+            dates = sorted(inst_df["date"].astype(str).unique().tolist())
+            dates_3d = dates[-3:]
+            data_date_finmind = dates[-1] if dates else None
     except Exception:
         dates_3d = []
         data_date_finmind = None
 
     return ("READY" if ready_any else "PENDING"), dates_3d, data_date_finmind
 
+def _market_comment(m: dict) -> str:
+    # 明確、可回溯的裁決文字（避免空泛）
+    amt_total = m.get("amount_total")
+    amt_label = m.get("amount_norm_label", "UNKNOWN")
+    inst_status = m.get("inst_status", "UNAVAILABLE")
+    degraded = bool(m.get("degraded_mode", False))
 
-def generate_market_comment_retail(macro_overview: dict) -> str:
-    """
-    人類可讀的市場摘要：
-    - 若 degraded_mode=True → 明確寫出禁止 BUY/TRIAL
-    - amount_total 若未知 → 明確寫待更新
-    """
-    degraded_mode = bool(macro_overview.get("degraded_mode", False))
-    kill_switch = bool(macro_overview.get("kill_switch", False))
-    v14_watch = bool(macro_overview.get("v14_watch", False))
-    inst_status = macro_overview.get("inst_status", "PENDING")
+    parts = []
 
-    amount_total = macro_overview.get("amount_total", "待更新")
-    amount_norm_label = macro_overview.get("amount_norm_label", "UNKNOWN")
+    if amt_total in (None, "待更新"):
+        parts.append("成交金額待更新")
+    else:
+        try:
+            v = int(str(amt_total).replace(",", ""))
+            parts.append(f"成交金額約 {v/1e8:,.0f} 億")
+        except Exception:
+            parts.append("成交金額已取得")
 
-    if kill_switch or v14_watch:
-        return "系統風控已啟動：禁止進場（BUY/TRIAL）。"
+    parts.append(f"量能標籤={amt_label}")
 
-    # 降級：你的「絕對防線」
-    if degraded_mode:
-        return f"成交金額{amount_total}；法人資料{inst_status}；量能判定={amount_norm_label}。裁決層已進入資料降級：禁止 BUY/TRIAL。"
+    if inst_status == "READY":
+        parts.append("法人資料可用")
+    elif inst_status == "PENDING":
+        parts.append("法人資料不足")
+    else:
+        parts.append("法人資料不可用")
 
-    # 非降級：給一般描述
-    return f"成交金額={amount_total}；法人狀態={inst_status}；量能判定={amount_norm_label}。"
+    if degraded:
+        parts.append("裁決層：資料降級 → 禁止 BUY/TRIAL")
+    else:
+        parts.append("裁決層：允許依規則執行")
 
-
-def _apply_shipping_valuation_overrides(df_top: pd.DataFrame) -> pd.DataFrame:
-    out = df_top.copy()
-
-    def _inject(row: pd.Series) -> pd.Series:
-        sym = str(row.get("Symbol", "")).strip()
-        info = SHIPPING_VALUATION.get(sym)
-        if not info:
-            return row
-
-        if not row.get("Name"):
-            row["Name"] = info.get("name_zh", sym)
-
-        row["Valuation_Override"] = {
-            "sector": info.get("sector"),
-            "opm_q": float(info.get("opm_q", 0.0)),
-            "opm_q_period": info.get("opm_q_period"),
-            "eps_ttm": float(info.get("eps_ttm", 0.0)),
-            "price_ref": float(info.get("price_ref", 0.0)),
-            "price_ref_date": info.get("price_ref_date"),
-            "pe_calc": float(info.get("pe_calc", 0.0)),
-            "label": info.get("label"),
-            "source": info.get("source"),
-        }
-        return row
-
-    out = out.apply(_inject, axis=1)
-    return out
-
+    return "；".join(parts) + "。"
 
 def app():
     st.set_page_config(page_title="Sunhero｜股市智能超盤中控台", layout="wide")
     st.title("Sunhero｜股市智能超盤中控台")
 
-    # 顯示 market_amount 匯入狀態（避免你一直盲猜）
-    if not MARKET_AMOUNT_OK:
-        st.warning(f"market_amount 模組匯入失敗（不致命，系統仍可運行）：{MARKET_AMOUNT_IMPORT_ERROR}")
+    now = _now_taipei()
 
     market = st.sidebar.selectbox("Market", ["tw-share", "tw"], index=0)
-    session = st.sidebar.selectbox("Session", [SESSION_INTRADAY, SESSION_EOD], index=0)
-    run_btn = st.sidebar.button("Run")
 
+    # 開盤前強制顯示昨日 EOD（你 08:17 的需求）
+    default_session = _decide_preopen_session(now)
+    session = st.sidebar.selectbox("Session", [SESSION_INTRADAY, SESSION_EOD], index=0 if default_session == SESSION_INTRADAY else 1)
+
+    tickers_text = st.sidebar.text_area("追蹤清單（逗號分隔，模擬期）", value=",".join(DEFAULT_TICKERS), height=80)
+    tickers = [x.strip() for x in tickers_text.split(",") if x.strip()]
+
+    run_btn = st.sidebar.button("Run")
     if not run_btn:
         st.info("按左側 Run 產生 Top 清單與 JSON。")
         return
 
-    # 1) Load market data (你的 CSV)
+    # 1) Load market data
     df = _load_market_csv(market)
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+
     latest_date = df["Date"].max()
     trade_date = _fmt_date(latest_date)
 
@@ -246,15 +275,48 @@ def app():
         st.error(f"Analyzer error: {err}")
         return
 
-    # 2.1 航運估值 overlay
-    df_top = _apply_shipping_valuation_overrides(df_top)
+    # 2.1) 中文名補上（至少你監控池一定有）
+    if "Name" not in df_top.columns:
+        df_top["Name"] = df_top["Symbol"].map(NAME_ZH_MAP).fillna("")
 
-    # 3) Fetch institutional (FinMind) - 免費期常遇到 402
+    # 3) Global summary（美股/日經/匯率）
+    st.subheader
+    st.subheader("全球市場摘要（美股/日經/匯率）")
+    gsum = _load_global_summary()
+    if gsum is None or gsum.empty:
+        st.warning("全球摘要資料缺失（global_market_summary.csv 不存在，且 yfinance 補抓失敗）")
+    else:
+        st.dataframe(gsum, use_container_width=True)
+
+    # 4) Market amount: TWSE + TPEx（抓不到就用 yfinance proxy（昨日保底））
+    amt = fetch_amount_total(trade_date)
+    amount_sources = {"twse": amt.source_twse, "tpex": amt.source_tpex, "error": amt.error}
+
+    amount_twse = amt.amount_twse
+    amount_tpex = amt.amount_tpex
+    amount_total = amt.amount_total
+
+    # 開盤前/昨日模式：若官方抓不到 → 用 yfinance proxy（至少昨日有數字）
+    if amount_total is None:
+        proxy, proxy_src = yfinance_amount_proxy(tickers, trade_date=trade_date)
+        if proxy is not None:
+            amount_total = proxy
+            amount_sources["proxy"] = proxy_src
+
+    # 5) intraday normalization（只有在 INTRADAY 且 amount_total 有值才算）
+    norm = {"progress": None, "amount_norm_cum_ratio": None, "amount_norm_slice_ratio": None, "amount_norm_label": "UNKNOWN"}
+    if session == SESSION_INTRADAY and isinstance(amount_total, int):
+        # 模擬期：先用 20D 代理為 None（你之後可接真正 avg20）
+        avg20_amount_total_median = None
+        norm = intraday_norm(amount_total_now=amount_total, amount_total_prev=None, avg20_amount_total=avg20_amount_total_median)
+
+    # 6) Institutional (FinMind) — 免費期遇到 402 就 UNAVAILABLE
     start_date = (pd.to_datetime(trade_date) - pd.Timedelta(days=45)).strftime("%Y-%m-%d")
     end_date = trade_date
     symbols = df_top["Symbol"].astype(str).tolist()
 
     inst_fetch_error = None
+    inst_df = pd.DataFrame(columns=["date", "symbol", "net_amount"])
     try:
         inst_df = fetch_finmind_institutional(
             symbols=symbols,
@@ -263,104 +325,58 @@ def app():
             token=os.getenv("FINMIND_TOKEN", None),
         )
     except Exception as e:
-        inst_df = pd.DataFrame(columns=["date", "symbol", "net_amount"])
         inst_fetch_error = f"{type(e).__name__}: {str(e)}"
         st.warning(f"個股法人資料抓取失敗：{inst_fetch_error}")
 
+    # 7) inst_status & degraded_mode（V15.7 裁決）
     inst_status, inst_dates_3d, data_date_finmind = _decide_inst_status(inst_df, symbols, trade_date, inst_fetch_error)
 
-    # 4) Merge institutional into df_top
+    # ✅ 資料降級防線（你指定：任一關鍵資料缺失 → 禁止 BUY/TRIAL）
+    amount_ok = isinstance(amount_total, int) and amount_total > 0
+    inst_ok = (inst_status == "READY")  # 免費期如果不可用，寧願降級
+    degraded_mode = (not amount_ok) or (not inst_ok) or (norm.get("amount_norm_label") == "UNKNOWN" and session == SESSION_INTRADAY)
+
+    # 8) Merge institutional into df_top
     df_top2 = _merge_institutional_into_df_top(df_top, inst_df, trade_date=trade_date)
 
-    # =========================
-    # 5) Market amount: 上市 + 上櫃 = amount_total（優先）
-    # =========================
-    amount_twse = "待更新"
-    amount_tpex = "待更新"
-    amount_total = "待更新"
-    amount_sources = {"twse": None, "tpex": None, "error": None}
-
-    # 20D Median(代理)：模擬期先不做（你之後要做再補）
-    avg20_amount_total_median = None
-
-    if MARKET_AMOUNT_OK:
-        try:
-            ma = fetch_amount_total()
-            amount_twse = f"{ma.amount_twse:,}"
-            amount_tpex = f"{ma.amount_tpex:,}"
-            amount_total = f"{ma.amount_total:,}"
-            amount_sources = {"twse": ma.source_twse, "tpex": ma.source_tpex, "error": None}
-        except Exception as e:
-            amount_sources = {"twse": None, "tpex": None, "error": f"{type(e).__name__}: {e}"}
-
-    # INTRADAY 量能正規化（你的定義：保守看 slice，穩健看 cum，試投忽略）
-    norm = intraday_norm(
-        amount_total_now=int(str(amount_total).replace(",", "")) if str(amount_total).isdigit() else 0,
-        amount_total_prev=None,
-        avg20_amount_total=avg20_amount_total_median,
-    )
-    progress = norm.get("progress")
-    amount_norm_cum_ratio = norm.get("amount_norm_cum_ratio")
-    amount_norm_slice_ratio = norm.get("amount_norm_slice_ratio")
-    amount_norm_label = norm.get("amount_norm_label", "UNKNOWN")
-
-    # =========================
-    # 6) Degraded mode（裁決層）
-    # 規則：任一核心資料缺失 → degraded_mode=True → 禁止 BUY/TRIAL
-    # 核心資料：amount_total（上市+上櫃）、inst_status 可用性
-    # =========================
-    amount_bad = (amount_total in (None, "", "待更新")) or (amount_norm_label == "UNKNOWN")
-    inst_bad = (inst_status in ("UNAVAILABLE",))  # PENDING 不一定要降級，可依你 Arbiter 規則再細分
-
-    degraded_mode = bool(amount_bad or inst_bad)
-
+    # 9) Macro overview
     macro_overview = {
-        # amount 分拆
-        "amount_twse": amount_twse,
-        "amount_tpex": amount_tpex,
-        "amount_total": amount_total,
+        "amount_twse": "待更新" if amount_twse is None else f"{amount_twse:,}",
+        "amount_tpex": "待更新" if amount_tpex is None else f"{amount_tpex:,}",
+        "amount_total": "待更新" if not amount_ok else f"{amount_total:,}",
         "amount_sources": amount_sources,
-        "avg20_amount_total_median": avg20_amount_total_median,
-        # norm
-        "progress": progress,
-        "amount_norm_cum_ratio": amount_norm_cum_ratio,
-        "amount_norm_slice_ratio": amount_norm_slice_ratio,
-        "amount_norm_label": amount_norm_label,
-        # inst
+        "avg20_amount_total_median": None,
+        "progress": norm.get("progress"),
+        "amount_norm_cum_ratio": norm.get("amount_norm_cum_ratio"),
+        "amount_norm_slice_ratio": norm.get("amount_norm_slice_ratio"),
+        "amount_norm_label": norm.get("amount_norm_label", "UNKNOWN"),
         "inst_net": "A:0.00億 | B:0.00億",
         "trade_date": trade_date,
         "inst_status": inst_status,
         "inst_dates_3d": inst_dates_3d,
         "data_date_finmind": data_date_finmind,
-        # system flags
         "kill_switch": False,
         "v14_watch": False,
         "degraded_mode": degraded_mode,
         "data_mode": "INTRADAY" if session == SESSION_INTRADAY else "EOD",
-        # backward compatible
-        "amount": amount_total,
     }
-
-    market_comment = generate_market_comment_retail(macro_overview)
-    macro_overview["market_comment"] = market_comment
+    macro_overview["market_comment"] = _market_comment(macro_overview)
 
     macro_data = {"overview": macro_overview, "indices": []}
 
-    # 7) Generate JSON for Arbiter
+    # 10) Generate JSON
     json_text = generate_ai_json(df_top2, market=market, session=session, macro_data=macro_data)
 
-    # =========================
-    # UI
-    # =========================
+    # ---------------- UI ----------------
     st.subheader("今日市場狀態判斷（V15.7 裁決）")
-    st.info(market_comment)
+    st.info(macro_overview["market_comment"])
 
     st.subheader("市場成交金額（上市 + 上櫃 = amount_total）")
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("TWSE 上市", amount_twse)
-    c2.metric("TPEx 上櫃", amount_tpex)
-    c3.metric("Total 合計", amount_total)
-    c4.metric("20D Median(代理)", str(avg20_amount_total_median))
+    c1.metric("TWSE 上市", macro_overview["amount_twse"])
+    c2.metric("TPEx 上櫃", macro_overview["amount_tpex"])
+    c3.metric("Total 合計", macro_overview["amount_total"])
+    c4.metric("20D Median(代理)", str(macro_overview["avg20_amount_total_median"]))
 
     st.caption(f"來源/錯誤：{json.dumps(amount_sources, ensure_ascii=False)}")
 
@@ -368,10 +384,10 @@ def app():
     st.code(
         json.dumps(
             {
-                "progress": progress,
-                "cum_ratio(穩健型用)": amount_norm_cum_ratio,
-                "slice_ratio(保守型用)": amount_norm_slice_ratio,
-                "label": amount_norm_label,
+                "progress": macro_overview["progress"],
+                "cum_ratio(穩健型用)": macro_overview["amount_norm_cum_ratio"],
+                "slice_ratio(保守型用)": macro_overview["amount_norm_slice_ratio"],
+                "label": macro_overview["amount_norm_label"],
             },
             ensure_ascii=False,
             indent=2,
@@ -379,37 +395,25 @@ def app():
         language="json",
     )
 
-    # 航運估值卡
-    hit = df_top2[df_top2["Symbol"].isin(list(SHIPPING_VALUATION.keys()))].copy()
-    if not hit.empty:
-        st.subheader("航運股估值快照（財報狗/玩股網）")
-
-        def _render(v: dict) -> str:
-            if not isinstance(v, dict):
-                return ""
-            return (
-                f"OPM({v.get('opm_q_period')}): {v.get('opm_q')}% | "
-                f"EPS(TTM): {v.get('eps_ttm')} | "
-                f"Price({v.get('price_ref_date')}): {v.get('price_ref')} | "
-                f"PE≈{v.get('pe_calc')} | {v.get('label')} | "
-                f"來源: {v.get('source')}"
-            )
-
-        show = hit[["Symbol", "Name", "Valuation_Override"]].copy()
-        show["估值摘要"] = show["Valuation_Override"].apply(_render)
-        st.dataframe(show[["Symbol", "Name", "估值摘要"]], use_container_width=True)
-
     st.subheader("Top List")
+    # 顯示：代碼 + 中文名
+    if "Name" in df_top2.columns:
+        df_top2["Name"] = df_top2["Symbol"].map(NAME_ZH_MAP).fillna(df_top2["Name"].fillna(""))
+    else:
+        df_top2["Name"] = df_top2["Symbol"].map(NAME_ZH_MAP).fillna("")
     st.dataframe(df_top2, use_container_width=True)
 
     st.subheader("AI JSON (Arbiter Input)")
     st.code(json_text, language="json")
 
+    # Save output (Streamlit Cloud 容器可寫，但會重置；這裡仍保留給你下載/除錯)
     outname = f"ai_payload_{market}_{trade_date.replace('-', '')}_{session.lower()}.json"
-    with open(outname, "w", encoding="utf-8") as f:
-        f.write(json_text)
-    st.success(f"JSON 已輸出：{outname}")
-
+    try:
+        with open(os.path.join(DATA_DIR, outname), "w", encoding="utf-8") as f:
+            f.write(json_text)
+        st.success(f"JSON 已輸出：data/{outname}")
+    except Exception as e:
+        st.warning(f"JSON 寫檔失敗（不影響畫面）：{type(e).__name__}: {e}")
 
 if __name__ == "__main__":
     app()
