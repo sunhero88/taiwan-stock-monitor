@@ -3,4 +3,6 @@ pandas
 numpy
 yfinance
 requests
-certifi
+lxml
+html5lib
+beautifulsoup4
