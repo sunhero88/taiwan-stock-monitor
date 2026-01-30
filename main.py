@@ -7,6 +7,28 @@ from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional
 
 import streamlit as st
+
+try:
+    import pandas as pd
+    from analyzer import (
+        TZ_TAIPEI,
+        now_taipei,
+        find_latest_trade_date,
+        fetch_twse_stock_day_all,
+        build_topn_from_market_dayall,
+        merge_with_positions,
+        fetch_global_summary,
+        fetch_index_yf,
+        fetch_twse_institutional_all,
+    )
+    from market_amount import fetch_amount_total_latest
+
+except Exception as e:
+    st.set_page_config(page_title="Boot Error", layout="wide")
+    st.error("啟動失敗：模組匯入階段就出錯（main.py import analyzer/market_amount）。")
+    st.code(str(e))
+    st.stop()
+
 import pandas as pd
 
 from analyzer import (
@@ -317,3 +339,4 @@ def app():
 
 if __name__ == "__main__":
     app()
+
