@@ -3,328 +3,317 @@
 from __future__ import annotations
 
 import json
-import os
-from datetime import datetime, timezone, timedelta
-from typing import Dict, List, Tuple
+from datetime import datetime, timedelta, timezone
+from typing import List, Dict, Any, Optional
 
-import pandas as pd
 import streamlit as st
+import pandas as pd
 
 from analyzer import (
-    run_analysis,
-    generate_ai_json,
-    SESSION_PREOPEN,
-    SESSION_INTRADAY,
-    SESSION_EOD,
+    TZ_TAIPEI,
+    now_taipei,
+    find_latest_trade_date,
+    fetch_twse_stock_day_all,
+    build_topn_from_market_dayall,
+    merge_with_positions,
+    fetch_global_summary,
+    fetch_index_yf,
+    fetch_twse_institutional_all,
 )
+from market_amount import fetch_amount_total_latest
 
-TZ_TAIPEI = timezone(timedelta(hours=8))
+APP_TITLE = "Sunhero｜股市智能超盤中控台（Top20 + 持倉監控 / V15.7 SIM-FREE）"
 
+def _days_stale(latest_trade_date: str, asof_date: Optional[str]) -> Optional[int]:
+    if not latest_trade_date or not asof_date:
+        return None
+    try:
+        d0 = datetime.strptime(latest_trade_date, "%Y-%m-%d").date()
+        d1 = datetime.strptime(asof_date, "%Y-%m-%d").date()
+        return (d0 - d1).days
+    except Exception:
+        return None
 
-# =========
-# 工具：資料載入 / 名稱映射
-# =========
-def _load_market_csv(market: str) -> pd.DataFrame:
+def _copy_button(label: str, text: str, key: str):
+    # Streamlit 原生沒有 clipboard；用 HTML/JS
+    html = f"""
+    <div style="display:flex; gap:8px; align-items:center;">
+      <button onclick="navigator.clipboard.writeText(document.getElementById('{key}').textContent)"
+              style="padding:6px 10px;border-radius:8px;border:1px solid #ccc;background:#fff;cursor:pointer;">
+        {label}
+      </button>
+      <span style="color:#666;font-size:12px;">（若瀏覽器阻擋剪貼簿，請改用 Download）</span>
+    </div>
+    <pre id="{key}" style="display:none;">{text}</pre>
     """
-    預設你 repo 新結構：data/xxx.csv
-    相容舊結構：根目錄 data_tw-share.csv / data_tw.csv
-    """
-    candidates = [
-        os.path.join("data", f"data_{market}.csv"),
-        f"data_{market}.csv",
-        os.path.join("data", "data_tw-share.csv"),
-        "data_tw-share.csv",
-        os.path.join("data", "data_tw.csv"),
-        "data_tw.csv",
-    ]
-    for p in candidates:
-        if os.path.exists(p):
-            return pd.read_csv(p)
-    raise FileNotFoundError("找不到市場資料檔。請確認 data/data_tw-share.csv 或 data_tw-share.csv 是否存在。")
+    st.components.v1.html(html, height=45)
 
-
-def _load_name_map() -> Dict[str, str]:
-    """
-    優先讀取 configs/name_map.json（你可自行維護，避免 yfinance 限流）
-    格式：{"2330.TW":"台積電", ...}
-    """
-    path = os.path.join("configs", "name_map.json")
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                m = json.load(f)
-            return {str(k): str(v) for k, v in m.items()}
-        except Exception:
-            return {}
-    # 最小內建（你可自行擴充）
-    return {
-        "2330.TW": "台積電",
-        "2317.TW": "鴻海",
-        "2454.TW": "聯發科",
-        "2382.TW": "廣達",
-        "3231.TW": "緯創",
-        "2308.TW": "台達電",
-        "2603.TW": "長榮",
-        "2609.TW": "陽明",
-    }
-
-
-def _today_taipei() -> datetime:
-    return datetime.now(tz=TZ_TAIPEI)
-
-
-def _fmt_date(dt) -> str:
-    return pd.to_datetime(dt).strftime("%Y-%m-%d")
-
-
-def _staleness_guard(trade_date_str: str, session: str) -> Tuple[bool, str]:
-    """
-    你要「最新資料」：若資料落後太多 → 直接 degraded_mode
-    - 盤前：允許 trade_date = 最近一個交易日（通常是昨日）
-    - 盤中/盤後：trade_date 不能落後太久（>1個自然日先保守降級）
-    """
-    now = _today_taipei()
-    td = pd.to_datetime(trade_date_str).to_pydatetime().replace(tzinfo=TZ_TAIPEI)
-
-    delta_days = (now.date() - td.date()).days
-
-    if session == SESSION_PREOPEN:
-        # 盤前：至少要是「最近一個交易日」，自然日差距通常 1（遇假日可能>1）
-        if delta_days >= 4:
-            return True, f"DATA_STALE_PREOPEN_{delta_days}D"
-        return False, "OK"
-
-    # 盤中/盤後：若落後 >=2 天 → 視為失真
-    if delta_days >= 2:
-        return True, f"DATA_STALE_{delta_days}D"
-    return False, "OK"
-
-
-def _merge_top20_plus_positions(df_top: pd.DataFrame, positions: List[dict]) -> pd.DataFrame:
-    """
-    最終分析清單 = Top20 + positions（去重）
-    若持倉不在 Top20，也要拉進來，避免「買了台積電隔天沒入榜就不管」。
-    """
-    if not positions:
-        return df_top
-
-    pos_syms = []
-    for p in positions:
-        sym = str(p.get("symbol", "")).strip()
-        if sym:
-            pos_syms.append(sym)
-
-    pos_syms = sorted(set(pos_syms))
-    if not pos_syms:
-        return df_top
-
-    # 把持倉補進 df_top（不存在則新增一行，Price/Score 等先空白，後面用 market_df 最新價補）
-    out = df_top.copy()
-    existing = set(out["Symbol"].astype(str).tolist())
-    missing = [s for s in pos_syms if s not in existing]
-
-    if missing:
-        add = pd.DataFrame({
-            "Date": [out["Date"].iloc[0] if len(out) else "" for _ in missing],
-            "Symbol": missing,
-            "Price": [0.0 for _ in missing],
-            "Volume": [0.0 for _ in missing],
-            "MA_Bias": [0.0 for _ in missing],
-            "Vol_Ratio": [0.0 for _ in missing],
-            "Body_Power": [0.0 for _ in missing],
-            "Score": [-9999.0 for _ in missing],
-            "Tag": ["○觀察(持倉監控)" for _ in missing],
-        })
-        out = pd.concat([out, add], ignore_index=True)
-
-    return out
-
-
-def _fill_prices_from_market(df_list: pd.DataFrame, df_market: pd.DataFrame) -> pd.DataFrame:
-    """
-    對於「持倉補入」但沒有 Price 的列，用 market_df 最新 Close 補齊。
-    """
-    m = df_market.copy()
-    m["Date"] = pd.to_datetime(m["Date"], errors="coerce")
-    m["Symbol"] = m["Symbol"].astype(str)
-    m["Close"] = pd.to_numeric(m["Close"], errors="coerce")
-    m = m.dropna(subset=["Date", "Symbol", "Close"]).sort_values(["Symbol", "Date"])
-    last = m.groupby("Symbol", as_index=False).tail(1)[["Symbol", "Close"]].copy()
-    price_map = dict(zip(last["Symbol"].tolist(), last["Close"].tolist()))
-
-    out = df_list.copy()
-    out["Price"] = out.apply(
-        lambda r: float(price_map.get(str(r["Symbol"]), r.get("Price", 0.0))) if float(r.get("Price", 0.0)) <= 0 else float(r["Price"]),
-        axis=1
-    )
-    return out
-
+def _session_to_data_mode(session: str) -> str:
+    # 盤前/盤中/盤後映射
+    if session == "PREOPEN":
+        return "PREOPEN"
+    if session == "INTRADAY":
+        return "INTRADAY"
+    return "EOD"
 
 def app():
-    st.set_page_config(page_title="Sunhero｜股市智能超盤中控台", layout="wide")
-    st.title("Sunhero｜股市智能超盤中控台（Top20 + 持倉監控 / V15.7 SIM-FREE）")
+    st.set_page_config(page_title=APP_TITLE, layout="wide")
+    st.title(APP_TITLE)
 
-    # =========
-    # Sidebar：模式/市場/TopN
-    # =========
-    market = st.sidebar.selectbox("Market", ["tw-share", "tw"], index=0)
-    session = st.sidebar.selectbox("Session", [SESSION_PREOPEN, SESSION_INTRADAY, SESSION_EOD], index=0)
-    topn = st.sidebar.selectbox("TopN（固定追蹤數量）", [20, 30, 50], index=0)
+    # ---------------- Sidebar Controls ----------------
+    st.sidebar.header("設定")
 
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("大盤指數輸入（你指定要寫入 macro）")
+    session = st.sidebar.selectbox("Session", ["PREOPEN", "INTRADAY", "EOD"], index=0)
+    topn = st.sidebar.selectbox("TopN（固定追蹤數量）", [10, 20, 30, 50], index=1)
 
-    # 盤前：輸入昨日/最後收盤日大盤
-    idx_level = st.sidebar.number_input("Index Level（大盤指數）", value=0.0, step=1.0, format="%.2f")
-    idx_change = st.sidebar.number_input("Index Change（漲跌點數）", value=0.0, step=1.0, format="%.2f")
+    positions_text = st.sidebar.text_area("持倉（會納入追蹤）\n輸入代碼（逗號分隔）", value="2330.TW", height=90)
+    positions = [x.strip() for x in positions_text.split(",") if x.strip()]
 
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("帳戶/持倉（模擬用）")
+    st.sidebar.caption("免費模擬期：法人資料改用 TWSE T86（免 FinMind 402）。")
 
-    cash_balance = st.sidebar.number_input("cash_balance（NTD）", value=2_000_000, step=10_000)
-    total_equity = st.sidebar.number_input("total_equity（NTD）", value=2_000_000, step=10_000)
+    # ---------------- Core: Latest Trade Date ----------------
+    now = now_taipei()
+    latest_dt = find_latest_trade_date(max_lookback_days=10)
+    latest_trade_date = latest_dt.strftime("%Y-%m-%d")
 
-    default_positions = [
-        # {"symbol":"2330.TW","shares":1000,"avg_cost":1500,"entry_date":"2026-01-15","status":"HOLD","sector":"Semiconductor"}
-    ]
-    positions_text = st.sidebar.text_area(
-        "positions（JSON array）",
-        value=json.dumps(default_positions, ensure_ascii=False, indent=2),
-        height=180
-    )
+    st.info(f"目前台北時間：{now.strftime('%Y-%m-%d %H:%M')} ｜模式：{session}｜最新可用交易日：{latest_trade_date}")
 
-    run_btn = st.sidebar.button("Run")
+    # ---------------- Global Summary (US/FX etc) ----------------
+    st.subheader("全球市場摘要（美股/日經/匯率）— 最新可用交易日收盤")
+    gdf = fetch_global_summary()
+    st.dataframe(gdf, use_container_width=True)
 
-    if not run_btn:
-        st.info("按左側 Run：會產生『Top20 + 持倉』清單與 Arbiter JSON。")
-        return
-
-    # =========
-    # 1) Load market data
-    # =========
-    df_market = _load_market_csv(market)
-
-    df_market["Date"] = pd.to_datetime(df_market["Date"], errors="coerce")
-    latest_date = df_market["Date"].max()
-    trade_date = _fmt_date(latest_date)
-
-    # =========
-    # 2) Top20 analysis（全市場掃描）
-    # =========
-    from analyzer import AnalyzerConfig
-    cfg = AnalyzerConfig(topn=int(topn))
-    df_top, err = run_analysis(df_market, session=session, cfg=cfg)
-    if err:
-        st.error(f"Analyzer error: {err}")
-        return
-
-    # =========
-    # 3) Parse positions
-    # =========
+    # ---------------- TW Index (Auto) ----------------
+    # 台股大盤：^TWII（免費階段最穩）
+    # PREOPEN/EOD：用最近日 K（收盤）
+    # INTRADAY：yfinance 有時提供延遲即時；若抓不到就仍顯示最近日並標示延遲
+    idx = None
+    idx_err = None
     try:
-        positions = json.loads(positions_text) if positions_text.strip() else []
-        if not isinstance(positions, list):
-            raise ValueError("positions 必須是 JSON array")
+        idx = fetch_index_yf("^TWII", "TWSE_TAIEX", period="10d")
     except Exception as e:
-        st.error(f"positions JSON 解析失敗：{type(e).__name__}: {str(e)}")
-        return
+        idx_err = str(e)
 
-    account = {
-        "cash_balance": int(cash_balance),
-        "total_equity": int(total_equity),
-        "positions": positions
-    }
-
-    # =========
-    # 4) Top20 + positions（去重後一起分析）
-    # =========
-    df_list = _merge_top20_plus_positions(df_top, positions)
-    df_list = _fill_prices_from_market(df_list, df_market)
-
-    # =========
-    # 5) 名稱（中文）
-    # =========
-    name_map = _load_name_map()
-    df_list["Name"] = df_list["Symbol"].astype(str).map(lambda s: name_map.get(s, s))
-
-    # =========
-    # 6) Macro：大盤指數與漲跌幅（你指定的 2/3/4）
-    # =========
-    # 你要求：
-    # - 盤前：輸入昨日(最後收盤日)大盤與漲跌幅
-    # - 盤中：輸入最新大盤與漲跌幅
-    # - 盤後：輸入當日大盤與漲跌幅
-    # 這裡統一由 UI 輸入寫入 macro（因為你要「最新可靠」，不要自動亂抓）
-    degraded_by_stale, stale_reason = _staleness_guard(trade_date, session)
-
-    macro_overview = {
-        "trade_date": trade_date,
-        "data_mode": session,
-        "index_level": float(idx_level),
-        "index_change": float(idx_change),
-
-        # 量能/法人（免費模擬期：允許 UNAVAILABLE，不讓系統爆掉）
-        "amount_total": "UNAVAILABLE(FREE_SIM)",
-        "inst_status": "UNAVAILABLE(FREE_SIM)",
-        "inst_dates_3d": [],
-        "data_date_finmind": None,
-
-        # 系統旗標（保留你的風控入口）
-        "kill_switch": False,
-        "v14_watch": False,
-        "degraded_mode": bool(degraded_by_stale),  # 最新性不夠就降級
-        "degraded_reason": stale_reason,
-    }
-
-    # market_comment 僅供人類讀，不應成為 arbiter decision 依據
-    if degraded_by_stale:
-        macro_overview["market_comment"] = (
-            f"資料日期 {trade_date} 與目前時間落差過大（{stale_reason}），"
-            "為避免用舊數據導致裁決失真，已啟動資料降級：禁止 BUY/TRIAL。"
-        )
+    st.subheader("台股大盤指數（自動）")
+    if idx is None:
+        st.error(f"台股指數抓取失敗：{idx_err}")
+        idx_asof = None
+        index_level = None
+        index_change = None
+        index_chg_pct = None
+        idx_source = f"ERR:{idx_err}"
     else:
-        macro_overview["market_comment"] = (
-            f"{session} 模式：大盤 {idx_level:,.2f} 點、漲跌 {idx_change:+,.2f}。"
-            "Top20 以全市場相對排名每日更新；持倉會額外加入監控。"
-        )
+        idx_asof = idx.asof_date
+        index_level = idx.close
+        index_change = idx.change
+        index_chg_pct = idx.chg_pct
+        idx_source = idx.source
 
-    macro_data = {
-        "overview": macro_overview,
-        "indices": []
+        stale = _days_stale(latest_trade_date, idx_asof)
+        note = ""
+        if stale is not None and stale > 0:
+            note = f"（⚠️ DATA_STALE_{stale}D）"
+        st.write(f"**{idx.name}**：{index_level}，漲跌 {index_change}（{index_chg_pct}%）｜日期 {idx_asof}｜來源 {idx_source} {note}")
+
+    # ---------------- Market Amount (TWSE/TPEx) ----------------
+    st.subheader("市場成交金額（官方優先 / 免費 best-effort）")
+    amt = fetch_amount_total_latest()
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("TWSE 上市", "待更新" if amt.amount_twse is None else f"{amt.amount_twse/1e8:,.0f} 億")
+    c2.metric("TPEx 上櫃", "待更新" if amt.amount_tpex is None else f"{amt.amount_tpex/1e8:,.0f} 億")
+    c3.metric("Total 合計", "待更新" if amt.amount_total is None else f"{amt.amount_total/1e8:,.0f} 億")
+    c4.metric("最新交易日", latest_trade_date)
+
+    st.caption(f"來源：TWSE={amt.source_twse}｜TPEx={amt.source_tpex}")
+    if amt.warnings:
+        st.warning("；".join(amt.warnings))
+
+    # ---------------- TopN (True market ranking) ----------------
+    st.subheader(f"今日分析清單（Top{topn} + 持倉監控）— 以全市場日行情做真正排名")
+
+    top_df = pd.DataFrame()
+    dayall_source = ""
+    top_build_err = None
+    data_asof = None
+
+    try:
+        dayall = fetch_twse_stock_day_all(latest_dt)
+        dayall_source = dayall.source
+        top_df = build_topn_from_market_dayall(dayall, topn=topn, preselect_by_turnover=250)
+        data_asof = latest_trade_date  # dayall 是最新交易日口徑
+    except Exception as e:
+        top_build_err = str(e)
+
+    if top_build_err:
+        st.error(f"TopN 建立失敗：{top_build_err}")
+        st.stop()
+
+    final_df = merge_with_positions(top_df, positions)
+    final_df_display = final_df.copy()
+
+    # 補上中文名：TopN 來自 TWSE OpenAPI 已是中文；positions 補入的 name 可能空
+    # 這裡不強行從其他來源補，避免誤對映；若要補，可用 TWSE 公司基本資料表再擴充。
+    cols = ["symbol","name","date","close","ret20_pct","vol_ratio","ma_bias_pct","volume","score","rank","tag"]
+    for c in cols:
+        if c not in final_df_display.columns:
+            final_df_display[c] = None
+    st.dataframe(final_df_display[cols], use_container_width=True)
+
+    # ---------------- Institutional (TWSE T86) ----------------
+    st.subheader("三大法人買賣超（TWSE T86 / 免費）")
+    inst_status = "READY"
+    inst_asof = latest_trade_date
+    inst_err = None
+    inst_map = {}
+
+    try:
+        inst_df = fetch_twse_institutional_all(latest_dt)
+        inst_map = dict(zip(inst_df["symbol"], inst_df["inst_net"]))
+        st.caption(f"法人資料日期：{inst_asof}｜來源：TWSE T86")
+        # 展示：對 final_df 的前三大法人淨買賣
+        show = final_df_display[["symbol","name"]].copy()
+        show["inst_net_shares"] = show["symbol"].map(inst_map).fillna(0).astype(int)
+        st.dataframe(show, use_container_width=True)
+    except Exception as e:
+        inst_status = "UNAVAILABLE"
+        inst_err = str(e)
+        st.warning(f"法人資料不可用：{inst_err}")
+
+    # ---------------- Audit & Degraded Mode ----------------
+    audit_flags = []
+    # 指數日期稽核
+    idx_stale = _days_stale(latest_trade_date, idx_asof)
+    if idx_stale is None:
+        audit_flags.append("INDEX_MISSING")
+    elif idx_stale >= 1:
+        audit_flags.append(f"DATA_STALE_INDEX_{idx_stale}D")
+
+    # TopN 稽核：top_df date 應該等於 latest_trade_date（我們口徑固定）
+    top_stale = _days_stale(latest_trade_date, data_asof)
+    if top_stale is None:
+        audit_flags.append("TOPN_DATE_MISSING")
+    elif top_stale >= 1:
+        audit_flags.append(f"DATA_STALE_TOPN_{top_stale}D")
+
+    # 成交金額稽核：TWSE amount 必須有，TPEx 可缺但會警告
+    if amt.amount_twse is None:
+        audit_flags.append("AMOUNT_TWSE_MISSING")
+    if amt.amount_total is None:
+        audit_flags.append("AMOUNT_TOTAL_MISSING_PARTIAL")
+
+    # 法人稽核
+    if inst_status != "READY":
+        audit_flags.append("INST_UNAVAILABLE")
+
+    # 免費模擬版裁決：
+    # - 若指數缺失 或 TopN 日期落後>=1 或 TWSE amount 缺失 => degraded_mode true
+    degraded_mode = False
+    hard_triggers = {"INDEX_MISSING", "TOPN_DATE_MISSING", "AMOUNT_TWSE_MISSING"}
+    if any(f in hard_triggers for f in audit_flags):
+        degraded_mode = True
+    if any(f.startswith("DATA_STALE_INDEX_") for f in audit_flags):
+        degraded_mode = True
+    if any(f.startswith("DATA_STALE_TOPN_") for f in audit_flags):
+        degraded_mode = True
+
+    # ---------------- AI JSON (Arbiter Input) ----------------
+    meta = {
+        "system": "Predator V15.7 (SIM-FREE)",
+        "market": "tw-share",
+        "timestamp": now.strftime("%Y-%m-%d %H:%M"),
+        "session": session,
+        "topn": int(topn),
     }
 
-    # =========
-    # 7) Generate Arbiter JSON
-    # =========
-    json_text = generate_ai_json(
-        df_top=df_list[[
-            "Date","Symbol","Price","Volume","MA_Bias","Vol_Ratio","Body_Power","Score","Tag"
-        ]].copy(),
-        market=market,
-        session=session,
-        macro_data=macro_data,
-        name_map={k: v for k, v in name_map.items()},
-        account=account,
-    )
+    macro = {
+        "overview": {
+            "latest_trade_date": latest_trade_date,
+            "data_mode": _session_to_data_mode(session),
 
-    # =========
-    # UI output
-    # =========
-    st.subheader("1) 今日分析清單（Top20 + 持倉監控）")
-    st.caption(f"資料日期：{trade_date}｜Session：{session}｜TopN：{topn}｜清單筆數：{len(df_list)}（Top20 + positions 去重後）")
-    st.dataframe(df_list[["Symbol","Name","Price","MA_Bias","Vol_Ratio","Score","Tag"]], use_container_width=True)
+            # 大盤
+            "index_symbol": "^TWII",
+            "index_level": index_level,
+            "index_change": index_change,
+            "index_chg_pct": index_chg_pct,
+            "index_asof": idx_asof,
+            "index_source": idx_source,
 
-    st.subheader("2) Macro（你指定要補的大盤指數與漲跌幅）")
-    st.json(macro_overview)
+            # 成交金額（元）
+            "amount_twse": amt.amount_twse,
+            "amount_tpex": amt.amount_tpex,
+            "amount_total": amt.amount_total,
+            "amount_source_twse": amt.source_twse,
+            "amount_source_tpex": amt.source_tpex,
 
-    st.subheader("3) AI JSON (Arbiter Input)")
+            # 法人
+            "inst_status": inst_status,
+            "inst_asof": inst_asof if inst_status == "READY" else None,
+            "inst_source": "TWSE T86" if inst_status == "READY" else f"ERR:{inst_err}",
+
+            # 裁決/稽核
+            "audit_flags": audit_flags,
+            "degraded_mode": degraded_mode,
+        }
+    }
+
+    stocks = []
+    for _, r in final_df_display.iterrows():
+        sym = str(r.get("symbol", "")).strip()
+        if sym == "":
+            continue
+        stocks.append({
+            "Symbol": sym,
+            "Name": r.get("name", ""),
+            "Date": r.get("date", None),
+            "Close": r.get("close", None),
+            "ret20_pct": r.get("ret20_pct", None),
+            "vol_ratio": r.get("vol_ratio", None),
+            "ma_bias_pct": r.get("ma_bias_pct", None),
+            "volume": r.get("volume", None),
+            "Score": r.get("score", None),
+            "Rank": r.get("rank", None),
+            "Tag": r.get("tag", None),
+            # 法人（若可用）
+            "Inst_Net_Shares": int(inst_map.get(sym, 0)) if inst_status == "READY" else None,
+        })
+
+    arbiter_input = {
+        "meta": meta,
+        "macro": macro,
+        "stocks": stocks,
+        "positions": positions,
+        "positions_count": len(positions),
+        "final_universe_count": len(stocks),
+    }
+
+    st.subheader("AI JSON（Arbiter Input）— 可回溯（模擬期免費）")
+    json_text = json.dumps(arbiter_input, ensure_ascii=False, indent=2)
+
+    _copy_button("複製 JSON", json_text, key="arbiter_json_blob")
+    st.download_button("Download JSON", data=json_text, file_name=f"arbiter_input_{latest_trade_date}_{session}.json", mime="application/json")
     st.code(json_text, language="json")
 
-    outname = f"ai_payload_{market}_{trade_date.replace('-', '')}_{session.lower()}.json"
-    with open(outname, "w", encoding="utf-8") as f:
-        f.write(json_text)
-    st.success(f"JSON 已輸出：{outname}")
+    # ---------------- Human-readable judgement ----------------
+    st.subheader("今日系統判斷（白話解釋）")
+    bullets = []
+    if degraded_mode:
+        bullets.append(f"系統判定：**degraded_mode = true** → 強制禁止 BUY/TRIAL（原因：{', '.join(audit_flags) if audit_flags else 'N/A'}）")
+    else:
+        bullets.append(f"系統判定：**資料稽核通過**（audit_flags={audit_flags}）→ 可進入下一層 Arbiter 規則判定。")
 
+    bullets.append(f"追蹤股票數量：Top{topn} + 持倉 {len(positions)} → 最終輸出 {len(stocks)} 檔。")
+    bullets.append(f"Top{topn} 來源：{dayall_source}（全市場日行情→真正排名）")
+    bullets.append(f"大盤指數：{index_level}（{index_change} / {index_chg_pct}%）｜日期 {idx_asof}｜來源 {idx_source}")
+    bullets.append(f"成交金額：TWSE={amt.amount_twse}｜TPEx={amt.amount_tpex}｜Total={amt.amount_total}（元）")
+
+    if inst_status == "READY":
+        bullets.append("法人資料：TWSE T86 可用（免費官方）")
+    else:
+        bullets.append("法人資料：不可用（免費階段會保守降級，避免錯判）")
+
+    for b in bullets:
+        st.write("• " + b)
 
 if __name__ == "__main__":
     app()
