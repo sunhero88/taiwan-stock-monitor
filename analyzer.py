@@ -2,268 +2,454 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import json
+import math
+import time as _time
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone, date
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+import requests
+import yfinance as yf
 
-SESSION_PREOPEN = "PREOPEN"   # 盤前（輸入昨日/最後收盤日的大盤）
-SESSION_INTRADAY = "INTRADAY" # 盤中（輸入當下大盤）
-SESSION_EOD = "EOD"           # 盤後（輸入當日收盤大盤）
+TZ_TAIPEI = timezone(timedelta(hours=8))
 
+USER_AGENT = {
+    "User-Agent": "Mozilla/5.0 (compatible; SunheroStockBot/1.0; +https://github.com/)"
+}
+
+# --- Utilities ----------------------------------------------------------------
+
+def now_taipei() -> datetime:
+    return datetime.now(tz=TZ_TAIPEI)
+
+def ymd(dt: date) -> str:
+    return dt.strftime("%Y-%m-%d")
+
+def yyyymmdd(dt: date) -> str:
+    return dt.strftime("%Y%m%d")
+
+def safe_float(x, default=None):
+    try:
+        if x is None:
+            return default
+        if isinstance(x, (int, float, np.floating)):
+            return float(x)
+        s = str(x).strip().replace(",", "")
+        if s == "" or s.lower() == "nan":
+            return default
+        return float(s)
+    except Exception:
+        return default
+
+def safe_int(x, default=0):
+    try:
+        if x is None:
+            return default
+        if isinstance(x, (int, np.integer)):
+            return int(x)
+        s = str(x).strip().replace(",", "")
+        if s == "" or s.lower() == "nan":
+            return default
+        return int(float(s))
+    except Exception:
+        return default
+
+# --- Data Models ---------------------------------------------------------------
 
 @dataclass
-class AnalyzerConfig:
-    topn: int = 20
-    min_history_days: int = 60
-    vol_lookback: int = 20
-    ma_fast: int = 20
-    ma_slow: int = 60
-    mom_5d: int = 5
-    mom_20d: int = 20
+class MacroIndex:
+    symbol: str
+    name: str
+    asof_date: str
+    close: float
+    change: float
+    chg_pct: float
+    source: str
 
+@dataclass
+class MarketDayAll:
+    trade_date: str
+    df: pd.DataFrame
+    source: str
 
-def _ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
-    required = {"Date", "Symbol", "Close", "Volume"}
-    missing = required - set(df.columns)
-    if missing:
-        raise ValueError(f"Market CSV 缺欄位：{sorted(list(missing))}；需要 Date, Symbol, Close, Volume")
-    out = df.copy()
-    out["Date"] = pd.to_datetime(out["Date"], errors="coerce")
-    out["Symbol"] = out["Symbol"].astype(str)
-    out["Close"] = pd.to_numeric(out["Close"], errors="coerce")
-    out["Volume"] = pd.to_numeric(out["Volume"], errors="coerce")
-    out = out.dropna(subset=["Date", "Symbol", "Close"]).copy()
-    out["Volume"] = out["Volume"].fillna(0)
+# --- TWSE OpenAPI: STOCK_DAY_ALL (全市場日行情) --------------------------------
+# 官方 OpenAPI：全體上市股票當日行情 (含成交金額/成交股數/收盤等)
+# 這是免費階段做「真正全市場排名」最穩定的來源。
+
+def fetch_twse_stock_day_all(trade_dt: date, timeout: int = 20) -> MarketDayAll:
+    url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
+    r = requests.get(url, headers=USER_AGENT, timeout=timeout)
+    r.raise_for_status()
+    data = r.json()
+    if not isinstance(data, list) or len(data) == 0:
+        raise RuntimeError("TWSE OpenAPI STOCK_DAY_ALL 回傳空資料")
+
+    df = pd.DataFrame(data)
+
+    # 欄位常見：Code/Name/TradeVolume/TradeValue/Open/High/Low/Close/Change/Transaction
+    # 做最小兼容映射
+    colmap = {
+        "Code": "symbol",
+        "Name": "name",
+        "TradeVolume": "volume",
+        "TradeValue": "turnover",
+        "Open": "open",
+        "High": "high",
+        "Low": "low",
+        "Close": "close",
+        "Change": "change",
+    }
+    for k, v in colmap.items():
+        if k in df.columns:
+            df[v] = df[k]
+
+    if "symbol" not in df.columns or "close" not in df.columns:
+        raise RuntimeError(f"TWSE STOCK_DAY_ALL 欄位異動，缺 symbol/close，現有欄位={list(df.columns)}")
+
+    # 標準化
+    df["symbol"] = df["symbol"].astype(str).str.strip() + ".TW"
+    if "name" not in df.columns:
+        df["name"] = ""
+    df["name"] = df["name"].astype(str).str.strip()
+
+    for c in ["close", "open", "high", "low", "change"]:
+        if c in df.columns:
+            df[c] = df[c].apply(lambda x: safe_float(x, default=np.nan))
+
+    for c in ["volume", "turnover"]:
+        if c in df.columns:
+            df[c] = df[c].apply(lambda x: safe_int(x, default=0))
+
+    # STOCK_DAY_ALL 是「最新交易日」資料，不一定等於你傳入的 trade_dt
+    # 我們用 yfinance 的 ^TWII 最新交易日去對齊，並在上層做稽核。
+    return MarketDayAll(
+        trade_date=ymd(trade_dt),
+        df=df,
+        source="TWSE OpenAPI STOCK_DAY_ALL",
+    )
+
+def find_latest_trade_date(max_lookback_days: int = 10) -> date:
+    """
+    找最新可用交易日（免費階段用「可取到資料」當作交易日判定）。
+    """
+    today = now_taipei().date()
+    for i in range(max_lookback_days + 1):
+        d = today - timedelta(days=i)
+        # 週末直接略過可加速
+        if d.weekday() >= 5:
+            continue
+        try:
+            _ = fetch_twse_stock_day_all(d)
+            return d
+        except Exception:
+            continue
+    # 最後保底：今天
+    return today
+
+# --- Index / Global Summary via yfinance --------------------------------------
+
+def fetch_index_yf(symbol: str, name: str, period: str = "7d") -> MacroIndex:
+    """
+    用 yfinance 拉指數，抓最近一筆 close + 前一筆 close -> change/chg_pct
+    """
+    tk = yf.Ticker(symbol)
+    hist = tk.history(period=period, interval="1d", auto_adjust=False)
+    if hist is None or hist.empty or "Close" not in hist.columns:
+        raise RuntimeError(f"yfinance 無法取得 {symbol} 歷史資料")
+
+    hist = hist.dropna(subset=["Close"])
+    if len(hist) < 1:
+        raise RuntimeError(f"yfinance {symbol} 無有效 Close")
+
+    last = hist.iloc[-1]
+    last_close = float(last["Close"])
+    last_date = hist.index[-1].date()
+
+    if len(hist) >= 2:
+        prev_close = float(hist.iloc[-2]["Close"])
+    else:
+        prev_close = last_close
+
+    chg = last_close - prev_close
+    chg_pct = (chg / prev_close * 100.0) if prev_close != 0 else 0.0
+
+    return MacroIndex(
+        symbol=symbol,
+        name=name,
+        asof_date=ymd(last_date),
+        close=round(last_close, 4),
+        change=round(chg, 4),
+        chg_pct=round(chg_pct, 4),
+        source="yfinance",
+    )
+
+def fetch_global_summary() -> pd.DataFrame:
+    rows = []
+    # US
+    for sym, nm in [
+        ("^GSPC", "S&P500"),
+        ("^IXIC", "NASDAQ"),
+        ("^DJI", "DOW"),
+        ("^SOX", "SOX"),
+        ("^VIX", "VIX"),
+    ]:
+        try:
+            x = fetch_index_yf(sym, nm, period="10d")
+            rows.append({
+                "Market": "US",
+                "Name": x.name,
+                "Symbol": x.symbol,
+                "Date": x.asof_date,
+                "Close": x.close,
+                "Chg%": x.chg_pct,
+                "Source": x.source,
+            })
+        except Exception as e:
+            rows.append({"Market": "US", "Name": nm, "Symbol": sym, "Date": None, "Close": None, "Chg%": None, "Source": f"ERR:{e}"})
+
+    # ASIA (reference)
+    for sym, nm in [
+        ("^N225", "Nikkei_225"),
+        ("JPY=X", "USD/JPY"),
+        ("TWD=X", "USD/TWD"),
+        ("^TWII", "TWSE_TAIEX"),
+    ]:
+        try:
+            x = fetch_index_yf(sym, nm, period="10d")
+            rows.append({
+                "Market": "ASIA",
+                "Name": x.name,
+                "Symbol": x.symbol,
+                "Date": x.asof_date,
+                "Close": x.close,
+                "Chg%": x.chg_pct,
+                "Source": x.source,
+            })
+        except Exception as e:
+            rows.append({"Market": "ASIA", "Name": nm, "Symbol": sym, "Date": None, "Close": None, "Chg%": None, "Source": f"ERR:{e}"})
+
+    return pd.DataFrame(rows)
+
+# --- Institution (TWSE T86) ---------------------------------------------------
+
+def fetch_twse_institutional_all(trade_dt: date, timeout: int = 20) -> pd.DataFrame:
+    """
+    TWSE 三大法人買賣超 (T86) - 官方 JSON
+    """
+    url = f"https://www.twse.com.tw/rwd/zh/fund/T86?date={yyyymmdd(trade_dt)}&selectType=ALL&response=json"
+    r = requests.get(url, headers=USER_AGENT, timeout=timeout)
+    r.raise_for_status()
+    js = r.json()
+
+    data = js.get("data", [])
+    fields = js.get("fields", [])
+    if not data or not fields:
+        raise RuntimeError("TWSE T86 回傳空資料")
+
+    df = pd.DataFrame(data, columns=fields)
+
+    # 常見欄位：證券代號、證券名稱、外資及陸資買賣超股數、投信買賣超股數、自營商買賣超股數、三大法人買賣超股數
+    # 我們只取「三大法人買賣超股數」
+    code_col = None
+    name_col = None
+    net_col = None
+    for c in df.columns:
+        if "證券代號" in c:
+            code_col = c
+        if "證券名稱" in c:
+            name_col = c
+        if "三大法人" in c and "買賣超" in c and "股數" in c:
+            net_col = c
+
+    if code_col is None or net_col is None:
+        raise RuntimeError(f"TWSE T86 欄位異動，現有欄位={list(df.columns)}")
+
+    out = pd.DataFrame({
+        "symbol": df[code_col].astype(str).str.strip() + ".TW",
+        "name": df[name_col].astype(str).str.strip() if name_col else "",
+        "inst_net": df[net_col].apply(safe_int),
+    })
     return out
 
+# --- Ranking / Scoring --------------------------------------------------------
 
-def _calc_features(df: pd.DataFrame, cfg: AnalyzerConfig) -> pd.DataFrame:
+def _history_for_symbols(symbols: List[str], period: str = "3mo") -> Dict[str, pd.DataFrame]:
     """
-    以「每檔股票」做 rolling 指標，再取最後一筆作為當日(或盤中最新)快照。
+    用 yfinance 批次抓資料（Streamlit Cloud 需節制）
     """
-    d = df.sort_values(["Symbol", "Date"]).copy()
+    joined = " ".join(symbols)
+    data = yf.download(joined, period=period, interval="1d", group_by="ticker", auto_adjust=False, threads=True, progress=False)
+    out = {}
+    if isinstance(data.columns, pd.MultiIndex):
+        for s in symbols:
+            if s in data.columns.levels[0]:
+                df = data[s].copy()
+                df = df.dropna(subset=["Close"])
+                out[s] = df
+    else:
+        # 只有 1 檔
+        df = data.copy()
+        df = df.dropna(subset=["Close"])
+        out[symbols[0]] = df
+    return out
 
-    g = d.groupby("Symbol", group_keys=False)
-    d["ma20"] = g["Close"].transform(lambda s: s.rolling(cfg.ma_fast, min_periods=cfg.ma_fast).mean())
-    d["ma60"] = g["Close"].transform(lambda s: s.rolling(cfg.ma_slow, min_periods=cfg.ma_slow).mean())
-    d["vol20"] = g["Volume"].transform(lambda s: s.rolling(cfg.vol_lookback, min_periods=cfg.vol_lookback).mean())
-
-    # 報酬/動能
-    d["ret_5d"] = g["Close"].transform(lambda s: s.pct_change(cfg.mom_5d))
-    d["ret_20d"] = g["Close"].transform(lambda s: s.pct_change(cfg.mom_20d))
-
-    # MA_Bias：用 MA20
-    d["ma_bias_pct"] = (d["Close"] / d["ma20"] - 1.0) * 100.0
-
-    # 量能比
-    d["vol_ratio"] = np.where(d["vol20"] > 0, d["Volume"] / d["vol20"], np.nan)
-
-    return d
-
-
-def _score_row(r: pd.Series) -> float:
+def build_topn_from_market_dayall(dayall: MarketDayAll, topn: int = 20, preselect_by_turnover: int = 250) -> pd.DataFrame:
     """
-    免費/模擬期：用可回溯、可穩定的因子做「相對排名」。
-    Score 不用追求金融完美，重點是「每天都能算出全市場 Top20」。
+    先用 STOCK_DAY_ALL 的成交金額做預篩（加速），再用 yfinance 算 20D 指標。
+    輸出欄位：
+      symbol, name, date, close, ret20_pct, vol_ratio, ma_bias_pct, volume, score, rank, tag
     """
-    ma_bias = float(r.get("ma_bias_pct", np.nan))
-    vol_ratio = float(r.get("vol_ratio", np.nan))
-    ret_5d = float(r.get("ret_5d", np.nan))
-    ret_20d = float(r.get("ret_20d", np.nan))
+    df0 = dayall.df.copy()
 
-    # 缺值保守處理（避免亂給高分）
-    if np.isnan(ma_bias):
-        ma_bias = -999
-    if np.isnan(vol_ratio):
-        vol_ratio = 0
-    if np.isnan(ret_5d):
-        ret_5d = 0
-    if np.isnan(ret_20d):
-        ret_20d = 0
+    # 預篩：turnover 最大的前 N 檔（避免全市場逐檔 yfinance）
+    if "turnover" in df0.columns:
+        df0 = df0.sort_values("turnover", ascending=False).head(preselect_by_turnover)
+    else:
+        # 沒 turnover 就用 volume
+        df0 = df0.sort_values("volume", ascending=False).head(preselect_by_turnover)
 
-    # 核心：趨勢 + 量能 + 動能（權重可調）
-    # - ma_bias：-10%~+10% 常見，放大到可比較
-    # - vol_ratio：1.0=正常，>1.2偏放量
-    # - ret_5d/20d：動能
-    score = 0.0
-    score += 0.55 * ma_bias
-    score += 10.0 * np.tanh((vol_ratio - 1.0) * 1.5)   # 避免極端量爆掉
-    score += 40.0 * ret_5d
-    score += 20.0 * ret_20d
+    symbols = df0["symbol"].astype(str).tolist()
+    hist_map = _history_for_symbols(symbols, period="6mo")
 
-    # 基本防護：極低量（例如 vol_ratio < 0.2）扣分
-    if vol_ratio < 0.2:
-        score -= 8.0
+    rows = []
+    for sym in symbols:
+        h = hist_map.get(sym)
+        if h is None or h.empty:
+            continue
 
-    return float(score)
+        closes = h["Close"].dropna()
+        vols = h["Volume"].dropna() if "Volume" in h.columns else None
+        if len(closes) < 25:
+            continue
 
+        last_close = float(closes.iloc[-1])
+        last_date = h.index[-1].date()
 
-def _tag_row(r: pd.Series) -> str:
-    ma_bias = float(r.get("ma_bias_pct", np.nan))
-    vol_ratio = float(r.get("vol_ratio", np.nan))
-    ret_5d = float(r.get("ret_5d", np.nan))
+        close_20 = float(closes.iloc[-21]) if len(closes) >= 21 else float(closes.iloc[0])
+        ret20 = (last_close / close_20 - 1.0) * 100.0 if close_20 != 0 else 0.0
 
-    # 缺值→觀察
-    if np.isnan(ma_bias) or np.isnan(vol_ratio):
-        return "○觀察(觀望)"
+        ma20 = float(closes.tail(20).mean())
+        ma_bias = (last_close / ma20 - 1.0) * 100.0 if ma20 != 0 else 0.0
 
-    # 你原本的標籤語系（保持一致）
-    # 🔥：趨勢強 + 放量
-    if ma_bias >= 5 and vol_ratio >= 1.2:
-        return "🔥主力(觀望)"
-    # 起漲：剛翻正、且短線動能>0
-    if ma_bias > 0 and ret_5d > 0:
-        return "🟢起漲(觀望)"
-    return "○觀察(觀望)"
+        vol_ratio = None
+        last_vol = None
+        if vols is not None and len(vols) >= 21:
+            last_vol = float(vols.iloc[-1])
+            vma20 = float(vols.tail(20).mean())
+            vol_ratio = (last_vol / vma20) if vma20 != 0 else None
 
+        name = df0.loc[df0["symbol"] == sym, "name"].iloc[0] if "name" in df0.columns and (df0["symbol"] == sym).any() else ""
 
-def run_analysis(
-    df_market: pd.DataFrame,
-    session: str = SESSION_EOD,
-    cfg: Optional[AnalyzerConfig] = None
-) -> Tuple[pd.DataFrame, Optional[str]]:
-    """
-    輸入：全市場歷史資料（Date, Symbol, Close, Volume）
-    輸出：TopN 快照表（含 Score/Tag 等）
-    """
-    cfg = cfg or AnalyzerConfig()
-
-    try:
-        df = _ensure_columns(df_market)
-        if df.empty:
-            return pd.DataFrame(), "market dataframe is empty"
-
-        df_feat = _calc_features(df, cfg)
-
-        # 取每檔最後一筆（代表最新快照）
-        last = df_feat.sort_values(["Symbol", "Date"]).groupby("Symbol", as_index=False).tail(1).copy()
-
-        # 歷史不足者剔除
-        hist_cnt = df.groupby("Symbol")["Date"].count()
-        last["hist_cnt"] = last["Symbol"].map(hist_cnt).fillna(0).astype(int)
-        last = last[last["hist_cnt"] >= cfg.min_history_days].copy()
-
-        if last.empty:
-            return pd.DataFrame(), f"no symbols meet min_history_days >= {cfg.min_history_days}"
-
-        last["Score"] = last.apply(_score_row, axis=1)
-        last["Tag"] = last.apply(_tag_row, axis=1)
-
-        # 組出 TopN
-        top = last.sort_values("Score", ascending=False).head(cfg.topn).copy()
-
-        # 整理輸出欄位
-        top_out = pd.DataFrame({
-            "Date": top["Date"].dt.strftime("%Y-%m-%d"),
-            "Symbol": top["Symbol"].astype(str),
-            "Price": top["Close"].astype(float),
-            "Volume": top["Volume"].astype(float),
-            "MA_Bias": top["ma_bias_pct"].astype(float).round(2),
-            "Vol_Ratio": top["vol_ratio"].astype(float).round(2),
-            "Body_Power": 0.0,
-            "Score": top["Score"].astype(float).round(1),
-            "Tag": top["Tag"].astype(str),
+        rows.append({
+            "symbol": sym,
+            "name": name,
+            "date": ymd(last_date),
+            "close": round(last_close, 4),
+            "ret20_pct": round(ret20, 4),
+            "vol_ratio": None if vol_ratio is None else round(float(vol_ratio), 4),
+            "ma_bias_pct": round(ma_bias, 4),
+            "volume": None if last_vol is None else int(last_vol),
         })
 
-        return top_out.reset_index(drop=True), None
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
 
-    except Exception as e:
-        return pd.DataFrame(), f"{type(e).__name__}: {str(e)}"
+    # score：用可解釋、可稽核的線性組合（免費模擬版）
+    # score = 0.45*ret20 + 0.35*ma_bias + 0.20*(vol_ratio-1)*100
+    out["vol_boost"] = out["vol_ratio"].fillna(1.0).apply(lambda x: (x - 1.0) * 100.0)
+    out["score"] = 0.45 * out["ret20_pct"] + 0.35 * out["ma_bias_pct"] + 0.20 * out["vol_boost"]
 
+    out = out.sort_values("score", ascending=False).reset_index(drop=True)
+    out["rank"] = np.arange(1, len(out) + 1)
 
-def generate_ai_json(
-    df_top: pd.DataFrame,
-    market: str,
-    session: str,
-    macro_data: dict,
-    name_map: Optional[Dict[str, str]] = None,
-    account: Optional[dict] = None,
-) -> str:
+    # tag：簡單規則（可在 arbiter 再做裁決）
+    def tag_row(r):
+        if r["ret20_pct"] >= 15 and (r["vol_ratio"] is not None and r["vol_ratio"] >= 1.5):
+            return "🔥Volume_Alert"
+        if r["ret20_pct"] >= 10 and r["ma_bias_pct"] >= 2:
+            return "🟢Strong_Relative"
+        return "○Neutral"
+
+    out["tag"] = out.apply(tag_row, axis=1)
+
+    return out.head(topn).copy()
+
+def merge_with_positions(top_df: pd.DataFrame, positions: List[str]) -> pd.DataFrame:
     """
-    產出 Arbiter Input JSON（保持你既有 V15.x 格式習慣）
-    - Top20 + positions(去重) 的邏輯在 main.py 做（這裡假設 df_top 已是要輸出的清單）
+    positions: ["2330.TW","2317.TW",...]
+    TopN + positions 去重合併；若 position 不在 top_df，補抓 yfinance 當日指標。
     """
-    import json
-    from datetime import datetime
+    positions = [p.strip() for p in positions if p and str(p).strip() != ""]
+    positions = [p if p.endswith(".TW") else p + ".TW" for p in positions]
+    positions = list(dict.fromkeys(positions))  # preserve order
 
-    name_map = name_map or {}
-    account = account or {
-        "cash_balance": 2_000_000,
-        "total_equity": 2_000_000,
-        "positions": []
-    }
+    if top_df is None or top_df.empty:
+        base = pd.DataFrame(columns=["symbol","name","date","close","ret20_pct","vol_ratio","ma_bias_pct","volume","score","rank","tag"])
+    else:
+        base = top_df.copy()
 
-    # ranking：依 df_top 順序給 rank / tier / top20_flag
-    stocks = []
-    for i, r in df_top.reset_index(drop=True).iterrows():
-        sym = str(r.get("Symbol"))
-        price = float(r.get("Price", 0.0))
-        score = float(r.get("Score", 0.0))
-        tag = str(r.get("Tag", "○觀察(觀望)"))
+    existing = set(base["symbol"].astype(str).tolist())
+    need = [p for p in positions if p not in existing]
+    if not need:
+        return base
 
-        rank = int(i + 1)
-        tier = "A" if rank <= 10 else "B"
-        top20_flag = True if rank <= 20 else False
+    hist_map = _history_for_symbols(need, period="6mo")
+    extra = []
+    for sym in need:
+        h = hist_map.get(sym)
+        if h is None or h.empty or "Close" not in h.columns:
+            continue
+        closes = h["Close"].dropna()
+        if len(closes) < 25:
+            continue
+        last_close = float(closes.iloc[-1])
+        last_date = h.index[-1].date()
 
-        # 中文名：優先本地映射
-        name = name_map.get(sym, sym)
+        close_20 = float(closes.iloc[-21]) if len(closes) >= 21 else float(closes.iloc[0])
+        ret20 = (last_close / close_20 - 1.0) * 100.0 if close_20 != 0 else 0.0
 
-        stocks.append({
-            "Symbol": sym,
-            "Name": name,
-            "Price": price,
-            "ranking": {
-                "symbol": sym,
-                "rank": rank,
-                "tier": tier,
-                "top20_flag": top20_flag
-            },
-            "Technical": {
-                "MA_Bias": float(r.get("MA_Bias", 0.0)),
-                "Vol_Ratio": float(r.get("Vol_Ratio", 0.0)),
-                "Body_Power": float(r.get("Body_Power", 0.0)),
-                "Score": score,
-                "Tag": tag
-            },
-            # 免費/模擬期：法人先允許 UNAVAILABLE，不要讓系統爆掉
-            "Institutional": {
-                "Inst_Visual": "PENDING",
-                "Inst_Net_3d": 0.0,
-                "Inst_Streak3": 0,
-                "Inst_Dir3": "PENDING",
-                "Inst_Status": "PENDING"
-            },
-            "Structure": {
-                "OPM": 0.0,
-                "Rev_Growth": 0.0,
-                "PE": 0.0,
-                "Sector": "Unknown",
-                "Rev_Growth_Source": "raw"
-            },
-            "risk": {
-                "position_pct_max": 12,
-                "risk_per_trade_max": 1.0,
-                "trial_flag": True
-            },
-            "orphan_holding": False,
-            "weaken_flags": {
-                "technical_weaken": False,
-                "structure_weaken": False
-            }
+        ma20 = float(closes.tail(20).mean())
+        ma_bias = (last_close / ma20 - 1.0) * 100.0 if ma20 != 0 else 0.0
+
+        vols = h["Volume"].dropna() if "Volume" in h.columns else None
+        vol_ratio = None
+        last_vol = None
+        if vols is not None and len(vols) >= 21:
+            last_vol = float(vols.iloc[-1])
+            vma20 = float(vols.tail(20).mean())
+            vol_ratio = (last_vol / vma20) if vma20 != 0 else None
+
+        # yfinance 名稱（有時是英文）；台股中文名我們優先用 TWSE OpenAPI 的 name（top_df 已帶）
+        nm = ""
+        try:
+            info = yf.Ticker(sym).fast_info
+            _ = info  # no-op
+        except Exception:
+            pass
+
+        vol_boost = ((vol_ratio or 1.0) - 1.0) * 100.0
+        score = 0.45 * ret20 + 0.35 * ma_bias + 0.20 * vol_boost
+
+        extra.append({
+            "symbol": sym,
+            "name": nm,
+            "date": ymd(last_date),
+            "close": round(last_close, 4),
+            "ret20_pct": round(ret20, 4),
+            "vol_ratio": None if vol_ratio is None else round(float(vol_ratio), 4),
+            "ma_bias_pct": round(ma_bias, 4),
+            "volume": None if last_vol is None else int(last_vol),
+            "vol_boost": round(vol_boost, 4),
+            "score": round(score, 4),
+            "rank": None,
+            "tag": "POSITION",
         })
 
-    payload = {
-        "meta": {
-            "system": "Predator V15.7 (SIM/FREE)",
-            "market": market,
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
-            "session": session
-        },
-        "macro": macro_data,
-        "account": account,
-        "stocks": stocks
-    }
+    if extra:
+        base = pd.concat([base, pd.DataFrame(extra)], ignore_index=True)
 
-    return json.dumps(payload, ensure_ascii=False, indent=2)
+    return base
