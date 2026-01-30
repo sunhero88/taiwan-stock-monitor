@@ -3,765 +3,327 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict
-from datetime import datetime, date, timedelta, timezone, time
-from pathlib import Path
-from typing import Dict, Any, Optional, Tuple, List
+import os
+from datetime import datetime, timezone, timedelta
+from typing import Dict, List, Tuple
 
-import numpy as np
 import pandas as pd
 import streamlit as st
-import yfinance as yf
 
-# 你 repo 內的模組（請確保 market_amount.py 已套用我給的完整覆蓋版）
-from market_amount import TZ_TAIPEI, fetch_amount_total_latest, intraday_norm
+from analyzer import (
+    run_analysis,
+    generate_ai_json,
+    SESSION_PREOPEN,
+    SESSION_INTRADAY,
+    SESSION_EOD,
+)
 
-
-# =========================
-# 基本設定
-# =========================
-APP_TITLE = "Sunhero｜股市智能超盤中控台"
-SYSTEM_NAME = "Predator V15.7（Free/Sim）"
-
-REPO_ROOT = Path(__file__).resolve().parent
-DATA_DIR = REPO_ROOT / "data"
-REPORTS_DIR = REPO_ROOT / "reports"
-PLOTS_DIR = REPO_ROOT / "plots"
-
-TRADING_START = time(9, 0)
-TRADING_END = time(13, 30)
+TZ_TAIPEI = timezone(timedelta(hours=8))
 
 
-# =========================
-# 小工具
-# =========================
-def now_taipei() -> datetime:
+# =========
+# 工具：資料載入 / 名稱映射
+# =========
+def _load_market_csv(market: str) -> pd.DataFrame:
+    """
+    預設你 repo 新結構：data/xxx.csv
+    相容舊結構：根目錄 data_tw-share.csv / data_tw.csv
+    """
+    candidates = [
+        os.path.join("data", f"data_{market}.csv"),
+        f"data_{market}.csv",
+        os.path.join("data", "data_tw-share.csv"),
+        "data_tw-share.csv",
+        os.path.join("data", "data_tw.csv"),
+        "data_tw.csv",
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return pd.read_csv(p)
+    raise FileNotFoundError("找不到市場資料檔。請確認 data/data_tw-share.csv 或 data_tw-share.csv 是否存在。")
+
+
+def _load_name_map() -> Dict[str, str]:
+    """
+    優先讀取 configs/name_map.json（你可自行維護，避免 yfinance 限流）
+    格式：{"2330.TW":"台積電", ...}
+    """
+    path = os.path.join("configs", "name_map.json")
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                m = json.load(f)
+            return {str(k): str(v) for k, v in m.items()}
+        except Exception:
+            return {}
+    # 最小內建（你可自行擴充）
+    return {
+        "2330.TW": "台積電",
+        "2317.TW": "鴻海",
+        "2454.TW": "聯發科",
+        "2382.TW": "廣達",
+        "3231.TW": "緯創",
+        "2308.TW": "台達電",
+        "2603.TW": "長榮",
+        "2609.TW": "陽明",
+    }
+
+
+def _today_taipei() -> datetime:
     return datetime.now(tz=TZ_TAIPEI)
 
 
-def is_tw_market_open(now: Optional[datetime] = None) -> bool:
-    now = now or now_taipei()
-    t = now.timetz().replace(tzinfo=None)
-    return TRADING_START <= t <= TRADING_END
+def _fmt_date(dt) -> str:
+    return pd.to_datetime(dt).strftime("%Y-%m-%d")
 
 
-def safe_float(x, default=np.nan) -> float:
-    try:
-        if x is None:
-            return default
-        return float(x)
-    except Exception:
-        return default
+def _staleness_guard(trade_date_str: str, session: str) -> Tuple[bool, str]:
+    """
+    你要「最新資料」：若資料落後太多 → 直接 degraded_mode
+    - 盤前：允許 trade_date = 最近一個交易日（通常是昨日）
+    - 盤中/盤後：trade_date 不能落後太久（>1個自然日先保守降級）
+    """
+    now = _today_taipei()
+    td = pd.to_datetime(trade_date_str).to_pydatetime().replace(tzinfo=TZ_TAIPEI)
+
+    delta_days = (now.date() - td.date()).days
+
+    if session == SESSION_PREOPEN:
+        # 盤前：至少要是「最近一個交易日」，自然日差距通常 1（遇假日可能>1）
+        if delta_days >= 4:
+            return True, f"DATA_STALE_PREOPEN_{delta_days}D"
+        return False, "OK"
+
+    # 盤中/盤後：若落後 >=2 天 → 視為失真
+    if delta_days >= 2:
+        return True, f"DATA_STALE_{delta_days}D"
+    return False, "OK"
 
 
-def safe_int(x, default=0) -> int:
-    try:
-        if x is None or (isinstance(x, float) and np.isnan(x)):
-            return default
-        return int(float(x))
-    except Exception:
-        return default
+def _merge_top20_plus_positions(df_top: pd.DataFrame, positions: List[dict]) -> pd.DataFrame:
+    """
+    最終分析清單 = Top20 + positions（去重）
+    若持倉不在 Top20，也要拉進來，避免「買了台積電隔天沒入榜就不管」。
+    """
+    if not positions:
+        return df_top
 
+    pos_syms = []
+    for p in positions:
+        sym = str(p.get("symbol", "")).strip()
+        if sym:
+            pos_syms.append(sym)
 
-def fmt_bn_twd(amount: Optional[int]) -> str:
-    if amount is None:
-        return "待更新"
-    if amount <= 0:
-        return "待更新"
-    # 元 → 億
-    bn = amount / 1e8
-    return f"{bn:,.0f} 億"
+    pos_syms = sorted(set(pos_syms))
+    if not pos_syms:
+        return df_top
 
+    # 把持倉補進 df_top（不存在則新增一行，Price/Score 等先空白，後面用 market_df 最新價補）
+    out = df_top.copy()
+    existing = set(out["Symbol"].astype(str).tolist())
+    missing = [s for s in pos_syms if s not in existing]
 
-def fmt_pct(x: float) -> str:
-    if x is None or (isinstance(x, float) and np.isnan(x)):
-        return ""
-    return f"{x:.2f}%"
+    if missing:
+        add = pd.DataFrame({
+            "Date": [out["Date"].iloc[0] if len(out) else "" for _ in missing],
+            "Symbol": missing,
+            "Price": [0.0 for _ in missing],
+            "Volume": [0.0 for _ in missing],
+            "MA_Bias": [0.0 for _ in missing],
+            "Vol_Ratio": [0.0 for _ in missing],
+            "Body_Power": [0.0 for _ in missing],
+            "Score": [-9999.0 for _ in missing],
+            "Tag": ["○觀察(持倉監控)" for _ in missing],
+        })
+        out = pd.concat([out, add], ignore_index=True)
 
-
-def fmt_num(x: float, nd=2) -> str:
-    if x is None or (isinstance(x, float) and np.isnan(x)):
-        return ""
-    return f"{x:,.{nd}f}"
-
-
-def normalize_symbol(s: str) -> str:
-    s = (s or "").strip()
-    return s
-
-
-def parse_holdings_input(text: str) -> List[str]:
-    if not text:
-        return []
-    parts = []
-    for token in text.replace("\n", ",").split(","):
-        token = token.strip()
-        if token:
-            parts.append(token)
-    # 去重保序
-    out = []
-    seen = set()
-    for p in parts:
-        p2 = normalize_symbol(p)
-        if p2 and p2 not in seen:
-            seen.add(p2)
-            out.append(p2)
     return out
 
 
-# =========================
-# 台股中文名稱（免費/模擬期：用內建小字典 + yfinance fallback）
-# 你可自行擴充或改為讀檔（例如 data/tw_name_map.csv）
-# =========================
-TW_NAME_MAP = {
-    "2330.TW": "台積電",
-    "2317.TW": "鴻海",
-    "2382.TW": "廣達",
-    "2454.TW": "聯發科",
-    "2603.TW": "長榮",
-    "2609.TW": "陽明",
-    "2308.TW": "台達電",
-    "3231.TW": "緯創",
-    "0050.TW": "元大台灣50",
-}
+def _fill_prices_from_market(df_list: pd.DataFrame, df_market: pd.DataFrame) -> pd.DataFrame:
+    """
+    對於「持倉補入」但沒有 Price 的列，用 market_df 最新 Close 補齊。
+    """
+    m = df_market.copy()
+    m["Date"] = pd.to_datetime(m["Date"], errors="coerce")
+    m["Symbol"] = m["Symbol"].astype(str)
+    m["Close"] = pd.to_numeric(m["Close"], errors="coerce")
+    m = m.dropna(subset=["Date", "Symbol", "Close"]).sort_values(["Symbol", "Date"])
+    last = m.groupby("Symbol", as_index=False).tail(1)[["Symbol", "Close"]].copy()
+    price_map = dict(zip(last["Symbol"].tolist(), last["Close"].tolist()))
 
-
-@st.cache_data(ttl=3600)
-def yf_short_name(symbol: str) -> str:
-    # 盡量不要呼叫太重；cache 1 小時
-    try:
-        t = yf.Ticker(symbol)
-        info = getattr(t, "fast_info", None)
-        # fast_info 沒 name
-        # 用 info（可能比較慢）
-        d = t.info or {}
-        name = d.get("shortName") or d.get("longName") or ""
-        return str(name) if name else ""
-    except Exception:
-        return ""
-
-
-def get_stock_name(symbol: str) -> str:
-    symbol = normalize_symbol(symbol)
-    if symbol in TW_NAME_MAP:
-        return TW_NAME_MAP[symbol]
-    # fallback：yfinance（可能是英文/拼音）
-    n = yf_short_name(symbol)
-    return n if n else ""
-
-
-# =========================
-# 讀取 TopList 資料（多路徑容錯）
-# =========================
-def candidate_market_csv_paths(market: str) -> List[Path]:
-    m1 = market.replace("-", "_")
-    candidates = [
-        REPO_ROOT / f"data_{market}.csv",
-        REPO_ROOT / f"data_{m1}.csv",
-        DATA_DIR / f"data_{market}.csv",
-        DATA_DIR / f"data_{m1}.csv",
-        DATA_DIR / f"{market}.csv",
-        DATA_DIR / f"{m1}.csv",
-        DATA_DIR / f"top_{market}.csv",
-        DATA_DIR / f"top_{m1}.csv",
-        DATA_DIR / f"toplist_{market}.csv",
-        DATA_DIR / f"toplist_{m1}.csv",
-        DATA_DIR / f"ranking_{market}.csv",
-        DATA_DIR / f"ranking_{m1}.csv",
-        DATA_DIR / f"{market}_toplist.csv",
-        DATA_DIR / f"{m1}_toplist.csv",
-    ]
-    # 去重保序
-    out = []
-    seen = set()
-    for p in candidates:
-        s = str(p)
-        if s not in seen:
-            seen.add(s)
-            out.append(p)
-    return out
-
-
-def load_market_toplist_csv(market: str) -> Tuple[pd.DataFrame, str]:
-    last_err = None
-    for p in candidate_market_csv_paths(market):
-        try:
-            if p.exists():
-                df = pd.read_csv(p)
-                return df, str(p.relative_to(REPO_ROOT))
-        except Exception as e:
-            last_err = e
-    raise FileNotFoundError(
-        f"找不到 {market} 的資料檔（已嘗試多個候選路徑）。最後錯誤：{last_err}"
+    out = df_list.copy()
+    out["Price"] = out.apply(
+        lambda r: float(price_map.get(str(r["Symbol"]), r.get("Price", 0.0))) if float(r.get("Price", 0.0)) <= 0 else float(r["Price"]),
+        axis=1
     )
-
-
-def ensure_date_column(df: pd.DataFrame) -> pd.DataFrame:
-    # 允許 Date/date/Datetime 等
-    cols = {c.lower(): c for c in df.columns}
-    if "date" in cols:
-        c = cols["date"]
-        df = df.copy()
-        df["date"] = pd.to_datetime(df[c], errors="coerce")
-        return df
-    if "datetime" in cols:
-        c = cols["datetime"]
-        df = df.copy()
-        df["date"] = pd.to_datetime(df[c], errors="coerce")
-        return df
-    # 沒日期欄：建立空
-    df = df.copy()
-    df["date"] = pd.NaT
-    return df
-
-
-def pick_latest_trade_date_from_df(df: pd.DataFrame) -> Optional[date]:
-    if "date" not in df.columns:
-        return None
-    s = pd.to_datetime(df["date"], errors="coerce")
-    if s.notna().sum() == 0:
-        return None
-    dmax = s.max()
-    if pd.isna(dmax):
-        return None
-    return dmax.date()
-
-
-def build_top20_with_holdings(
-    df: pd.DataFrame,
-    holdings: List[str],
-    top_n: int = 20,
-) -> pd.DataFrame:
-    """
-    Top20 定義（Route A / 免費模擬）：
-    - 以資料檔中 score 由大到小排序，取前 N 名
-    - 若沒有 score 欄位，改用 rank（由小到大）
-    - 加入持倉（若不在 Top20 內，附加在表尾）→ 變成 20 + H
-    """
-    df = df.copy()
-
-    # 標準化欄位名
-    cols_lower = {c.lower(): c for c in df.columns}
-
-    # symbol 欄
-    sym_col = cols_lower.get("symbol") or cols_lower.get("ticker") or cols_lower.get("code")
-    if not sym_col:
-        raise RuntimeError("TopList CSV 缺少 symbol/ticker/code 欄位，無法建立候選清單")
-
-    # score 或 rank
-    score_col = cols_lower.get("score")
-    rank_col = cols_lower.get("rank")
-
-    if score_col:
-        df["_sort"] = pd.to_numeric(df[score_col], errors="coerce")
-        df = df.sort_values(["_sort"], ascending=False)
-    elif rank_col:
-        df["_sort"] = pd.to_numeric(df[rank_col], errors="coerce")
-        df = df.sort_values(["_sort"], ascending=True)
-    else:
-        # 最後 fallback：成交量 volume 由大到小
-        vol_col = cols_lower.get("volume")
-        if not vol_col:
-            df["_sort"] = np.arange(len(df))
-            df = df.sort_values(["_sort"], ascending=True)
-        else:
-            df["_sort"] = pd.to_numeric(df[vol_col], errors="coerce")
-            df = df.sort_values(["_sort"], ascending=False)
-
-    top = df.head(top_n).copy()
-
-    # 持倉加入：若持倉不在 top，從原 df 找到該列；找不到就建空列
-    top_syms = set(top[sym_col].astype(str))
-    extra_rows = []
-    for h in holdings:
-        if h in top_syms:
-            continue
-        # 從 df 找第一筆
-        m = df[df[sym_col].astype(str) == h]
-        if len(m) > 0:
-            extra_rows.append(m.iloc[0].to_dict())
-        else:
-            extra_rows.append({sym_col: h})
-
-    if extra_rows:
-        extra_df = pd.DataFrame(extra_rows)
-        # 補日期欄對齊
-        for c in top.columns:
-            if c not in extra_df.columns:
-                extra_df[c] = np.nan
-        extra_df = extra_df[top.columns]
-        top = pd.concat([top, extra_df], axis=0, ignore_index=True)
-
-    # 清理
-    if "_sort" in top.columns:
-        top.drop(columns=["_sort"], inplace=True, errors="ignore")
-
-    # 加上 name（中文/英文）
-    top["name"] = [get_stock_name(str(x)) for x in top[sym_col].astype(str)]
-
-    return top
-
-
-# =========================
-# 全球摘要：優先讀 data/global_market_summary.csv，沒有就 yfinance 即時抓
-# =========================
-GLOBAL_FALLBACK_TICKERS = [
-    ("US", "S&P500", "^GSPC"),
-    ("US", "NASDAQ", "^IXIC"),
-    ("US", "DOW", "^DJI"),
-    ("US", "SOX", "^SOX"),
-    ("US", "VIX", "^VIX"),
-    ("ASIA", "Nikkei_225", "^N225"),
-    ("FX", "USD_JPY", "JPY=X"),
-    ("FX", "USD_TWD", "TWD=X"),
-]
-
-
-@st.cache_data(ttl=900)
-def fetch_global_summary_yf() -> pd.DataFrame:
-    rows = []
-    for market, name, symbol in GLOBAL_FALLBACK_TICKERS:
-        try:
-            h = yf.download(symbol, period="10d", interval="1d", progress=False, auto_adjust=False)
-            if h is None or len(h) == 0:
-                continue
-            h = h.dropna()
-            if len(h) == 0:
-                continue
-            last = h.iloc[-1]
-            prev = h.iloc[-2] if len(h) >= 2 else last
-            close = safe_float(last.get("Close"))
-            prev_close = safe_float(prev.get("Close"))
-            chg_pct = ((close / prev_close) - 1) * 100 if prev_close and prev_close > 0 else np.nan
-            rows.append(
-                {
-                    "Market": market,
-                    "Name": name,
-                    "Symbol": symbol,
-                    "Date": str(h.index[-1].date()),
-                    "Close": close,
-                    "Chg%": chg_pct,
-                }
-            )
-        except Exception:
-            continue
-    df = pd.DataFrame(rows)
-    if len(df) == 0:
-        return df
-    return df
-
-
-def load_global_market_summary() -> Tuple[pd.DataFrame, str]:
-    p = DATA_DIR / "global_market_summary.csv"
-    if p.exists():
-        try:
-            df = pd.read_csv(p)
-            return df, "data/global_market_summary.csv"
-        except Exception:
-            pass
-    # fallback yfinance
-    df = fetch_global_summary_yf()
-    return df, "yfinance(fallback)"
-
-
-# =========================
-# Arbiter Input（免費模擬：法人資料關閉）
-# =========================
-def build_arbiter_input(
-    market: str,
-    session: str,
-    display_trade_date: Optional[date],
-    amount_pack: Dict[str, Any],
-    toplist: pd.DataFrame,
-) -> Dict[str, Any]:
-    # 判定資料降級（免費模擬：法人資料一律 UNAVAILABLE）
-    inst_status = "UNAVAILABLE"
-    degraded_mode = True
-
-    # 成交金額資料是否完整（TWSE/TPEx 任一缺失都視為「宏觀不完整」→ Degraded Mode）
-    twse_ok = isinstance(amount_pack.get("amount_twse"), int) and amount_pack.get("amount_twse", 0) > 0
-    tpex_ok = isinstance(amount_pack.get("amount_tpex"), int) and amount_pack.get("amount_tpex", 0) > 0
-
-    # 這裡採「絕對防線」：任一缺失 → degraded_mode=true（禁止 BUY/TRIAL）
-    if twse_ok and tpex_ok:
-        degraded_mode = True  # 仍然因法人不可用而降級（免費期）
-    else:
-        degraded_mode = True
-
-    # Toplist 欄位映射
-    cols_lower = {c.lower(): c for c in toplist.columns}
-    sym_col = cols_lower.get("symbol") or cols_lower.get("ticker") or cols_lower.get("code")
-
-    def getv(row, key, default=None):
-        c = cols_lower.get(key.lower())
-        return row.get(c, default) if c else default
-
-    stocks = []
-    for _, r in toplist.iterrows():
-        sym = str(r.get(sym_col, "")).strip() if sym_col else ""
-        if not sym:
-            continue
-        stocks.append(
-            {
-                "Symbol": sym,
-                "Name": str(r.get("name", "")) if "name" in r else get_stock_name(sym),
-                "Price": safe_float(getv(r, "close", np.nan), np.nan),
-                "ranking": {
-                    "symbol": sym,
-                    "rank": safe_int(getv(r, "rank", np.nan), 0),
-                    "tier": str(getv(r, "tier", "")) if "tier" in cols_lower else "",
-                    "top20_flag": True,
-                },
-                "Technical": {
-                    "MA_Bias": safe_float(getv(r, "ma_bias", getv(r, "ma_bias_pct", np.nan)), np.nan),
-                    "Vol_Ratio": safe_float(getv(r, "vol_ratio", np.nan), np.nan),
-                    "Body_Power": safe_float(getv(r, "body_power", np.nan), np.nan),
-                    "Score": safe_float(getv(r, "score", np.nan), np.nan),
-                    "Tag": str(getv(r, "predator_tag", getv(r, "tag", "")) or ""),
-                },
-                "Institutional": {
-                    "Inst_Visual": "PENDING",
-                    "Inst_Net_3d": 0.0,
-                    "Inst_Streak3": 0,
-                    "Inst_Dir3": "PENDING",
-                    "Inst_Status": "PENDING",
-                },
-                "Structure": {
-                    "OPM": safe_float(getv(r, "opm", np.nan), np.nan),
-                    "Rev_Growth": safe_float(getv(r, "rev_growth", np.nan), np.nan),
-                    "PE": safe_float(getv(r, "pe", np.nan), np.nan),
-                    "Sector": str(getv(r, "sector", "")) if "sector" in cols_lower else "Unknown",
-                    "Rev_Growth_Source": str(getv(r, "rev_growth_source", "")) if "rev_growth_source" in cols_lower else "",
-                },
-                "risk": {
-                    "position_pct_max": 12,
-                    "risk_per_trade_max": 1.0,
-                    "trial_flag": True,
-                },
-                "orphan_holding": False,
-                "weaken_flags": {
-                    "technical_weaken": False,
-                    "structure_weaken": False,
-                },
-            }
-        )
-
-    overview = {
-        "trade_date": str(display_trade_date) if display_trade_date else None,
-        "amount_twse": amount_pack.get("amount_twse"),
-        "amount_tpex": amount_pack.get("amount_tpex"),
-        "amount_total": amount_pack.get("amount_total"),
-        "amount_sources": amount_pack.get("sources", {}),
-        "inst_status": inst_status,
-        "degraded_mode": degraded_mode,
-        "data_mode": session,
-        "market_comment": (
-            "免費模擬期：法人資料(FinMind)停用；成交金額採官方口徑回溯最近交易日。"
-        ),
-    }
-
-    out = {
-        "meta": {
-            "system": SYSTEM_NAME,
-            "market": market,
-            "timestamp": now_taipei().strftime("%Y-%m-%d %H:%M"),
-            "session": session,
-        },
-        "macro": {"overview": overview},
-        "stocks": stocks,
-    }
     return out
 
 
-# =========================
-# UI
-# =========================
 def app():
-    st.set_page_config(page_title=APP_TITLE, layout="wide")
-    st.title(APP_TITLE)
+    st.set_page_config(page_title="Sunhero｜股市智能超盤中控台", layout="wide")
+    st.title("Sunhero｜股市智能超盤中控台（Top20 + 持倉監控 / V15.7 SIM-FREE）")
 
-    now = now_taipei()
+    # =========
+    # Sidebar：模式/市場/TopN
+    # =========
+    market = st.sidebar.selectbox("Market", ["tw-share", "tw"], index=0)
+    session = st.sidebar.selectbox("Session", [SESSION_PREOPEN, SESSION_INTRADAY, SESSION_EOD], index=0)
+    topn = st.sidebar.selectbox("TopN（固定追蹤數量）", [20, 30, 50], index=0)
 
-    # -------- Sidebar --------
-    st.sidebar.header("設定")
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("大盤指數輸入（你指定要寫入 macro）")
 
-    market = st.sidebar.selectbox(
-        "Market",
-        options=["tw-share", "us", "hk", "cn", "jp", "kr"],
-        index=0,
+    # 盤前：輸入昨日/最後收盤日大盤
+    idx_level = st.sidebar.number_input("Index Level（大盤指數）", value=0.0, step=1.0, format="%.2f")
+    idx_change = st.sidebar.number_input("Index Change（漲跌點數）", value=0.0, step=1.0, format="%.2f")
+
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("帳戶/持倉（模擬用）")
+
+    cash_balance = st.sidebar.number_input("cash_balance（NTD）", value=2_000_000, step=10_000)
+    total_equity = st.sidebar.number_input("total_equity（NTD）", value=2_000_000, step=10_000)
+
+    default_positions = [
+        # {"symbol":"2330.TW","shares":1000,"avg_cost":1500,"entry_date":"2026-01-15","status":"HOLD","sector":"Semiconductor"}
+    ]
+    positions_text = st.sidebar.text_area(
+        "positions（JSON array）",
+        value=json.dumps(default_positions, ensure_ascii=False, indent=2),
+        height=180
     )
-
-    # 盤前/盤中/盤後（你要的選項）
-    session_ui = st.sidebar.selectbox(
-        "Session",
-        options=["盤前(顯示昨日/最近可用EOD)", "盤中(INTRADAY)", "盤後(EOD)"],
-        index=0,
-    )
-
-    # 盤前強制顯示 EOD（避免 08:17 還在用 INTRADAY）
-    if session_ui.startswith("盤前"):
-        session = "EOD"
-        show_mode_note = "盤前：顯示『最近可用交易日收盤』做全市場參考。"
-    elif "INTRADAY" in session_ui:
-        session = "INTRADAY"
-        show_mode_note = "盤中：顯示盤中候選（若資料可用）。"
-    else:
-        session = "EOD"
-        show_mode_note = "盤後：顯示當日收盤候選。"
-
-    verify_ssl = st.sidebar.checkbox("SSL 驗證（官方資料）", value=True)
-    lookback = st.sidebar.slider("官方資料回溯天數", min_value=3, max_value=20, value=10, step=1)
-
-    st.sidebar.divider()
-
-    # 持倉（會納入追蹤 → 20 + H）
-    st.sidebar.subheader("持倉（會納入追蹤）")
-    holdings_text = st.sidebar.text_area("輸入代碼（逗號分隔）", value="2330.TW", height=100)
-    holdings = parse_holdings_input(holdings_text)
-    if st.sidebar.button("保存持倉"):
-        st.session_state["holdings"] = holdings
-        st.sidebar.success("已保存持倉")
-
-    # 若 session_state 有保存過，就優先使用
-    if "holdings" in st.session_state and isinstance(st.session_state["holdings"], list):
-        holdings = st.session_state["holdings"]
-
-    st.sidebar.caption("免費模擬期：法人資料（FinMind）停用，避免 402 付費門檻。")
 
     run_btn = st.sidebar.button("Run")
 
-    # -------- Header info --------
-    st.info(
-        f"目前台北時間：{now.strftime('%Y-%m-%d %H:%M')}｜模式：{session_ui}｜{show_mode_note}"
-    )
-
     if not run_btn:
-        st.caption("按下 Run 以更新畫面。")
+        st.info("按左側 Run：會產生『Top20 + 持倉』清單與 Arbiter JSON。")
         return
 
-    # =========================
-    # 1) 全球市場摘要（美股/日經/匯率）
-    # =========================
-    gdf, gsrc = load_global_market_summary()
-    st.subheader("全球市場摘要（美股/日經/匯率）— 最新可用交易日")
-    if gdf is None or len(gdf) == 0:
-        st.warning("全球摘要目前無資料（global_market_summary.csv 不存在且 yfinance fallback 失敗）。")
-    else:
-        # 統一欄位顯示
-        # 允許使用者 csv 欄位不同：盡量映射
-        gl = {c.lower(): c for c in gdf.columns}
-        def col(name):
-            return gl.get(name.lower())
+    # =========
+    # 1) Load market data
+    # =========
+    df_market = _load_market_csv(market)
 
-        out = pd.DataFrame()
-        if col("Market"):
-            out["Market"] = gdf[col("Market")]
-        elif col("market"):
-            out["Market"] = gdf[col("market")]
-        else:
-            out["Market"] = ""
+    df_market["Date"] = pd.to_datetime(df_market["Date"], errors="coerce")
+    latest_date = df_market["Date"].max()
+    trade_date = _fmt_date(latest_date)
 
-        # Name
-        if col("Name"):
-            out["Name"] = gdf[col("Name")]
-        elif col("name"):
-            out["Name"] = gdf[col("name")]
-        else:
-            out["Name"] = ""
+    # =========
+    # 2) Top20 analysis（全市場掃描）
+    # =========
+    from analyzer import AnalyzerConfig
+    cfg = AnalyzerConfig(topn=int(topn))
+    df_top, err = run_analysis(df_market, session=session, cfg=cfg)
+    if err:
+        st.error(f"Analyzer error: {err}")
+        return
 
-        # Symbol
-        if col("Symbol"):
-            out["Symbol"] = gdf[col("Symbol")]
-        elif col("symbol"):
-            out["Symbol"] = gdf[col("symbol")]
-        else:
-            out["Symbol"] = ""
+    # =========
+    # 3) Parse positions
+    # =========
+    try:
+        positions = json.loads(positions_text) if positions_text.strip() else []
+        if not isinstance(positions, list):
+            raise ValueError("positions 必須是 JSON array")
+    except Exception as e:
+        st.error(f"positions JSON 解析失敗：{type(e).__name__}: {str(e)}")
+        return
 
-        # Date
-        if col("Date"):
-            out["Date"] = gdf[col("Date")]
-        elif col("date"):
-            out["Date"] = gdf[col("date")]
-        else:
-            out["Date"] = ""
-
-        # Close / Value
-        if col("Close"):
-            out["Close"] = gdf[col("Close")]
-        elif col("Value"):
-            out["Close"] = gdf[col("Value")]
-        elif col("close"):
-            out["Close"] = gdf[col("close")]
-        else:
-            out["Close"] = np.nan
-
-        # Chg%
-        if col("Chg%"):
-            out["Chg%"] = gdf[col("Chg%")]
-        elif col("change"):
-            out["Chg%"] = gdf[col("change")]
-        elif col("chg%"):
-            out["Chg%"] = gdf[col("chg%")]
-        else:
-            out["Chg%"] = np.nan
-
-        st.dataframe(out, use_container_width=True, hide_index=True)
-        st.caption(f"資料來源：{gsrc}")
-
-    st.divider()
-
-    # =========================
-    # 2) 官方成交金額（TWSE + TPEx）
-    # =========================
-    st.subheader("市場成交金額（官方口徑：TWSE + TPEx = amount_total）")
-
-    amount_pack: Dict[str, Any] = {
-        "trade_date": None,
-        "amount_twse": None,
-        "amount_tpex": None,
-        "amount_total": None,
-        "sources": {"twse": None, "tpex": None},
-        "warning": None,
-        "error": None,
-        "debug": None,
+    account = {
+        "cash_balance": int(cash_balance),
+        "total_equity": int(total_equity),
+        "positions": positions
     }
 
-    try:
-        ma, debug = fetch_amount_total_latest(
-            lookback_days=int(lookback),
-            verify_ssl=bool(verify_ssl),
+    # =========
+    # 4) Top20 + positions（去重後一起分析）
+    # =========
+    df_list = _merge_top20_plus_positions(df_top, positions)
+    df_list = _fill_prices_from_market(df_list, df_market)
+
+    # =========
+    # 5) 名稱（中文）
+    # =========
+    name_map = _load_name_map()
+    df_list["Name"] = df_list["Symbol"].astype(str).map(lambda s: name_map.get(s, s))
+
+    # =========
+    # 6) Macro：大盤指數與漲跌幅（你指定的 2/3/4）
+    # =========
+    # 你要求：
+    # - 盤前：輸入昨日(最後收盤日)大盤與漲跌幅
+    # - 盤中：輸入最新大盤與漲跌幅
+    # - 盤後：輸入當日大盤與漲跌幅
+    # 這裡統一由 UI 輸入寫入 macro（因為你要「最新可靠」，不要自動亂抓）
+    degraded_by_stale, stale_reason = _staleness_guard(trade_date, session)
+
+    macro_overview = {
+        "trade_date": trade_date,
+        "data_mode": session,
+        "index_level": float(idx_level),
+        "index_change": float(idx_change),
+
+        # 量能/法人（免費模擬期：允許 UNAVAILABLE，不讓系統爆掉）
+        "amount_total": "UNAVAILABLE(FREE_SIM)",
+        "inst_status": "UNAVAILABLE(FREE_SIM)",
+        "inst_dates_3d": [],
+        "data_date_finmind": None,
+
+        # 系統旗標（保留你的風控入口）
+        "kill_switch": False,
+        "v14_watch": False,
+        "degraded_mode": bool(degraded_by_stale),  # 最新性不夠就降級
+        "degraded_reason": stale_reason,
+    }
+
+    # market_comment 僅供人類讀，不應成為 arbiter decision 依據
+    if degraded_by_stale:
+        macro_overview["market_comment"] = (
+            f"資料日期 {trade_date} 與目前時間落差過大（{stale_reason}），"
+            "為避免用舊數據導致裁決失真，已啟動資料降級：禁止 BUY/TRIAL。"
         )
-        amount_pack.update(
-            {
-                "trade_date": str(ma.trade_date),
-                "amount_twse": int(ma.amount_twse),
-                "amount_tpex": int(ma.amount_tpex),
-                "amount_total": int(ma.amount_total),
-                "sources": {"twse": ma.source_twse, "tpex": ma.source_tpex},
-                "debug": debug,
-            }
+    else:
+        macro_overview["market_comment"] = (
+            f"{session} 模式：大盤 {idx_level:,.2f} 點、漲跌 {idx_change:+,.2f}。"
+            "Top20 以全市場相對排名每日更新；持倉會額外加入監控。"
         )
-    except Exception as e:
-        amount_pack["error"] = str(e)
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("TWSE 上市", fmt_bn_twd(amount_pack.get("amount_twse")))
-    c2.metric("TPEx 上櫃", fmt_bn_twd(amount_pack.get("amount_tpex")))
-    c3.metric("Total 合計", fmt_bn_twd(amount_pack.get("amount_total")))
-    c4.metric("官方交易日", amount_pack.get("trade_date") or "未知")
+    macro_data = {
+        "overview": macro_overview,
+        "indices": []
+    }
 
-    st.caption(f"來源/錯誤：TWSE={amount_pack['sources'].get('twse')}｜TPEx={amount_pack['sources'].get('tpex')}")
-    if amount_pack.get("error"):
-        st.warning(f"官方抓取失敗：{amount_pack['error']}")
-
-    # 盤中量能正規化（僅在 INTRADAY 且 amount_total 有值才有意義）
-    st.markdown("### INTRADAY 量能正規化（避免早盤誤判 LOW）")
-    norm_box = {"progress": None, "cum_ratio(穩健型用)": None, "slice_ratio(保守型用)": None, "label": "UNKNOWN"}
-
-    if session == "INTRADAY" and isinstance(amount_pack.get("amount_total"), int) and amount_pack.get("amount_total", 0) > 0:
-        # 免費模擬：沒有 20D median（你可自行接 sqlite 或 csv）
-        avg20 = None
-        res = intraday_norm(
-            amount_total_now=int(amount_pack["amount_total"]),
-            amount_total_prev=None,
-            avg20_amount_total=avg20,
-            now=now,
-            alpha=0.65,
-        )
-        norm_box = {
-            "progress": res.get("progress"),
-            "cum_ratio(穩健型用)": res.get("amount_norm_cum_ratio"),
-            "slice_ratio(保守型用)": res.get("amount_norm_slice_ratio"),
-            "label": res.get("amount_norm_label"),
-        }
-
-    st.json(norm_box)
-
-    st.divider()
-
-    # =========================
-    # 3) TopList（Route A：score 排名）+ 持倉追加
-    # =========================
-    st.subheader("Top List（Route A：Universe + 持倉，動能排名）")
-
-    try:
-        mdf_raw, msrc = load_market_toplist_csv(market)
-        mdf_raw = ensure_date_column(mdf_raw)
-        display_trade_date = pick_latest_trade_date_from_df(mdf_raw)
-
-        # 若盤前：一定用「資料檔內最後日期」(避免顯示 3 天前)
-        # 若盤中：仍優先用資料檔內最後日期（你的資料管線如果盤中更新，日期會是今天）
-        if display_trade_date is None:
-            st.warning("TopList CSV 沒有可解析日期欄（Date/date）。將顯示全表（可能失真）。")
-
-        # 取最新日期資料（如果 date 欄可用）
-        mdf = mdf_raw.copy()
-        if display_trade_date is not None and mdf["date"].notna().sum() > 0:
-            mdf = mdf[mdf["date"].dt.date == display_trade_date].copy()
-
-        top = build_top20_with_holdings(mdf, holdings=holdings, top_n=20)
-
-        # 盡量把常用欄位呈現出來（你截圖那些）
-        cols_lower = {c.lower(): c for c in top.columns}
-        def pick(*names):
-            for n in names:
-                c = cols_lower.get(n.lower())
-                if c:
-                    return c
-            return None
-
-        sym_col = pick("symbol", "ticker", "code")
-        show_cols = []
-        for want in ["symbol", "name", "date", "close", "ret20_pct", "vol_ratio", "ma_bias_pct", "volume", "score", "rank", "predator_tag"]:
-            c = pick(want)
-            if c and c not in show_cols:
-                show_cols.append(c)
-
-        # 如果 pred/tag 欄不同名，也嘗試
-        if not pick("predator_tag"):
-            ctag = pick("tag")
-            if ctag and ctag not in show_cols:
-                show_cols.append(ctag)
-
-        show_df = top[show_cols].copy() if show_cols else top.copy()
-        st.dataframe(show_df, use_container_width=True, hide_index=True)
-
-        st.caption(f"TopList 來源：{msrc}｜顯示交易日：{str(display_trade_date) if display_trade_date else '未知'}｜持倉追加：{len(holdings)} 檔 → 20+H")
-
-    except Exception as e:
-        st.error(f"TopList 載入失敗：{e}")
-        return
-
-    st.divider()
-
-    # =========================
-    # 4) AI JSON（Arbiter Input）— st.code 提供「可複製」
-    # =========================
-    st.subheader("AI JSON（Arbiter Input）— 可回溯（模擬期免費）")
-
-    arbiter_input = build_arbiter_input(
+    # =========
+    # 7) Generate Arbiter JSON
+    # =========
+    json_text = generate_ai_json(
+        df_top=df_list[[
+            "Date","Symbol","Price","Volume","MA_Bias","Vol_Ratio","Body_Power","Score","Tag"
+        ]].copy(),
         market=market,
         session=session,
-        display_trade_date=display_trade_date,
-        amount_pack=amount_pack,
-        toplist=top,
+        macro_data=macro_data,
+        name_map={k: v for k, v in name_map.items()},
+        account=account,
     )
 
-    json_text = json.dumps(arbiter_input, ensure_ascii=False, indent=2)
+    # =========
+    # UI output
+    # =========
+    st.subheader("1) 今日分析清單（Top20 + 持倉監控）")
+    st.caption(f"資料日期：{trade_date}｜Session：{session}｜TopN：{topn}｜清單筆數：{len(df_list)}（Top20 + positions 去重後）")
+    st.dataframe(df_list[["Symbol","Name","Price","MA_Bias","Vol_Ratio","Score","Tag"]], use_container_width=True)
 
-    # st.code 右上角自帶 copy（你說缺的「複製鍵」）
+    st.subheader("2) Macro（你指定要補的大盤指數與漲跌幅）")
+    st.json(macro_overview)
+
+    st.subheader("3) AI JSON (Arbiter Input)")
     st.code(json_text, language="json")
 
-    st.download_button(
-        label="下載 Arbiter Input JSON",
-        data=json_text.encode("utf-8"),
-        file_name=f"arbiter_input_{market}_{now.strftime('%Y%m%d_%H%M')}.json",
-        mime="application/json",
-    )
-
-    # Debug（可選）
-    with st.expander("官方成交金額 Debug（回溯嘗試紀錄）"):
-        st.json(amount_pack.get("debug"))
+    outname = f"ai_payload_{market}_{trade_date.replace('-', '')}_{session.lower()}.json"
+    with open(outname, "w", encoding="utf-8") as f:
+        f.write(json_text)
+    st.success(f"JSON 已輸出：{outname}")
 
 
 if __name__ == "__main__":
