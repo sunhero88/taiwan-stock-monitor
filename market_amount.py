@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import datetime, time, timedelta, timezone, date
-from typing import Optional, Tuple, Dict, Any
+from datetime import datetime, time, timedelta, timezone
+from typing import Optional, Tuple, Dict, Any, List
 
 import requests
 import pandas as pd
@@ -22,7 +22,7 @@ USER_AGENT = {
 
 
 def _to_int_amount(x) -> int:
-    """把 '775,402,495,419' 之類字串轉 int"""
+    """把 '775,402,495,419' 或 '775402495419' 轉 int"""
     if x is None:
         return 0
     s = str(x)
@@ -35,7 +35,7 @@ def _now_taipei() -> datetime:
 
 
 def trading_progress(now: Optional[datetime] = None) -> float:
-    """回傳盤中進度 0~1。盤外會 clamp 到 0 或 1。"""
+    """回傳盤中進度 0~1。盤外 clamp 到 0 或 1。"""
     now = now or _now_taipei()
     start_dt = now.replace(hour=TRADING_START.hour, minute=TRADING_START.minute, second=0, microsecond=0)
     end_dt = now.replace(hour=TRADING_END.hour, minute=TRADING_END.minute, second=0, microsecond=0)
@@ -59,206 +59,169 @@ class MarketAmount:
     amount_twse: Optional[int]
     amount_tpex: Optional[int]
     amount_total: Optional[int]
-    trade_date: Optional[str]  # YYYY-MM-DD
-    sources: Dict[str, Any]    # 詳細來源/錯誤/是否跳過SSL/是否stale
+    trade_date: Optional[str]         # YYYY-MM-DD
+    source_twse: str
+    source_tpex: str
+    warning: Optional[str] = None
 
 
-# ----------------------------
-# TWSE (官方優先) - MI_INDEX JSON
-# ----------------------------
-
-def _fetch_json(url: str, *, verify_ssl: bool, timeout: int = 15) -> Dict[str, Any]:
-    r = requests.get(url, headers=USER_AGENT, timeout=timeout, verify=verify_ssl)
-    r.raise_for_status()
-    return r.json()
+def _fmt_yyyymmdd(dt: datetime) -> str:
+    return dt.astimezone(TZ_TAIPEI).strftime("%Y%m%d")
 
 
-def fetch_twse_amount_mi_index_json(
-    trade_date: Optional[date] = None,
-    *,
-    verify_ssl: bool = True,
-    allow_ssl_bypass: bool = True
-) -> Tuple[Optional[int], Dict[str, Any]]:
+def fetch_twse_amount(date: Optional[datetime] = None, verify_ssl: bool = True) -> Tuple[Optional[int], str]:
     """
-    上市成交金額（元）：TWSE MI_INDEX (JSON) → 找到含「成交金額」欄位之表並加總。
-    URL: https://www.twse.com.tw/exchangeReport/MI_INDEX?response=json&date=YYYYMMDD&type=ALL
+    上市成交金額（元）
+    優先用 TWSE MI_INDEX JSON，再 fallback HTML。
     """
-    td = trade_date or _now_taipei().date()
-    ymd = td.strftime("%Y%m%d")
-    url = f"https://www.twse.com.tw/exchangeReport/MI_INDEX?response=json&date={ymd}&type=ALL"
+    date = date or _now_taipei()
+    yyyymmdd = _fmt_yyyymmdd(date)
 
-    meta = {"url": url, "verify_ssl": verify_ssl, "ssl_bypassed": False, "error": None, "data_date": None}
-
-    def _parse(mi: Dict[str, Any]) -> Optional[int]:
-        # MI_INDEX JSON 常見結構：fields1/data1, fields2/data2 ... 逐表掃描
-        # 我們找 fieldsX 內含「成交金額」的那張表，並對應 dataX 加總
-        for k in list(mi.keys()):
-            if not k.startswith("fields"):
-                continue
-            idx = k.replace("fields", "")
-            fields = mi.get(k)
-            data = mi.get(f"data{idx}")
-            if not isinstance(fields, list) or not isinstance(data, list):
-                continue
-            # 欄位是否含成交金額
-            amt_idx = None
-            for i, f in enumerate(fields):
-                if "成交金額" in str(f):
-                    amt_idx = i
-                    break
-            if amt_idx is None:
-                continue
-
-            s = 0
-            for row in data:
-                if not isinstance(row, list) or len(row) <= amt_idx:
-                    continue
-                s += _to_int_amount(row[amt_idx])
-            if s > 0:
-                return int(s)
-
-        return None
-
+    # 1) JSON
+    url_json = f"https://www.twse.com.tw/exchangeReport/MI_INDEX?response=json&date={yyyymmdd}&type=ALL"
     try:
-        mi = _fetch_json(url, verify_ssl=verify_ssl)
-        # 交易日字串（不一定有標準欄位，盡量從 date/title 推）
-        meta["data_date"] = mi.get("date") or mi.get("stat") or None
-        amt = _parse(mi)
-        if amt is None:
-            raise RuntimeError("TWSE MI_INDEX(JSON) 找不到可加總之『成交金額』表")
-        return amt, meta
-
-    except Exception as e:
-        meta["error"] = f"{type(e).__name__}: {e}"
-        if verify_ssl and allow_ssl_bypass:
-            # 自動降級：verify=False（但要明確標示）
-            try:
-                mi = _fetch_json(url, verify_ssl=False)
-                meta["ssl_bypassed"] = True
-                meta["verify_ssl"] = False
-                meta["error"] = None
-                meta["data_date"] = mi.get("date") or mi.get("stat") or None
-                amt = _parse(mi)
-                if amt is None:
-                    raise RuntimeError("TWSE MI_INDEX(JSON)（SSL bypass）仍找不到成交金額")
-                return amt, meta
-            except Exception as e2:
-                meta["error"] = f"{type(e2).__name__}: {e2}"
-        return None, meta
-
-
-# ----------------------------
-# TPEx (官方優先) - pricing.html 文字抓取（你原本邏輯）
-# ----------------------------
-
-def fetch_tpex_amount_pricing_html(
-    *,
-    verify_ssl: bool = True,
-    allow_ssl_bypass: bool = True
-) -> Tuple[Optional[int], Dict[str, Any]]:
-    """
-    上櫃成交金額（元）：抓 pricing.html 的「總成交金額: xxx元」。
-    """
-    url = "https://www.tpex.org.tw/zh-tw/mainboard/trading/info/pricing.html"
-    meta = {"url": url, "verify_ssl": verify_ssl, "ssl_bypassed": False, "error": None, "data_date": None}
-
-    def _parse(text: str) -> Optional[int]:
-        m = re.search(r"總成交金額[:：]\s*([\d,]+)\s*元", text)
-        if m:
-            return _to_int_amount(m.group(1))
-        m2 = re.search(r"總成交金額.*?([\d,]+)\s*元", text)
-        if m2:
-            return _to_int_amount(m2.group(1))
-        return None
-
-    try:
-        r = requests.get(url, headers=USER_AGENT, timeout=15, verify=verify_ssl)
+        r = requests.get(url_json, headers=USER_AGENT, timeout=15, verify=verify_ssl)
         r.raise_for_status()
-        amt = _parse(r.text)
-        if amt is None:
+        j = r.json()
+
+        # 盡量找出含「成交金額」的表格欄位
+        # 有些版本會把表格放在 data、fields；也可能分 data1/data2...
+        candidates: List[pd.DataFrame] = []
+        if isinstance(j, dict):
+            fields = j.get("fields")
+            data = j.get("data")
+            if fields and data and isinstance(fields, list) and isinstance(data, list):
+                candidates.append(pd.DataFrame(data, columns=fields))
+
+            # 掃描所有 key，把像表格的結構轉成 DF 試試
+            for k, v in j.items():
+                if k.startswith("data") and isinstance(v, list) and v and isinstance(v[0], list):
+                    f = j.get(k.replace("data", "fields"))
+                    if isinstance(f, list):
+                        try:
+                            candidates.append(pd.DataFrame(v, columns=f))
+                        except Exception:
+                            pass
+
+        df_target = None
+        for df in candidates:
+            cols = [str(c) for c in df.columns]
+            if any("成交金額" in c for c in cols):
+                df_target = df
+                break
+
+        if df_target is None:
+            raise RuntimeError("TWSE MI_INDEX(JSON) 找不到『成交金額』欄位")
+
+        amt_col = None
+        for c in df_target.columns:
+            if "成交金額" in str(c):
+                amt_col = c
+                break
+        if amt_col is None:
+            raise RuntimeError("TWSE 成交統計表找不到『成交金額』欄")
+
+        amount = int(df_target[amt_col].apply(_to_int_amount).sum())
+        return amount, f"TWSE MI_INDEX(JSON) date={yyyymmdd} 加總"
+    except Exception:
+        pass
+
+    # 2) HTML fallback
+    url_html = f"https://www.twse.com.tw/exchangeReport/MI_INDEX?date={yyyymmdd}&response=html&type=ALL"
+    r = requests.get(url_html, headers=USER_AGENT, timeout=15, verify=verify_ssl)
+    r.raise_for_status()
+    tables = pd.read_html(r.text)
+    if not tables:
+        raise RuntimeError("TWSE MI_INDEX(HTML) 找不到可解析表格")
+
+    target = None
+    for t in tables:
+        cols = [str(c) for c in t.columns]
+        if any("成交金額" in c for c in cols):
+            target = t
+            break
+    if target is None:
+        target = tables[0]
+
+    amt_col = None
+    for c in target.columns:
+        if "成交金額" in str(c):
+            amt_col = c
+            break
+    if amt_col is None:
+        raise RuntimeError("TWSE 成交統計表找不到『成交金額』欄(HTML)")
+
+    amount = int(target[amt_col].apply(_to_int_amount).sum())
+    return amount, f"TWSE MI_INDEX(HTML) date={yyyymmdd} 加總"
+
+
+def fetch_tpex_amount(date: Optional[datetime] = None, verify_ssl: bool = True) -> Tuple[Optional[int], str]:
+    """
+    上櫃成交金額（元）
+    以 TPEx pricing.html 文字抓取（最穩的免費路徑之一，可能會改版）。
+    """
+    date = date or _now_taipei()
+    _ = _fmt_yyyymmdd(date)  # 目前頁面不是用 date query；保留以便未來改版
+
+    url = "https://www.tpex.org.tw/zh-tw/mainboard/trading/info/pricing.html"
+    r = requests.get(url, headers=USER_AGENT, timeout=15, verify=verify_ssl)
+    r.raise_for_status()
+
+    # 常見字樣：總成交金額: 175,152,956,339元
+    m = re.search(r"總成交金額[:：]\s*([\d,]+)\s*元", r.text)
+    if not m:
+        m2 = re.search(r"總成交金額.*?([\d,]+)\s*元", r.text, flags=re.S)
+        if not m2:
             raise RuntimeError("TPEx pricing.html 找不到『總成交金額』")
-        return int(amt), meta
+        amount = _to_int_amount(m2.group(1))
+    else:
+        amount = _to_int_amount(m.group(1))
 
-    except Exception as e:
-        meta["error"] = f"{type(e).__name__}: {e}"
-        if verify_ssl and allow_ssl_bypass:
-            try:
-                r = requests.get(url, headers=USER_AGENT, timeout=15, verify=False)
-                r.raise_for_status()
-                meta["ssl_bypassed"] = True
-                meta["verify_ssl"] = False
-                meta["error"] = None
-                amt = _parse(r.text)
-                if amt is None:
-                    raise RuntimeError("TPEx pricing.html（SSL bypass）仍找不到『總成交金額』")
-                return int(amt), meta
-            except Exception as e2:
-                meta["error"] = f"{type(e2).__name__}: {e2}"
-        return None, meta
+    return int(amount), "TPEx pricing.html 總成交金額"
 
-
-# ----------------------------
-# 對外：一次拿到 TWSE + TPEx + Total + 稽核資訊
-# ----------------------------
 
 def fetch_amount_total_latest(
-    trade_date: Optional[date] = None,
-    *,
+    trade_date: Optional[datetime] = None,
     verify_ssl: bool = True,
-    allow_ssl_bypass: bool = True
 ) -> MarketAmount:
     """
-    回傳：上市/上櫃/合計（元），以及來源、錯誤、是否跳過 SSL 等稽核資訊。
+    取得當日（或指定日）的 TWSE + TPEx 成交金額。
+    注意：TPEx 網頁偶有改版/阻擋；失敗時回傳 None 並在 warning 註記。
     """
-    td = trade_date or _now_taipei().date()
-    sources: Dict[str, Any] = {
-        "trade_date": td.isoformat(),
-        "twse": None,
-        "tpex": None,
-        "stale": False,
-        "warning": None,
-    }
+    trade_date = trade_date or _now_taipei()
+    trade_date_str = trade_date.astimezone(TZ_TAIPEI).strftime("%Y-%m-%d")
 
-    twse_amt, twse_meta = fetch_twse_amount_mi_index_json(
-        td, verify_ssl=verify_ssl, allow_ssl_bypass=allow_ssl_bypass
-    )
-    tpex_amt, tpex_meta = fetch_tpex_amount_pricing_html(
-        verify_ssl=verify_ssl, allow_ssl_bypass=allow_ssl_bypass
-    )
+    warning_parts = []
 
-    sources["twse"] = twse_meta
-    sources["tpex"] = tpex_meta
+    twse_amt, twse_src = None, "TWSE:UNAVAILABLE"
+    tpex_amt, tpex_src = None, "TPEx:UNAVAILABLE"
 
-    # 稽核：如果兩邊都拿不到 → 直接 UNKNOWN
-    if twse_amt is None and tpex_amt is None:
-        sources["warning"] = "官方抓取失敗且無可用 fallback（成交金額不可用）"
-        return MarketAmount(
-            amount_twse=None,
-            amount_tpex=None,
-            amount_total=None,
-            trade_date=td.isoformat(),
-            sources=sources,
-        )
+    try:
+        twse_amt, twse_src = fetch_twse_amount(date=trade_date, verify_ssl=verify_ssl)
+    except Exception as e:
+        warning_parts.append(f"TWSE amount 取得失敗: {e}")
 
-    total = (twse_amt or 0) + (tpex_amt or 0)
+    try:
+        tpex_amt, tpex_src = fetch_tpex_amount(date=trade_date, verify_ssl=verify_ssl)
+    except Exception as e:
+        warning_parts.append(f"TPEx amount 取得失敗: {e}")
 
-    # 稽核：若任一側是 SSL bypass → 明確提示（你要「真實可靠」就不能默默吃掉）
-    bypass = bool((twse_meta.get("ssl_bypassed")) or (tpex_meta.get("ssl_bypassed")))
-    if bypass:
-        sources["warning"] = "已發生 SSL bypass（requests verify=False）。此數據仍來自官方頁面，但不屬於嚴格安全通道。"
+    total = None
+    if isinstance(twse_amt, int) and isinstance(tpex_amt, int):
+        total = twse_amt + tpex_amt
+
+    warning = " | ".join(warning_parts) if warning_parts else None
 
     return MarketAmount(
         amount_twse=twse_amt,
         amount_tpex=tpex_amt,
         amount_total=total,
-        trade_date=td.isoformat(),
-        sources=sources,
+        trade_date=trade_date_str,
+        source_twse=twse_src,
+        source_tpex=tpex_src,
+        warning=warning,
     )
 
-
-# ----------------------------
-# 量能正規化（你原本的函數保留）
-# ----------------------------
 
 def classify_ratio(r: float) -> str:
     if r < 0.8:
@@ -269,17 +232,17 @@ def classify_ratio(r: float) -> str:
 
 
 def intraday_norm(
-    amount_total_now: int,
+    amount_total_now: Optional[int],
     amount_total_prev: Optional[int],
     avg20_amount_total: Optional[int],
     now: Optional[datetime] = None,
     alpha: float = 0.65,
-) -> dict:
+) -> Dict[str, Any]:
     """
     回傳：
     - amount_norm_cum_ratio：累積正規化比率（穩健型使用）
     - amount_norm_slice_ratio：切片正規化比率（保守型使用，需 prev）
-    - amount_norm_label：NORMAL/LOW/HIGH（以 cum_ratio 判定）
+    - amount_norm_label：NORMAL/LOW/HIGH/UNKNOWN
     """
     now = now or _now_taipei()
     p_now = trading_progress(now)
@@ -292,6 +255,8 @@ def intraday_norm(
         "amount_norm_label": "UNKNOWN",
     }
 
+    if not amount_total_now or amount_total_now <= 0:
+        return out
     if not avg20_amount_total or avg20_amount_total <= 0:
         return out
 
@@ -301,7 +266,7 @@ def intraday_norm(
     if cum_ratio is not None:
         out["amount_norm_label"] = classify_ratio(float(cum_ratio))
 
-    if amount_total_prev is not None:
+    if amount_total_prev is not None and amount_total_prev >= 0:
         slice_amount = max(0, amount_total_now - amount_total_prev)
         expected_slice = avg20_amount_total * (progress_curve(p_now, alpha=alpha) - progress_curve(p_prev, alpha=alpha))
         slice_ratio = (slice_amount / expected_slice) if expected_slice > 0 else None
