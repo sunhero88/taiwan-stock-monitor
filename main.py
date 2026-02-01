@@ -3,202 +3,182 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta, timezone
-from typing import Dict, List
+from typing import Any, Dict, List
 
 import streamlit as st
 import pandas as pd
 
-from analyzer import (
-    TZ_TAIPEI,
-    now_taipei,
-    build_arbiter_input_sim_free,
-)
+from analyzer import build_arbiter_input, now_taipei
 
-st.set_page_config(
-    page_title="Sunhero | 股市智能超盤中控台",
-    layout="wide",
-)
+st.set_page_config(page_title="Sunhero｜股市智能超盤中控台", layout="wide")
 
-# ----------------------------
+APP_TITLE = "Sunhero｜股市智能超盤中控台（Top20 + 持倉監控 / SIM-FREE）"
+
+# ---------------------------
 # UI helpers
-# ----------------------------
-def parse_positions_json(text: str) -> List[Dict]:
-    """
-    positions JSON array:
-    [
-      {"symbol":"2330.TW","qty":100,"avg_cost":1100},
-      {"symbol":"2308.TW","qty":450,"avg_cost":1110}
-    ]
-    """
-    t = (text or "").strip()
-    if not t:
+# ---------------------------
+def parse_positions_json(raw: str) -> List[Dict[str, Any]]:
+    raw = (raw or "").strip()
+    if raw == "":
         return []
     try:
-        obj = json.loads(t)
+        obj = json.loads(raw)
         if isinstance(obj, list):
-            out = []
-            for p in obj:
-                if not isinstance(p, dict):
-                    continue
-                sym = str(p.get("symbol","")).strip()
-                if sym.isdigit():
-                    sym = f"{sym}.TW"
-                if sym and not sym.endswith(".TW") and sym.replace(".","").isdigit():
-                    # keep as-is for non-TW
-                    pass
-                out.append({
-                    "symbol": sym,
-                    "qty": int(p.get("qty", 0)),
-                    "avg_cost": float(p.get("avg_cost", 0)),
-                })
-            return out
+            return obj
         return []
     except Exception:
-        # fallback: comma separated symbols
-        syms = [x.strip() for x in t.split(",") if x.strip()]
-        out = []
-        for s in syms:
-            if s.isdigit():
-                s = f"{s}.TW"
-            out.append({"symbol": s, "qty": 0, "avg_cost": 0})
-        return out
+        return []
 
-def json_copy_block(obj: Dict):
+def clipboard_button(label: str, text: str, key: str):
+    # Streamlit 沒有原生 copy-button，這用 components + JS clipboard
+    import streamlit.components.v1 as components
+    safe = text.replace("\\", "\\\\").replace("`", "\\`").replace("${", "\\${")
+    html = f"""
+    <button id="{key}" style="padding:8px 12px;border-radius:10px;border:1px solid #ddd;background:#fff;cursor:pointer;">
+      {label}
+    </button>
+    <script>
+      const btn = document.getElementById("{key}");
+      btn.addEventListener("click", async () => {{
+        try {{
+          await navigator.clipboard.writeText(`{safe}`);
+          btn.innerText = "已複製 ✅";
+          setTimeout(()=>btn.innerText="{label}", 1200);
+        }} catch (e) {{
+          btn.innerText = "複製失敗（瀏覽器限制）";
+          setTimeout(()=>btn.innerText="{label}", 1500);
+        }}
+      }});
+    </script>
     """
-    顯示 JSON + 複製按鈕（Streamlit 內建 copy）
-    """
-    st.code(json.dumps(obj, ensure_ascii=False, indent=2), language="json")
+    components.html(html, height=48)
 
-# ----------------------------
+# ---------------------------
 # Sidebar
-# ----------------------------
-st.sidebar.header("設定")
+# ---------------------------
+st.title(APP_TITLE)
 
-session = st.sidebar.selectbox(
-    "Session",
-    options=["PREOPEN", "INTRADAY", "EOD"],
-    index=0,
-)
+with st.sidebar:
+    st.subheader("設定")
 
-topn = st.sidebar.selectbox(
-    "TopN（固定追蹤數量）",
-    options=[10, 20, 30, 50],
-    index=1,  # default 20
-)
+    session = st.selectbox("Session", ["PREOPEN", "INTRADAY", "EOD"], index=2)
+    topn = st.selectbox("TopN（固定追蹤數量）", [10, 20, 30, 50], index=1)
 
-st.sidebar.subheader("持倉（會納入追蹤）")
-pos_text = st.sidebar.text_area(
-    "positions（JSON array，或逗號分隔代碼）",
-    value='[{"symbol":"2330.TW","qty":0,"avg_cost":0}]',
-    height=140,
-)
+    st.divider()
+    st.subheader("帳戶 / 持倉（會納入追蹤）")
 
-st.sidebar.subheader("資料取得策略（SIM-FREE）")
-verify_ssl = st.sidebar.checkbox(
-    "SSL 驗證（官方資料）",
-    value=True,
-    help="若 Streamlit Cloud 對 TWSE/TPEx 出現 SSL_CERTIFICATE_VERIFY_FAILED，可先關閉以恢復抓取（仍為官方來源，但不驗證憑證）。",
-)
+    cash_balance = st.number_input("cash_balance（NTD）", min_value=0, value=2000000, step=10000)
+    total_equity = st.number_input("total_equity（NTD）", min_value=0, value=2000000, step=10000)
 
-max_back_days = st.sidebar.slider(
-    "官方資料回溯天數（找最新交易日）",
-    min_value=3,
-    max_value=20,
-    value=10,
-    help="系統會從今天往回找，直到抓到有效的『全市場日行情』交易日。",
-)
+    st.caption("positions（JSON array），格式：[{symbol, shares, avg_cost, entry_date, trailing_high(optional)}]")
+    positions_raw = st.text_area(
+        "positions (JSON array)",
+        value='[]',
+        height=140
+    )
 
-liquidity_pool = st.sidebar.slider(
-    "流動性候選池（前N名）",
-    min_value=50,
-    max_value=500,
-    value=200,
-    step=50,
-    help="Top20 不是固定清單：先用全市場成交金額抓出前N名，再用這批做 60D 指標與打分。",
-)
+    st.divider()
+    st.subheader("資料取得策略（SIM-FREE）")
+    verify_ssl = st.checkbox("SSL 驗證（官方資料）", value=True)
+    st.caption("你要求「正確最新」→建議保持勾選。若遇到 Streamlit Cloud 憑證鏈問題，可暫時關閉，但會被標示風險。")
 
-run = st.sidebar.button("Run")
+    run = st.button("Run")
 
-# ----------------------------
+# ---------------------------
 # Main
-# ----------------------------
-st.title("Sunhero｜股市智能超盤中控台（Top20 + 持倉監控 / V15.7 SIM-FREE）")
+# ---------------------------
+st.info(f"目前台北時間：{now_taipei().strftime('%Y-%m-%d %H:%M')}｜模式：{session}｜TopN：{topn}")
 
-now_str = now_taipei().strftime("%Y-%m-%d %H:%M")
-st.info(f"目前台北時間：{now_str}｜模式：{session}｜TopN：{topn}")
+if run:
+    positions = parse_positions_json(positions_raw)
 
-if not run:
-    st.caption("請按左側 Run 產生最新資料。")
-    st.stop()
+    arb = build_arbiter_input(
+        session=session,
+        topn=int(topn),
+        positions=positions,
+        cash_balance=int(cash_balance),
+        total_equity=int(total_equity),
+        verify_ssl=bool(verify_ssl),
+        sim_free=True,
+    )
 
-positions = parse_positions_json(pos_text)
+    # 1) Market Meta
+    st.subheader("台股大盤指數（自動）")
+    twii = arb.get("market_meta", {}).get("taiex", {})
+    cols = st.columns(5)
+    cols[0].metric("TWII 日期", twii.get("date"))
+    cols[1].metric("TWII 收盤/最新", twii.get("close"))
+    cols[2].metric("漲跌", twii.get("chg"))
+    cols[3].metric("漲跌幅(%)", twii.get("chg_pct"))
+    cols[4].metric("來源", twii.get("source"))
 
-arb = build_arbiter_input_sim_free(
-    session=session,
-    topn=int(topn),
-    positions=positions,
-    verify_ssl=bool(verify_ssl),
-    max_back_days=int(max_back_days),
-    liquidity_pool=int(liquidity_pool),
-)
+    st.subheader("Regime / 指標（生成端先算好，Arbiter 只讀）")
+    mm = arb.get("market_meta", {})
+    rm = mm.get("regime_metrics", {})
+    cols2 = st.columns(6)
+    cols2[0].metric("current_regime", mm.get("current_regime"))
+    cols2[1].metric("SMR", round(rm.get("SMR", 0.0), 6) if rm.get("SMR") is not None else None)
+    cols2[2].metric("MA200", round(rm.get("MA200", 0.0), 2) if rm.get("MA200") is not None else None)
+    cols2[3].metric("Slope5", round(rm.get("Slope5", 0.0), 6) if rm.get("Slope5") is not None else None)
+    cols2[4].metric("MA14_Monthly", round(rm.get("MA14_Monthly", 0.0), 2) if rm.get("MA14_Monthly") is not None else None)
+    cols2[5].metric("drawdown_pct(%)", round(rm.get("drawdown_pct", 0.0), 2))
 
-macro = arb.get("macro", {})
-twii = macro.get("twii", {})
-warnings = macro.get("warnings", []) or []
-degraded = bool(macro.get("degraded_mode", False))
-stale_reason = macro.get("stale_reason")
+    vix = mm.get("vix", {})
+    st.caption(f"VIX：{vix.get('value')}（{vix.get('date')}）｜dynamic_vix_threshold：{vix.get('dynamic_vix_threshold')}｜source：{vix.get('source')}")
 
-# ----------------------------
-# Section: Macro (TWII)
-# ----------------------------
-st.subheader("台股大盤指數（自動）")
+    # 2) Amount
+    st.subheader("市場成交金額（官方優先 / SIM-FREE best-effort）")
+    ov = arb.get("macro", {}).get("overview", {})
+    c3 = st.columns(4)
+    c3[0].metric("TWSE 上市（億）", ov.get("amount_twse_yi"))
+    c3[1].metric("TPEx 上櫃（億）", ov.get("amount_tpex_yi"))
+    c3[2].metric("Total 合計（億）", ov.get("amount_total_yi"))
+    c3[3].metric("交易日（代理）", ov.get("data_date_proxy"))
 
-c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("TWII 日期", twii.get("date") or "None")
-c2.metric("TWII 收盤", twii.get("close") if twii.get("close") is not None else "None")
-c3.metric("漲跌", twii.get("chg") if twii.get("chg") is not None else "None")
-c4.metric("漲跌幅(%)", twii.get("chg_pct") if twii.get("chg_pct") is not None else "None")
-c5.metric("來源", twii.get("source") or "None")
+    if ov.get("amount_warning") or (isinstance(ov.get("amount_sources"), dict) and ("ERR" in str(ov.get("amount_sources")))):
+        st.warning(f"成交金額來源狀態：{ov.get('amount_sources')}｜warning：{ov.get('amount_warning')}")
 
-if stale_reason:
-    st.error(f"資料新鮮度稽核失敗：{stale_reason} → degraded_mode=true（禁止 BUY/TRIAL）")
+    # 3) Top list
+    st.subheader("今日分析清單（TopN + 持倉追加）— 以全市場成交金額做真排名")
+    stocks = arb.get("stocks", [])
+    df = pd.DataFrame(stocks)
 
-if warnings:
-    with st.expander("警告/降級原因（點開）", expanded=True):
-        for w in warnings:
-            st.write(f"- {w}")
+    if df.empty:
+        st.error("TopN 建立失敗：stocks 空。請查看 gate / risk_alerts。")
+    else:
+        show_cols = [c for c in ["rank", "symbol", "name", "tier_level", "top20_flag", "price",
+                                 "ret20_pct", "vol_ratio", "ma_bias_pct", "volume", "score"] if c in df.columns]
+        st.dataframe(df[show_cols], use_container_width=True, hide_index=True)
 
-# ----------------------------
-# Section: Top20 + Positions
-# ----------------------------
-st.subheader("今日分析清單（Top20 + 持倉追加）— 每日動態更新（非固定）")
+    # 4) Gate
+    st.subheader("今日系統判斷（白話解釋）")
+    gate = arb.get("gate", {})
+    if gate.get("degraded_mode"):
+        st.error(f"Gate 觸發：degraded_mode=true → **禁止 BUY/TRIAL**｜原因：{gate.get('degraded_reason')}")
+    else:
+        st.success("Gate 通過：資料可用（SIM-FREE）")
 
-top = arb.get("top_watchlist", []) or []
-top_df = pd.DataFrame(top)
+    ra = arb.get("risk_alerts", [])
+    if ra:
+        st.warning("風險警示 / 資料缺口：\n- " + "\n- ".join(ra))
 
-if top_df.empty:
-    st.error("TopN 建立失敗：目前無可用 TopN 清單（請看上方警告原因）。")
+    # 5) Arbiter Input JSON
+    st.subheader("AI JSON（Arbiter Input）— 可回溯（SIM-FREE）")
+    json_text = json.dumps(arb, ensure_ascii=False, indent=2)
+
+    # 一鍵複製 + 下載
+    colA, colB = st.columns([1, 1])
+    with colA:
+        clipboard_button("複製 Arbiter JSON", json_text, key="copy_json_btn")
+    with colB:
+        st.download_button(
+            "下載 Arbiter JSON",
+            data=json_text.encode("utf-8"),
+            file_name=f"arbiter_input_{arb.get('meta', {}).get('timestamp', '').replace(':','')}.json",
+            mime="application/json",
+        )
+
+    st.code(json_text, language="json")
+
 else:
-    # 標記持倉
-    pos_syms = set([p.get("symbol","") for p in positions if p.get("symbol")])
-    top_df["is_position"] = top_df["symbol"].apply(lambda s: (s in pos_syms))
-    st.dataframe(top_df, use_container_width=True)
-
-# ----------------------------
-# Section: System decision gate
-# ----------------------------
-st.subheader("今日系統判斷（白話解釋）")
-
-if degraded:
-    st.error("Gate 未通過：degraded_mode=true → 強制禁止 BUY/TRIAL（避免舊資料造成裁決失真）")
-else:
-    st.success("Gate 通過：資料稽核通過（SIM-FREE）")
-
-# ----------------------------
-# Section: AI JSON (copyable)
-# ----------------------------
-st.subheader("AI JSON（Arbiter Input）— 可回溯（SIM-FREE）")
-
-st.caption("下方 JSON 可直接複製貼給其他 AI；包含：Top20（每日更新）、持倉追加、TWII 大盤資料、法人連續性（近3交易日）、資料日期與稽核結果。")
-json_copy_block(arb)
+    st.caption("左側設定完成後按 Run。")
