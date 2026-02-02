@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
@@ -14,21 +15,16 @@ import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
+import urllib3
 import yfinance as yf
 
-# =========================================================
-# Predator V16.2 Enhanced (FREE/SIM) - main.py 直接跑版
-# 目標：
-# 1) 修復你現在卡住的 SyntaxError（__future__ 已在檔首）
-# 2) 直接用 Streamlit 跑 main.py 也能出畫面（不需要 app.py）
-# 3) 內建 SSL fallback（可控，預設安全；允許時才 verify=False）
-# 4) A+ Layer 必須啟用（已硬寫入 classify_layer）
-# 5) 即使 Top20=0，也要顯示「原因」(Data Health Gate)
-# =========================================================
+from market_amount import fetch_amount_total, TZ_TAIPEI
 
+# -----------------------------
+# 基本設定（免費/模擬期）
+# -----------------------------
 SYSTEM_VERSION = "Predator V16.2 Enhanced (FREE/SIM)"
 MARKET = "tw-share"
-TZ_TAIPEI = "Asia/Taipei"
 
 DEFAULT_UNIVERSE = [
     "2330.TW", "2317.TW", "2454.TW", "2308.TW", "2382.TW", "3231.TW",
@@ -41,37 +37,46 @@ USER_AGENT = {
     "User-Agent": "Mozilla/5.0 (compatible; SunheroStockBot/1.0; +https://github.com/)"
 }
 
-# === 重要：SSL 開關（預設關閉，只有你明確允許才會 verify=False）
-# 可用：
-# 1) Streamlit sidebar 勾選
-# 2) 環境變數：ALLOW_INSECURE_SSL=1
-ENV_ALLOW_INSECURE_SSL = str(os.getenv("ALLOW_INSECURE_SSL", "0")).strip().lower() in ("1", "true", "yes")
+def _bool_env(name: str, default: str = "0") -> bool:
+    return str(os.getenv(name, default)).strip().lower() in ("1", "true", "yes", "y", "on")
 
+# UI / ENV：允許 verify=False（為了解 TWSE 舊憑證 SSLError）
+# 1) Streamlit sidebar checkbox（若有 UI）
+# 2) 環境變數 ALLOW_INSECURE_SSL=1（Streamlit Cloud 建議用這個）
+allow_insecure_env = _bool_env("ALLOW_INSECURE_SSL", "0")
+ALLOW_INSECURE_SSL = allow_insecure_env
+
+# 若在 streamlit run 下，提供 UI 開關（不影響雲端用 env 控制）
+try:
+    # sidebar 可能在你另一個 app.py 生成；這裡做容錯，不存在就略過
+    ui_flag = st.sidebar.checkbox("允許不安全 SSL (verify=False)", value=allow_insecure_env)
+    ALLOW_INSECURE_SSL = bool(ui_flag)
+except Exception:
+    ALLOW_INSECURE_SSL = allow_insecure_env
+
+if ALLOW_INSECURE_SSL:
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # -----------------------------
-# 低階工具：requests（先用 certifi，必要時才 verify=False）
+# 低階工具：requests（帶 certifi，必要時退 verify=False）
 # -----------------------------
-def _requests_get(url: str, timeout: int = 15, allow_insecure_ssl: bool = False) -> requests.Response:
+def _requests_get(url: str, timeout: int = 15) -> requests.Response:
+    """
+    預設使用 certifi.where() 做 SSL 驗證。
+    若遇到 requests.exceptions.SSLError，且 ALLOW_INSECURE_SSL=True 才允許 verify=False 降級。
+    """
     try:
         return requests.get(url, headers=USER_AGENT, timeout=timeout, verify=certifi.where())
     except requests.exceptions.SSLError:
-        if not allow_insecure_ssl:
+        if not ALLOW_INSECURE_SSL:
             raise
-        # 允許 verify=False 時，才退到不驗證
-        import urllib3
-        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
         return requests.get(url, headers=USER_AGENT, timeout=timeout, verify=False)
 
-
 def _now_taipei() -> datetime:
-    # 以系統時區顯示即可（Streamlit Cloud 多半是 UTC；我們只做字串顯示）
-    # 如需嚴格 +0800，可再補 zoneinfo，但這版先求穩定可跑。
-    return datetime.now()
-
+    return datetime.now(tz=TZ_TAIPEI)
 
 def _floor_int(x: float) -> int:
     return int(math.floor(x))
-
 
 # -----------------------------
 # 交易日：用 ^TWII 最新K棒日期當作「最後收盤日」
@@ -83,112 +88,39 @@ def get_last_trade_date() -> str:
     last_dt = df.index[-1].to_pydatetime()
     return last_dt.strftime("%Y-%m-%d")
 
-
-def is_stale(last_trade_date: str, max_lag_days: int = 2) -> bool:
-    dt = datetime.strptime(last_trade_date, "%Y-%m-%d").date()
-    lag_days = (_now_taipei().date() - dt).days
-    return lag_days > max_lag_days
-
+def is_stale(last_trade_date: str, max_lag_trading_days: int = 1) -> bool:
+    dt = datetime.strptime(last_trade_date, "%Y-%m-%d").replace(tzinfo=TZ_TAIPEI)
+    lag_days = (_now_taipei().date() - dt.date()).days
+    return lag_days > 2 or lag_days > (max_lag_trading_days + 1)
 
 # -----------------------------
-# 成交金額（TWSE / TPEx）— FREE best-effort
-# 你之前的截圖顯示 TWSE SSL 會炸：Missing Subject Key Identifier
-# => 這裡用 allow_insecure_ssl 控制 fallback verify=False
+# 中文名稱：抓 TWSE/TPEx 股票清單做對照（免費）
 # -----------------------------
-@dataclass
-class MarketAmount:
-    amount_twse: Optional[int]
-    amount_tpex: Optional[int]
-    amount_total: Optional[int]
-    source_twse: str
-    source_tpex: str
-
-
-def fetch_amount_total(trade_date: str, allow_insecure_ssl: bool) -> MarketAmount:
-    """
-    回傳金額單位：元（取整數）
-    若抓不到，回 None，並在 source_* 留原因
-    """
-    # TWSE: MI_INDEX
-    amount_twse = None
-    src_twse = "TWSE:MI_INDEX"
+def fetch_twse_stock_names() -> Dict[str, str]:
+    out: Dict[str, str] = {}
     try:
-        url = f"https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX?date={trade_date.replace('-','')}&type=ALL&response=json"
-        r = _requests_get(url, timeout=15, allow_insecure_ssl=allow_insecure_ssl)
+        url = "https://isin.twse.com.tw/isin/C_public.jsp?strMode=2"
+        r = _requests_get(url, timeout=15)
         r.raise_for_status()
-        j = r.json()
-
-        # fields/data 會變，這裡用「容錯掃描」找「成交金額」
-        # 常見位置：各類指數總表內的「成交金額」
-        # 我們用最粗暴但穩定的方式：在 data 中找「成交金額」欄位的數值最大者（近似全市場）
-        fields = j.get("fields", [])
-        data = j.get("data", [])
-        if fields and data:
-            # 找欄位 index
-            idx_amt = None
-            for i, f in enumerate(fields):
-                if "成交金額" in str(f):
-                    idx_amt = i
-                    break
-            if idx_amt is not None:
-                vals = []
-                for row in data:
-                    if idx_amt < len(row):
-                        s = str(row[idx_amt]).replace(",", "").strip()
-                        if s.isdigit():
-                            vals.append(int(s))
-                if vals:
-                    amount_twse = max(vals)
-    except Exception as e:
-        src_twse = f"TWSE_FAIL:{type(e).__name__}"
-
-    # TPEx：日成交資訊（格式易變，做 best-effort）
-    amount_tpex = None
-    src_tpex = "TPEX:daily_trade_sum"
-    try:
-        # TPEx 日期格式：民國年/月份/日期（常見）
-        yyyy, mm, dd = trade_date.split("-")
-        roc = str(int(yyyy) - 1911)
-        roc_date = f"{roc}/{int(mm):02d}/{int(dd):02d}"
-
-        url = "https://www.tpex.org.tw/web/stock/aftertrading/daily_trade_sum/st43_result.php"
-        params = f"?l=zh-tw&d={roc_date}&o=json"
-        r = _requests_get(url + params, timeout=15, allow_insecure_ssl=allow_insecure_ssl)
-        r.raise_for_status()
-        j = r.json()
-
-        # 常見：{"aaData":[...]}，其中有「成交金額」欄位
-        aa = j.get("aaData", [])
-        # 嘗試掃描數字最大者（當作全市場成交金額近似）
-        vals = []
-        for row in aa:
-            for cell in row:
-                s = str(cell).replace(",", "").strip()
-                if s.isdigit():
-                    v = int(s)
-                    # 過小通常不是金額；用 >1e8 當濾網（1億）
-                    if v > 100_000_000:
-                        vals.append(v)
-        if vals:
-            amount_tpex = max(vals)
-    except Exception as e:
-        src_tpex = f"TPEX_FAIL:{type(e).__name__}"
-
-    amount_total = None
-    if amount_twse is not None and amount_tpex is not None:
-        amount_total = int(amount_twse + amount_tpex)
-
-    return MarketAmount(
-        amount_twse=amount_twse,
-        amount_tpex=amount_tpex,
-        amount_total=amount_total,
-        source_twse=src_twse,
-        source_tpex=src_tpex,
-    )
-
+        tables = pd.read_html(r.text)
+        if not tables:
+            return out
+        t = tables[0]
+        col0 = t.columns[0]
+        for v in t[col0].astype(str).tolist():
+            if len(v) < 6:
+                continue
+            parts = [p for p in v.replace("\u3000", " ").split(" ") if p.strip()]
+            if len(parts) >= 2 and parts[0].isdigit():
+                code = parts[0].strip()
+                name = parts[1].strip()
+                out[f"{code}.TW"] = name
+    except Exception:
+        return out
+    return out
 
 # -----------------------------
-# 指數快照（盤前/盤中/盤後）
+# 大盤指數
 # -----------------------------
 @dataclass
 class IndexSnapshot:
@@ -199,13 +131,7 @@ class IndexSnapshot:
     change_pct: float
     asof: str
 
-
 def fetch_index_snapshot(symbol: str, session: str) -> Optional[IndexSnapshot]:
-    """
-    session:
-      - PREMARKET / POSTMARKET: 抓 1d 收盤
-      - INTRADAY: 抓 5m 最後一筆 + 昨收
-    """
     try:
         if session == "INTRADAY":
             intr = yf.download(symbol, period="2d", interval="5m", progress=False)
@@ -230,20 +156,10 @@ def fetch_index_snapshot(symbol: str, session: str) -> Optional[IndexSnapshot]:
     except Exception:
         return None
 
-
 # -----------------------------
-# Regime 計算（V16.2 Enhanced）
+# Regime 計算（V16.2）
 # -----------------------------
 def compute_regime_metrics() -> dict:
-    """
-    指標：
-      - MA200
-      - SMR = (Index - MA200) / MA200
-      - SMR_MA5, Slope5
-      - drawdown_pct（250日高點回撤）
-      - CONSOLIDATION: 15日波動 < 5% 且 SMR 0.08~0.18
-      - VIX（^VIX）
-    """
     out = {
         "SMR": None,
         "MA200": None,
@@ -255,7 +171,7 @@ def compute_regime_metrics() -> dict:
         "consolidation_flag": False,
     }
 
-    tw = yf.download("^TWII", period="420d", interval="1d", progress=False)
+    tw = yf.download("^TWII", period="400d", interval="1d", progress=False)
     vx = yf.download("^VIX", period="60d", interval="1d", progress=False)
 
     if tw is None or tw.empty or len(tw) < 220:
@@ -266,12 +182,10 @@ def compute_regime_metrics() -> dict:
     last = float(close.iloc[-1])
     smr = (last - ma200) / ma200 if ma200 else 0.0
 
-    smr_series = (close - close.rolling(200).mean()) / close.rolling(200).mean()
+    ma200_series = close.rolling(200).mean()
+    smr_series = (close - ma200_series) / ma200_series
     smr_ma5_series = smr_series.rolling(5).mean().dropna()
-    if smr_ma5_series.empty:
-        return out
-
-    smr_ma5 = float(smr_ma5_series.iloc[-1])
+    smr_ma5 = float(smr_ma5_series.iloc[-1]) if len(smr_ma5_series) >= 1 else float(smr)
     smr_ma5_prev = float(smr_ma5_series.iloc[-2]) if len(smr_ma5_series) >= 2 else smr_ma5
     slope5 = smr_ma5 - smr_ma5_prev
 
@@ -280,10 +194,10 @@ def compute_regime_metrics() -> dict:
     dd = (last - peak) / peak * 100 if peak else 0.0
 
     lb15 = close.iloc[-15:] if len(close) >= 15 else close
-    vol15 = None
     if len(lb15) >= 10:
         vol15 = (float(lb15.max()) - float(lb15.min())) / float(lb15.mean()) * 100
-
+    else:
+        vol15 = None
     consolidation_flag = (vol15 is not None) and (vol15 < 5.0) and (0.08 <= smr <= 0.18)
 
     vix = float(vx["Close"].dropna().iloc[-1]) if (vx is not None and not vx.empty) else None
@@ -300,14 +214,10 @@ def compute_regime_metrics() -> dict:
     })
     return out
 
-
 def pick_regime(metrics: dict) -> Tuple[str, float]:
     """
     V16.2 優先序：
     CRASH > HIBERNATION > MEAN_REVERSION > OVERHEAT > CONSOLIDATION > NORMAL
-
-    注意：HIBERNATION 需要「MA14_Monthly」月收盤，免費端難完整；
-    這版先不在這裡硬觸發，避免錯殺。你若要真月線，我再幫你補「月收盤序列」算法。
     """
     smr = metrics.get("SMR")
     slope5 = metrics.get("Slope5")
@@ -327,33 +237,24 @@ def pick_regime(metrics: dict) -> Tuple[str, float]:
     if smr is None or slope5 is None:
         return "NORMAL", max_equity_map["NORMAL"]
 
-    # CRASH: VIX>35 或 回撤>=18%
     if (vix is not None and vix > 35) or (dd is not None and dd <= -18.0):
         return "CRASH_RISK", max_equity_map["CRASH_RISK"]
 
-    # MEAN_REVERSION: SMR 0.15~0.25 且 Slope5 < -0.0001
+    # HIBERNATION：需要 MA14_Monthly（每月收盤）資料。免費版先不硬觸發（避免錯殺）
+    # 你若要「真 MA14_Monthly」，我可以再提供月線取樣版本。
+
     if 0.15 <= smr <= 0.25 and slope5 < -0.0001:
         return "MEAN_REVERSION", max_equity_map["MEAN_REVERSION"]
 
-    # OVERHEAT: SMR > 0.25
     if smr > 0.25:
         return "OVERHEAT", max_equity_map["OVERHEAT"]
 
-    # CONSOLIDATION
     if cons:
         return "CONSOLIDATION", max_equity_map["CONSOLIDATION"]
 
     return "NORMAL", max_equity_map["NORMAL"]
 
-
 def vix_stop_pct(vix: Optional[float]) -> float:
-    """
-    動態停損（V16.2）：
-      VIX < 20: 6%
-      20~30: 8%
-      >30: 10%
-    回傳正值（例如 0.06）
-    """
     if vix is None:
         return 0.08
     if vix < 20:
@@ -362,47 +263,17 @@ def vix_stop_pct(vix: Optional[float]) -> float:
         return 0.08
     return 0.10
 
-
 # -----------------------------
-# 中文名稱（TWSE ISIN page，best-effort）
-# -----------------------------
-def fetch_twse_stock_names(allow_insecure_ssl: bool) -> Dict[str, str]:
-    out: Dict[str, str] = {}
-    try:
-        url = "https://isin.twse.com.tw/isin/C_public.jsp?strMode=2"
-        r = _requests_get(url, timeout=15, allow_insecure_ssl=allow_insecure_ssl)
-        r.raise_for_status()
-        tables = pd.read_html(r.text)
-        if not tables:
-            return out
-        t = tables[0]
-        col0 = t.columns[0]
-        for v in t[col0].astype(str).tolist():
-            if len(v) < 6:
-                continue
-            parts = [p for p in v.replace("\u3000", " ").split(" ") if p.strip()]
-            if len(parts) >= 2 and parts[0].isdigit():
-                code = parts[0].strip()
-                name = parts[1].strip()
-                out[f"{code}.TW"] = name
-    except Exception:
-        return out
-    return out
-
-
-# -----------------------------
-# 法人：TWSE T86（三大法人買賣超）— best-effort
+# 法人：TWSE T86（三大法人買賣超）
 # -----------------------------
 def twse_date_fmt(yyyy_mm_dd: str) -> str:
     return yyyy_mm_dd.replace("-", "")
 
-
-def fetch_twse_t86_for_date(yyyy_mm_dd: str, allow_insecure_ssl: bool) -> pd.DataFrame:
+def fetch_twse_t86_for_date(yyyy_mm_dd: str) -> pd.DataFrame:
     url = f"https://www.twse.com.tw/rwd/zh/fund/T86?date={twse_date_fmt(yyyy_mm_dd)}&selectType=ALLBUT0999&response=json"
-    r = _requests_get(url, timeout=15, allow_insecure_ssl=allow_insecure_ssl)
+    r = _requests_get(url, timeout=15)
     r.raise_for_status()
     j = r.json()
-
     data = j.get("data", [])
     fields = j.get("fields", [])
     if not data or not fields:
@@ -442,17 +313,18 @@ def fetch_twse_t86_for_date(yyyy_mm_dd: str, allow_insecure_ssl: bool) -> pd.Dat
     out = out[out["code"].str.match(r"^\d{4}$")]
     return out.reset_index(drop=True)
 
-
-def build_institutional_panel(last_trade_date: str, allow_insecure_ssl: bool, lookback_days: int = 7) -> Tuple[pd.DataFrame, List[str]]:
+def build_institutional_panel(last_trade_date: str, lookback_days: int = 7) -> Tuple[pd.DataFrame, List[str]]:
     warnings = []
+    dates = []
     dt = datetime.strptime(last_trade_date, "%Y-%m-%d").date()
-    dates = [(dt - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(lookback_days)]
+    for i in range(lookback_days):
+        dates.append((dt - timedelta(days=i)).strftime("%Y-%m-%d"))
     dates = list(reversed(dates))
 
     daily = []
     for d in dates:
         try:
-            df = fetch_twse_t86_for_date(d, allow_insecure_ssl=allow_insecure_ssl)
+            df = fetch_twse_t86_for_date(d)
             if df.empty:
                 continue
             df["date"] = d
@@ -467,16 +339,10 @@ def build_institutional_panel(last_trade_date: str, allow_insecure_ssl: bool, lo
     all_df = pd.concat(daily, ignore_index=True)
     avail_dates = sorted(all_df["date"].unique().tolist())
     last5 = avail_dates[-5:] if len(avail_dates) >= 5 else avail_dates
-
     panel = all_df[all_df["date"].isin(last5)].copy()
     return panel, warnings
 
-
 def inst_metrics_for_symbol(panel: pd.DataFrame, symbol_tw: str) -> dict:
-    """
-    回傳：
-      inst_streak3, inst_streak5, inst_dir3, foreign_dir, inst_status, inst_dates_5
-    """
     out = {
         "inst_streak3": 0,
         "inst_streak5": 0,
@@ -498,7 +364,6 @@ def inst_metrics_for_symbol(panel: pd.DataFrame, symbol_tw: str) -> dict:
     dates = df["date"].tolist()
     inst = df["inst_net"].tolist()
     foreign = df["foreign_net"].tolist()
-
     out["inst_dates_5"] = dates[-5:]
 
     last3 = inst[-3:] if len(inst) >= 3 else inst
@@ -523,20 +388,21 @@ def inst_metrics_for_symbol(panel: pd.DataFrame, symbol_tw: str) -> dict:
     out["inst_status"] = "READY" if len(inst) >= 3 else "UNAVAILABLE"
     return out
 
-
 # -----------------------------
 # 個股技術資料（yfinance）
 # -----------------------------
 def fetch_stock_daily(tickers: List[str]) -> pd.DataFrame:
     return yf.download(tickers, period="260d", interval="1d", progress=False, group_by="ticker", auto_adjust=False)
 
-
 def stock_features(data: pd.DataFrame, symbol: str) -> dict:
-    """
-    回傳：
-      Price, MA_Bias(%), Vol_Ratio(當日量/20日均量), Score(簡易), Tag
-    """
-    out = {"Price": None, "MA_Bias": 0.0, "Vol_Ratio": None, "Score": 0.0, "Tag": "○觀察(觀望)"}
+    out = {
+        "Price": None,
+        "MA_Bias": 0.0,
+        "Vol_Ratio": None,
+        "Score": 0.0,
+        "Body_Power": 0.0,
+        "Tag": "○觀察(觀望)",
+    }
     try:
         df = data[symbol].copy() if isinstance(data.columns, pd.MultiIndex) else data.copy()
         close = df["Close"].dropna()
@@ -553,8 +419,8 @@ def stock_features(data: pd.DataFrame, symbol: str) -> dict:
 
         vr = None
         if len(vol) >= 20:
-            vma = float(vol.rolling(20).mean().iloc[-1])
-            vr = float(vol.iloc[-1]) / vma if vma else None
+            vma20 = float(vol.rolling(20).mean().iloc[-1])
+            vr = (float(vol.iloc[-1]) / vma20) if vma20 else None
 
         score = 0.0
         if price > ma20 > ma60:
@@ -583,9 +449,8 @@ def stock_features(data: pd.DataFrame, symbol: str) -> dict:
     except Exception:
         return out
 
-
 # -----------------------------
-# TopN（免費版用可解釋排名）
+# Top20：免費/模擬期的「動態掃描」
 # -----------------------------
 def build_universe(positions: List[dict]) -> List[str]:
     s = set(DEFAULT_UNIVERSE)
@@ -595,13 +460,7 @@ def build_universe(positions: List[dict]) -> List[str]:
             s.add(sym)
     return sorted(s)
 
-
-def rank_topn(features_map: Dict[str, dict], inst_map: Dict[str, dict], topn: int) -> List[str]:
-    """
-    排名分數 = 技術 Score + 量能加權 + 法人加權
-    量能加權：vol_ratio 0.8->0, 1.8->10（上限 10）
-    法人加權：streak3*2 + POSITIVE +4（最多 10）
-    """
+def rank_top20(features_map: Dict[str, dict], inst_map: Dict[str, dict]) -> List[str]:
     rows = []
     for sym, f in features_map.items():
         score = float(f.get("Score") or 0.0)
@@ -621,34 +480,16 @@ def rank_topn(features_map: Dict[str, dict], inst_map: Dict[str, dict], topn: in
         rows.append((sym, total))
 
     rows.sort(key=lambda x: x[1], reverse=True)
-    return [r[0] for r in rows[:topn]]
-
-
-# -----------------------------
-# Momentum Lock（免費簡化版）
-# -----------------------------
-def compute_momentum_lock(top_features: Dict[str, dict]) -> bool:
-    """
-    先用 TopN 中 Score>=30 的比例判定動能鎖：
-    強勢占比 >= 50% -> True
-    """
-    if not top_features:
-        return False
-    scores = [float(v.get("Score") or 0.0) for v in top_features.values()]
-    if not scores:
-        return False
-    strong = sum(1 for s in scores if s >= 30.0)
-    return (strong / len(scores)) >= 0.5
-
+    return [r[0] for r in rows[:20]]
 
 # -----------------------------
-# Layer 判定（A+ 必須啟用）
+# Layer 判定（含 A+）
 # -----------------------------
 def classify_layer(regime: str, momentum_lock: bool, vol_ratio: Optional[float], inst: dict) -> str:
     """
-    A+：inst_streak5>=5 AND foreign_dir=POSITIVE  （必須啟用）
-    A ：inst_streak3>=3 AND inst_dir3=POSITIVE
-    B ：(regime in OVERHEAT/CONSOLIDATION) AND momentum_lock AND vol_ratio>0.8
+    A+：inst_streak5>=5 且 foreign_dir=POSITIVE
+    A ：inst_streak3>=3 且 inst_dir3=POSITIVE
+    B ：(regime in OVERHEAT/CONSOLIDATION) 且 momentum_lock=True 且 vol_ratio>0.8
     NONE：其他
     """
     if int(inst.get("inst_streak5", 0)) >= 5 and inst.get("foreign_dir") == "POSITIVE":
@@ -660,37 +501,32 @@ def classify_layer(regime: str, momentum_lock: bool, vol_ratio: Optional[float],
             return "B"
     return "NONE"
 
+def compute_momentum_lock(features_map: Dict[str, dict]) -> bool:
+    if not features_map:
+        return False
+    scores = [float(v.get("Score") or 0.0) for v in features_map.values()]
+    if not scores:
+        return False
+    strong = sum(1 for s in scores if s >= 30.0)
+    return (strong / len(scores)) >= 0.5
 
 # -----------------------------
-# Account（UI JSON 輸入：positions）
+# 帳戶：免費模擬
 # -----------------------------
-def normalize_positions(raw_positions: list) -> list:
-    out = []
-    for p in raw_positions or []:
-        sym = str(p.get("symbol", "")).strip()
-        if not sym:
-            continue
-        out.append({
-            "symbol": sym,
-            "shares": int(p.get("shares", 0) or 0),
-            "avg_cost": float(p.get("avg_cost", 0) or 0),
-            "entry_date": str(p.get("entry_date", "")) if p.get("entry_date") is not None else "",
-            "status": str(p.get("status", "")) if p.get("status") is not None else "",
-            "sector": str(p.get("sector", "")) if p.get("sector") is not None else "",
-        })
-    return out
-
+def load_account() -> dict:
+    path = "configs/account.json"
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"cash_balance": 2000000, "total_equity": 2000000, "positions": []}
 
 # -----------------------------
-# Data Health Gate（保命邏輯）
+# Data Health Gate
 # -----------------------------
-def data_health_gate(
-    trade_date: str,
-    stale_flag: bool,
-    amount_ok: bool,
-    inst_ready_any: bool,
-    ssl_broken: bool,
-) -> Tuple[bool, str]:
+def data_health_gate(trade_date: str, inst_ready_any: bool, amount_ok: bool, stale_flag: bool) -> Tuple[bool, str]:
     reasons = []
     if stale_flag:
         reasons.append("DATA_STALE")
@@ -698,73 +534,65 @@ def data_health_gate(
         reasons.append("AMOUNT_UNAVAILABLE")
     if not inst_ready_any:
         reasons.append("INST_UNAVAILABLE")
-    if ssl_broken:
-        reasons.append("SSL_BROKEN")
-
     degraded = len(reasons) > 0
-    return degraded, "; ".join(reasons) if reasons else "OK"
-
+    comment = "; ".join(reasons) if reasons else "OK"
+    return degraded, comment
 
 # -----------------------------
-# 主流程：產出 Arbiter Input JSON（供你下一段 Arbiter 用）
+# 主流程：產出 Arbiter Input JSON
 # -----------------------------
-def build_arbiter_input(
-    session: str,
-    topn: int,
-    allow_insecure_ssl: bool,
-    account: dict,
-) -> dict:
+def build_arbiter_input(session: str = "PREMARKET") -> dict:
     now = _now_taipei()
     ts_str = now.strftime("%Y-%m-%d %H:%M")
 
     trade_date = get_last_trade_date()
-    stale_flag = is_stale(trade_date, max_lag_days=2)
+    stale_flag = is_stale(trade_date, max_lag_trading_days=1)
 
+    account = load_account()
     positions = account.get("positions", [])
 
-    # 1) 指數
-    sess_idx = "INTRADAY" if session == "INTRADAY" else "POSTMARKET"
-    twii = fetch_index_snapshot("^TWII", sess_idx)
+    # 指數
+    twii = fetch_index_snapshot("^TWII", "INTRADAY" if session == "INTRADAY" else "POSTMARKET")
     spx = fetch_index_snapshot("^GSPC", "POSTMARKET")
     ixic = fetch_index_snapshot("^IXIC", "POSTMARKET")
     dji = fetch_index_snapshot("^DJI", "POSTMARKET")
-    vix_snap = fetch_index_snapshot("^VIX", "POSTMARKET")
+    vix = fetch_index_snapshot("^VIX", "POSTMARKET")
 
-    # 2) 成交金額（SSL 會影響）
+    # 成交金額（上市+上櫃合計）— 會受 market_amount.py 影響
     amount_ok = True
-    ssl_broken = False
-    ma = None
+    amount_twse = None
+    amount_tpex = None
+    amount_total = None
+    amount_sources = {"twse": None, "tpex": None, "error": None, "allow_insecure_ssl": ALLOW_INSECURE_SSL}
     try:
-        ma = fetch_amount_total(trade_date, allow_insecure_ssl=allow_insecure_ssl)
-        # 如果兩邊都抓不到，視為 amount 不可用
-        if ma.amount_twse is None and ma.amount_tpex is None:
-            amount_ok = False
-    except requests.exceptions.SSLError:
+        ma = fetch_amount_total(allow_insecure_ssl=ALLOW_INSECURE_SSL)
+        amount_twse = int(ma.amount_twse)
+        amount_tpex = int(ma.amount_tpex)
+        amount_total = int(ma.amount_total)
+        amount_sources["twse"] = ma.source_twse
+        amount_sources["tpex"] = ma.source_tpex
+    except Exception as e:
         amount_ok = False
-        ssl_broken = True
-        ma = MarketAmount(None, None, None, "TWSE_SSL_FAIL", "TPEX_SSL_FAIL")
-    except Exception:
-        amount_ok = False
-        ma = MarketAmount(None, None, None, "TWSE_FAIL", "TPEX_FAIL")
+        amount_sources["error"] = f"{type(e).__name__}: {str(e)[:160]}"
 
-    # 3) Regime
+    # Regime
     regime_metrics = compute_regime_metrics()
     regime, max_equity_allowed_pct = pick_regime(regime_metrics)
 
-    # 4) 法人 panel
-    panel, inst_warn = build_institutional_panel(trade_date, allow_insecure_ssl=allow_insecure_ssl, lookback_days=7)
+    # 法人 panel（T86）
+    panel, inst_warn = build_institutional_panel(trade_date, lookback_days=7)
 
-    # 5) 名稱
-    name_map = fetch_twse_stock_names(allow_insecure_ssl=allow_insecure_ssl)
+    # 名稱對照
+    name_map = fetch_twse_stock_names()
 
-    # 6) Universe + 技術
+    # Universe + 個股技術
     universe = build_universe(positions)
     data = fetch_stock_daily(universe)
 
     features_map: Dict[str, dict] = {}
     inst_map: Dict[str, dict] = {}
-    inst_ready_any = False
 
+    inst_ready_any = False
     for sym in universe:
         f = stock_features(data, sym)
         features_map[sym] = f
@@ -774,32 +602,35 @@ def build_arbiter_input(
         if im.get("inst_status") == "READY":
             inst_ready_any = True
 
-    # 7) TopN
-    top_list = rank_topn(features_map, inst_map, topn=topn)
-    top_features = {s: features_map.get(s, {}) for s in top_list}
-    momentum_lock = compute_momentum_lock(top_features)
+    # Top20（每日更新）
+    top20 = rank_top20(features_map, inst_map)
 
-    # 8) Gate
+    # momentum_lock（簡化版）
+    top20_features = {s: features_map[s] for s in top20 if s in features_map}
+    momentum_lock = compute_momentum_lock(top20_features)
+
+    # Gate → degraded_mode
     degraded_mode, gate_comment = data_health_gate(
         trade_date=trade_date,
-        stale_flag=stale_flag,
-        amount_ok=amount_ok,
         inst_ready_any=inst_ready_any,
-        ssl_broken=ssl_broken,
+        amount_ok=amount_ok,
+        stale_flag=stale_flag,
     )
 
-    # 9) tracked = TopN + 持倉（避免 orphan）
-    tracked = list(dict.fromkeys(top_list + [p.get("symbol") for p in positions if p.get("symbol")]))
+    # stocks（Top20 + 持倉補入）
+    tracked = list(dict.fromkeys(top20 + [p.get("symbol") for p in positions if p.get("symbol")]))
 
     stocks_out = []
+    a_plus_hits = 0
+
     for i, sym in enumerate(tracked, start=1):
         f = features_map.get(sym, {})
         im = inst_map.get(sym, {})
         name = name_map.get(sym, sym.replace(".TW", ""))
 
         tier = "A" if i <= 10 else "B"
-        top_flag = sym in top_list
-        orphan_holding = (not top_flag) and any(str(p.get("symbol")) == sym for p in positions)
+        top20_flag = sym in top20
+        orphan_holding = (not top20_flag) and any(str(p.get("symbol")) == sym for p in positions)
 
         layer = classify_layer(
             regime=regime,
@@ -807,35 +638,55 @@ def build_arbiter_input(
             vol_ratio=f.get("Vol_Ratio"),
             inst=im,
         )
+        if layer == "A+":
+            a_plus_hits += 1
 
         stocks_out.append({
-            "symbol": sym,
-            "name": name,
-            "price": f.get("Price"),
+            "Symbol": sym,
+            "Name": name,
+            "Price": f.get("Price"),
             "ranking": {
+                "symbol": sym,
                 "rank": i,
                 "tier": tier,
-                "top_flag": bool(top_flag),
-                "topn_actual": len(top_list),
+                "top20_flag": bool(top20_flag),
+                "topn_actual": len(top20),
             },
-            "technical": {
-                "ma_bias": f.get("MA_Bias", 0.0),
-                "vol_ratio": f.get("Vol_Ratio"),
-                "score": f.get("Score", 0.0),
-                "tag": f.get("Tag", "○觀察(觀望)"),
+            "Technical": {
+                "MA_Bias": f.get("MA_Bias", 0.0),
+                "Vol_Ratio": f.get("Vol_Ratio"),
+                "Body_Power": f.get("Body_Power", 0.0),
+                "Score": f.get("Score", 0.0),
+                "Tag": f.get("Tag", "○觀察(觀望)"),
             },
-            "institutional": {
-                "inst_status": im.get("inst_status", "UNAVAILABLE"),
-                "inst_streak3": int(im.get("inst_streak3", 0)),
-                "inst_streak5": int(im.get("inst_streak5", 0)),
-                "inst_dir3": im.get("inst_dir3", "MISSING"),
-                "foreign_dir": im.get("foreign_dir", "MISSING"),
-                "inst_dates_5": im.get("inst_dates_5", []),
-                "layer": layer,  # A+ / A / B / NONE
+            "Institutional": {
+                "Inst_Status": im.get("inst_status", "UNAVAILABLE"),
+                "Inst_Streak3": int(im.get("inst_streak3", 0)),
+                "Inst_Streak5": int(im.get("inst_streak5", 0)),
+                "Inst_Dir3": im.get("inst_dir3", "MISSING"),
+                "Foreign_Dir": im.get("foreign_dir", "MISSING"),
+                "Inst_Dates_5": im.get("inst_dates_5", []),
+                "Layer": layer,  # A+ / A / B / NONE
+            },
+            "Structure": {
+                "OPM": 0.0,
+                "Rev_Growth": 0.0,
+                "PE": 0.0,
+                "Sector": "Unknown",
+            },
+            "risk": {
+                "position_pct_max": 12,
+                "risk_per_trade_max": 1.0,
+                "trial_flag": True,
             },
             "orphan_holding": bool(orphan_holding),
+            "weaken_flags": {
+                "technical_weaken": False,
+                "structure_weaken": False,
+            }
         })
 
+    # indices
     indices = []
     def add_idx(snap: Optional[IndexSnapshot], name: str):
         if not snap:
@@ -849,198 +700,60 @@ def build_arbiter_input(
             "change_pct": round(snap.change_pct, 3),
             "asof": snap.asof,
         })
-
     add_idx(twii, "TAIEX")
     add_idx(spx, "S&P 500")
     add_idx(ixic, "NASDAQ")
     add_idx(dji, "DJIA")
-    add_idx(vix_snap, "VIX")
+    add_idx(vix, "VIX")
+
+    # overview
+    overview = {
+        "amount_twse": amount_twse if amount_twse is not None else None,
+        "amount_tpex": amount_tpex if amount_tpex is not None else None,
+        "amount_total": amount_total if amount_total is not None else None,
+        "amount_sources": amount_sources,
+        "trade_date": trade_date,
+        "data_mode": session,
+        "inst_status": "READY" if inst_ready_any else "UNAVAILABLE",
+        "kill_switch": False,
+        "v14_watch": False,
+        "degraded_mode": bool(degraded_mode),
+        "market_comment": gate_comment,  # Arbiter 會忽略
+        "regime": regime,
+        "regime_metrics": regime_metrics,
+        "max_equity_allowed_pct": float(max_equity_allowed_pct),
+        "vix_stop_pct": round(vix_stop_pct(regime_metrics.get("VIX")), 4),
+        "momentum_lock": bool(momentum_lock),
+        "a_plus_hits": int(a_plus_hits),
+        "warnings": inst_warn,
+    }
 
     payload = {
         "meta": {
             "system": SYSTEM_VERSION,
             "market": MARKET,
             "timestamp": ts_str,
-            "session": session,
-            "allow_insecure_ssl": bool(allow_insecure_ssl),
+            "session": session
         },
         "macro": {
-            "overview": {
-                "trade_date": trade_date,
-                "data_mode": session,
-                "regime": regime,
-                "regime_metrics": regime_metrics,
-                "max_equity_allowed_pct": float(max_equity_allowed_pct),
-                "degraded_mode": bool(degraded_mode),
-                "gate_comment": gate_comment,
-                "amount_twse": ma.amount_twse if ma else None,
-                "amount_tpex": ma.amount_tpex if ma else None,
-                "amount_total": ma.amount_total if ma else None,
-                "amount_sources": {
-                    "twse": ma.source_twse if ma else None,
-                    "tpex": ma.source_tpex if ma else None,
-                },
-                "inst_ready_any": bool(inst_ready_any),
-                "momentum_lock": bool(momentum_lock),
-                "vix_stop_pct": float(vix_stop_pct(regime_metrics.get("VIX"))),
-                "warnings_count": len(inst_warn),
-                "warnings": inst_warn[:50],
-            },
-            "indices": indices,
+            "overview": overview,
+            "indices": indices
         },
         "account": account,
-        "stocks": stocks_out,
-        "audit": {
-            "layer_a_plus_enabled": True,
-            "a_plus_hits": sum(1 for s in stocks_out if s.get("institutional", {}).get("layer") == "A+"),
-        }
+        "stocks": stocks_out
     }
     return payload
 
+def main():
+    """
+    你在 Streamlit Cloud 的 entrypoint 用 main.py 沒問題。
+    若你要本機直接跑：python main.py 會輸出 JSON 到 stdout。
+    """
+    session = os.getenv("SESSION", "PREMARKET").strip().upper()
+    if session not in ("PREMARKET", "INTRADAY", "POSTMARKET"):
+        session = "PREMARKET"
+    payload = build_arbiter_input(session=session)
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
 
-# -----------------------------
-# Streamlit UI（main.py 直接跑）
-# -----------------------------
-def run_app():
-    st.set_page_config(page_title="Sunhero｜股市智能超盤中控台", layout="wide")
-
-    st.title("Sunhero｜股市智能超盤中控台（TopN + 持倉監控 / Predator V16.2 Enhanced SIM-FREE）")
-
-    with st.sidebar:
-        st.header("設定")
-        session = st.selectbox("Session", ["PREMARKET", "INTRADAY", "POSTMARKET"], index=0)
-        topn = st.selectbox("TopN（固定池化數量）", [10, 20, 30, 50], index=1)
-
-        # SSL 開關：環境變數 OR 手動勾選
-        allow_insecure_ssl = st.checkbox(
-            "允許不安全 SSL（verify=False）",
-            value=ENV_ALLOW_INSECURE_SSL,
-            help="只在 TWSE/TPEx 憑證導致 requests.SSLError 時才會退到 verify=False。預設應保持關閉。",
-        )
-
-        st.subheader("持倉（手動貼 JSON array）")
-        st.caption("格式範例：[{\"symbol\":\"2330.TW\",\"shares\":100,\"avg_cost\":1000}]")
-        positions_text = st.text_area("positions", value="[]", height=120)
-
-        cash_balance = st.number_input("cash_balance（NTD）", min_value=0, value=2000000, step=10000)
-        total_equity = st.number_input("total_equity（NTD）", min_value=0, value=2000000, step=10000)
-
-        run_btn = st.button("Run")
-
-    # 解析持倉
-    try:
-        raw_positions = json.loads(positions_text) if positions_text.strip() else []
-        positions = normalize_positions(raw_positions)
-    except Exception as e:
-        st.error(f"positions JSON 解析失敗：{type(e).__name__}")
-        st.stop()
-
-    account = {
-        "cash_balance": int(cash_balance),
-        "total_equity": int(total_equity),
-        "positions": positions,
-    }
-
-    if not run_btn and "last_payload" in st.session_state:
-        payload = st.session_state["last_payload"]
-    elif run_btn:
-        try:
-            payload = build_arbiter_input(
-                session=session,
-                topn=int(topn),
-                allow_insecure_ssl=bool(allow_insecure_ssl),
-                account=account,
-            )
-            st.session_state["last_payload"] = payload
-        except requests.exceptions.SSLError as e:
-            st.error("SSLError：你目前遇到的 Missing Subject Key Identifier 類型問題。")
-            st.error("若你確認要暫時恢復抓取，請在左側勾選「允許不安全 SSL（verify=False）」再 Run。")
-            st.stop()
-        except Exception as e:
-            st.exception(e)
-            st.stop()
-    else:
-        st.info("請在左側設定後按 Run。")
-        return
-
-    ov = payload["macro"]["overview"]
-    metrics = ov.get("regime_metrics", {}) or {}
-
-    # ====== 關鍵數據（用數字講話）
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("交易日（最後收盤）", ov.get("trade_date", "NA"))
-    c2.metric("Regime", ov.get("regime", "NA"))
-    c3.metric("SMR", f"{metrics.get('SMR')}", help="(Index-MA200)/MA200")
-    c4.metric("Slope5", f"{metrics.get('Slope5')}", help="SMR_MA5[t]-SMR_MA5[t-1]")
-    c5.metric("VIX", f"{metrics.get('VIX')}")
-
-    c6, c7, c8, c9, c10 = st.columns(5)
-    c6.metric("Max Equity Allowed", f"{ov.get('max_equity_allowed_pct')}%")
-    c7.metric("Degraded Mode", str(ov.get("degraded_mode")))
-    c8.metric("TopN Actual", str(payload["stocks"][0]["ranking"]["topn_actual"]) if payload["stocks"] else "0")
-    c9.metric("A+ 命中檔數", str(payload["audit"]["a_plus_hits"]))
-    c10.metric("VIX Stop(%)", f"{round(ov.get('vix_stop_pct', 0)*100, 1)}%")
-
-    # ====== Gate 狀態
-    if ov.get("degraded_mode"):
-        st.error(f"Gate：DEGRADED（禁止 BUY/TRIAL）｜原因：{ov.get('gate_comment')}")
-    else:
-        st.success("Gate：NORMAL（資料健康通過）")
-
-    # ====== 成交金額與來源（你之前最常壞在這裡）
-    st.subheader("市場成交金額（best-effort / 可稽核）")
-    st.write({
-        "amount_twse": ov.get("amount_twse"),
-        "amount_tpex": ov.get("amount_tpex"),
-        "amount_total": ov.get("amount_total"),
-        "sources": ov.get("amount_sources"),
-        "allow_insecure_ssl": payload["meta"]["allow_insecure_ssl"],
-    })
-
-    # ====== 指數列表
-    st.subheader("指數快照")
-    idx_df = pd.DataFrame(payload["macro"]["indices"])
-    if not idx_df.empty:
-        st.dataframe(idx_df, use_container_width=True)
-    else:
-        st.warning("指數資料不足（yfinance 可能暫時無回應）。")
-
-    # ====== TopN + 持倉監控表（含 A+）
-    st.subheader(f"今日分析清單（Top{topn} + 持倉）— 含 A+ Layer")
-    rows = []
-    for s in payload["stocks"]:
-        rows.append({
-            "rank": s["ranking"]["rank"],
-            "tier": s["ranking"]["tier"],
-            "symbol": s["symbol"],
-            "name": s["name"],
-            "price": s["price"],
-            "score": s["technical"]["score"],
-            "ma_bias(%)": s["technical"]["ma_bias"],
-            "vol_ratio": s["technical"]["vol_ratio"],
-            "inst_status": s["institutional"]["inst_status"],
-            "streak3": s["institutional"]["inst_streak3"],
-            "streak5": s["institutional"]["inst_streak5"],
-            "inst_dir3": s["institutional"]["inst_dir3"],
-            "foreign_dir": s["institutional"]["foreign_dir"],
-            "layer": s["institutional"]["layer"],  # A+ / A / B / NONE
-            "orphan_holding": s["orphan_holding"],
-        })
-    df = pd.DataFrame(rows)
-    if not df.empty:
-        st.dataframe(df, use_container_width=True, height=520)
-    else:
-        st.warning("stocks 清單為空：通常是 Universe 建立失敗或資料源完全不可用。")
-
-    # ====== 警告（你要看的「為什麼沒東西」會在這裡）
-    st.subheader("Warnings（最多顯示 50 條）")
-    warns = ov.get("warnings", []) or []
-    st.write({"warnings_count": ov.get("warnings_count", 0), "warnings": warns[:50]})
-
-    # ====== Arbiter Input JSON（給你下一步裁決引擎餵入）
-    st.subheader("AI JSON（Arbiter Input）— 可回溯（SIM-FREE）")
-    st.json(payload, expanded=False)
-
-
-# 直接跑 main.py（Streamlit 會從頂層執行）
-run_app()
+if __name__ == "__main__":
+    main()
