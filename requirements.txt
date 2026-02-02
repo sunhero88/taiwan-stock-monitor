@@ -6,3 +6,4 @@ requests
 lxml
 html5lib
 beautifulsoup4
+certifi
