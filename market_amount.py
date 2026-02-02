@@ -2,14 +2,16 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta, timezone
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple
 
+import certifi
 import requests
 import pandas as pd
-import certifi
+
 
 TZ_TAIPEI = timezone(timedelta(hours=8))
 
@@ -18,23 +20,43 @@ TRADING_END = time(13, 30)
 TRADING_MINUTES = 270  # 09:00~13:30
 
 USER_AGENT = {
-    "User-Agent": "Mozilla/5.0 (compatible; SunheroStockBot/1.0; +https://streamlit.app/)"
+    "User-Agent": "Mozilla/5.0 (compatible; SunheroStockBot/1.0; +https://github.com/)"
 }
 
-# -----------------------
-# Utils
-# -----------------------
+# 安全開關：預設不關 SSL。只有你明確設環境變數才會關。
+# Streamlit Cloud -> Settings -> Secrets / Env
+ALLOW_INSECURE_SSL = str(os.getenv("ALLOW_INSECURE_SSL", "0")).strip() in ("1", "true", "TRUE", "yes", "YES")
+
+
+def _requests_get(url: str, timeout: int = 15) -> requests.Response:
+    """
+    先用正常 SSL（certifi）連；
+    若遇到 SSL 錯誤且 ALLOW_INSECURE_SSL=1 才退到 verify=False。
+    """
+    try:
+        return requests.get(url, headers=USER_AGENT, timeout=timeout, verify=certifi.where())
+    except requests.exceptions.SSLError:
+        if not ALLOW_INSECURE_SSL:
+            raise
+        # 退而求其次：僅在你允許時使用
+        return requests.get(url, headers=USER_AGENT, timeout=timeout, verify=False)
+
+
 def _to_int_amount(x) -> int:
+    """把 '775,402,495,419' 之類字串轉 int"""
     if x is None:
         return 0
     s = str(x)
     s = re.sub(r"[^\d]", "", s)
     return int(s) if s else 0
 
+
 def _now_taipei() -> datetime:
     return datetime.now(tz=TZ_TAIPEI)
 
+
 def trading_progress(now: Optional[datetime] = None) -> float:
+    """回傳盤中進度 0~1。盤外 clamp 到 0 或 1。"""
     now = now or _now_taipei()
     start_dt = now.replace(hour=TRADING_START.hour, minute=TRADING_START.minute, second=0, microsecond=0)
     end_dt = now.replace(hour=TRADING_END.hour, minute=TRADING_END.minute, second=0, microsecond=0)
@@ -46,9 +68,12 @@ def trading_progress(now: Optional[datetime] = None) -> float:
     elapsed = (now - start_dt).total_seconds() / 60.0
     return max(0.0, min(1.0, elapsed / TRADING_MINUTES))
 
+
 def progress_curve(p: float, alpha: float = 0.65) -> float:
+    """用冪次曲線做『盤中累積量能』預期，避免早盤被誤判 LOW。"""
     p = max(0.0, min(1.0, p))
     return p ** alpha
+
 
 @dataclass
 class MarketAmount:
@@ -57,91 +82,72 @@ class MarketAmount:
     amount_total: int
     source_twse: str
     source_tpex: str
-    ssl_mode: str
-    errors: Dict[str, str]
 
-def http_get(url: str, timeout: int = 20, verify_ssl: bool = True) -> requests.Response:
-    """
-    verify_ssl=True: 使用 certifi CA bundle（建議）
-    verify_ssl=False: 不驗證 SSL（最後防線，需 Gate 降級）
-    """
-    verify = certifi.where() if verify_ssl else False
-    return requests.get(url, headers=USER_AGENT, timeout=timeout, verify=verify)
 
-# -----------------------
-# TWSE: use OpenAPI (avoid www.twse.com.tw SSL issues)
-# -----------------------
-def fetch_twse_amount_openapi(verify_ssl: bool = True) -> Tuple[int, str, Optional[str]]:
+def fetch_twse_amount() -> Tuple[int, str]:
     """
-    上市成交金額（元）：TWSE OpenAPI STOCK_DAY_ALL，把 TradeValue 加總。
+    上市成交金額（元）：TWSE MI_INDEX(HTML) 成交統計表，各類別成交金額加總。
     """
-    url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
-    try:
-        r = http_get(url, timeout=25, verify_ssl=verify_ssl)
-        r.raise_for_status()
-        data = r.json()
-        df = pd.DataFrame(data)
-        if df.empty or "TradeValue" not in df.columns:
-            return 0, "TWSE OpenAPI STOCK_DAY_ALL (schema/empty)", "TWSE_EMPTY_OR_SCHEMA_CHANGED"
+    url = "https://www.twse.com.tw/exchangeReport/MI_INDEX?date=&response=html"
+    r = _requests_get(url, timeout=15)
+    r.raise_for_status()
 
-        # TradeValue 多為字串數字（元）
-        tv = df["TradeValue"].apply(_to_int_amount)
-        amount = int(tv.sum())
-        return amount, "TWSE OpenAPI STOCK_DAY_ALL TradeValue sum", None
-    except Exception as e:
-        return 0, "TWSE OpenAPI STOCK_DAY_ALL", f"TWSE_ERR:{type(e).__name__}"
+    tables = pd.read_html(r.text)
+    if not tables:
+        raise RuntimeError("TWSE MI_INDEX 找不到可解析表格")
 
-# -----------------------
-# TPEx: best-effort (HTML summary)
-# -----------------------
-def fetch_tpex_amount_html(verify_ssl: bool = True) -> Tuple[int, str, Optional[str]]:
+    target = None
+    for t in tables:
+        cols = [str(c) for c in t.columns]
+        if any("成交金額" in c for c in cols) and any("成交統計" in c for c in cols):
+            target = t
+            break
+    if target is None:
+        target = tables[0]
+
+    amt_col = None
+    for c in target.columns:
+        if "成交金額" in str(c):
+            amt_col = c
+            break
+    if amt_col is None:
+        raise RuntimeError("TWSE 成交統計表找不到『成交金額』欄")
+
+    amount = int(target[amt_col].apply(_to_int_amount).sum())
+    return amount, "TWSE MI_INDEX(HTML) 成交統計各類別加總"
+
+
+def fetch_tpex_amount() -> Tuple[int, str]:
     """
-    上櫃成交金額（元）：TPEx pricing.html 內文字抓「總成交金額」。
-    若抓不到，回傳 error（不 raise）。
+    上櫃成交金額（元）：TPEx 行情頁的「總成交金額」。
     """
     url = "https://www.tpex.org.tw/zh-tw/mainboard/trading/info/pricing.html"
-    try:
-        r = http_get(url, timeout=25, verify_ssl=verify_ssl)
-        r.raise_for_status()
+    r = _requests_get(url, timeout=15)
+    r.raise_for_status()
 
-        # 常見：總成交金額: 175,152,956,339元
-        m = re.search(r"總成交金額[:：]\s*([\d,]+)\s*元", r.text)
-        if not m:
-            m2 = re.search(r"總成交金額.*?([\d,]+)\s*元", r.text)
-            if not m2:
-                return 0, "TPEx pricing.html", "TPEX_TOTAL_AMOUNT_NOT_FOUND"
-            amount = _to_int_amount(m2.group(1))
-        else:
-            amount = _to_int_amount(m.group(1))
+    m = re.search(r"總成交金額[:：]\s*([\d,]+)\s*元", r.text)
+    if not m:
+        m2 = re.search(r"總成交金額.*?([\d,]+)\s*元", r.text)
+        if not m2:
+            raise RuntimeError("TPEx pricing.html 找不到『總成交金額』")
+        amount = _to_int_amount(m2.group(1))
+    else:
+        amount = _to_int_amount(m.group(1))
 
-        return int(amount), "TPEx pricing.html 總成交金額", None
-    except Exception as e:
-        return 0, "TPEx pricing.html", f"TPEX_ERR:{type(e).__name__}"
+    return int(amount), "TPEx pricing.html 總成交金額"
 
-# -----------------------
-# Total
-# -----------------------
-def fetch_amount_total(verify_ssl: bool = True) -> MarketAmount:
-    errors: Dict[str, str] = {}
-    ssl_mode = "VERIFY_CERTIFI" if verify_ssl else "INSECURE_NO_VERIFY"
 
-    twse, s1, e1 = fetch_twse_amount_openapi(verify_ssl=verify_ssl)
-    if e1:
-        errors["twse"] = e1
-
-    tpex, s2, e2 = fetch_tpex_amount_html(verify_ssl=verify_ssl)
-    if e2:
-        errors["tpex"] = e2
-
+def fetch_amount_total() -> MarketAmount:
+    twse, s1 = fetch_twse_amount()
+    tpex, s2 = fetch_tpex_amount()
     return MarketAmount(
         amount_twse=twse,
         amount_tpex=tpex,
         amount_total=twse + tpex,
         source_twse=s1,
         source_tpex=s2,
-        ssl_mode=ssl_mode,
-        errors=errors,
     )
+
 
 def classify_ratio(r: float) -> str:
     if r < 0.8:
@@ -150,6 +156,7 @@ def classify_ratio(r: float) -> str:
         return "HIGH"
     return "NORMAL"
 
+
 def intraday_norm(
     amount_total_now: int,
     amount_total_prev: Optional[int],
@@ -157,6 +164,10 @@ def intraday_norm(
     now: Optional[datetime] = None,
     alpha: float = 0.65,
 ) -> dict:
+    """
+    - amount_norm_cum_ratio：累積正規化（穩健型）
+    - amount_norm_slice_ratio：切片正規化（保守型，需 prev）
+    """
     now = now or _now_taipei()
     p_now = trading_progress(now)
     p_prev = max(0.0, p_now - (5 / TRADING_MINUTES))
