@@ -1,5 +1,7 @@
 # main.py
 # -*- coding: utf-8 -*-
+import streamlit as st
+st.write("STREAMLIT BOOT OK")
 from __future__ import annotations
 
 import json
@@ -880,3 +882,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
