@@ -1,3 +1,9 @@
+# ===== Required imports for V16.3 Stable =====
+import pandas as pd
+import numpy as np
+import yfinance as yf
+from typing import Optional, Tuple, List
+
 # =========================================================
 # Predator V16.3 Stable (Hybrid Edition)
 # Replace these 4 functions (plus required helpers):
@@ -8,11 +14,7 @@
 # =========================================================
 
 EPS = 1e-4  # 0.0001
-# ===== Required imports for V16.3 Stable =====
-import pandas as pd
-import numpy as np
-import yfinance as yf
-from typing import Optional, Tuple, List
+
 
 def _as_series_close(df: pd.DataFrame) -> pd.Series:
     """
@@ -416,4 +418,5 @@ def classify_layer(regime: str, momentum_lock: bool, vol_ratio: Optional[float],
         return "B"
 
     return "NONE"
+
 
