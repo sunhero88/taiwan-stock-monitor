@@ -5,7 +5,6 @@
 # =========================================================
 
 import json
-import math
 import time
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional, Tuple
@@ -14,6 +13,7 @@ import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 import yfinance as yf
 
 
@@ -120,9 +120,6 @@ class MarketAmount:
 
 
 def _fetch_twse_amount(allow_insecure_ssl: bool) -> Tuple[Optional[int], str]:
-    """
-    TWSE 成交金額（上市） best-effort
-    """
     url = "https://www.twse.com.tw/exchangeReport/MI_INDEX?response=json&type=ALLBUT0999"
     try:
         r = requests.get(url, timeout=10, verify=(not allow_insecure_ssl))
@@ -146,7 +143,6 @@ def _fetch_twse_amount(allow_insecure_ssl: bool) -> Tuple[Optional[int], str]:
             )
             return None, "TWSE_FAIL:TABLE_MISSING"
 
-        # 對應欄位名稱（盡可能找成交金額欄）
         fields = js.get("fields9") or js.get("fields1") or js.get("fields") or []
         fields = [str(x) for x in fields] if isinstance(fields, list) else []
         amt_idx = None
@@ -162,7 +158,6 @@ def _fetch_twse_amount(allow_insecure_ssl: bool) -> Tuple[Optional[int], str]:
                 amount = _safe_int(last[amt_idx], default=None)
 
         if amount is None:
-            # fallback：max-scan
             best = None
             for _, tbl in candidate_tables:
                 for row in tbl[-8:]:
@@ -200,9 +195,6 @@ def _fetch_twse_amount(allow_insecure_ssl: bool) -> Tuple[Optional[int], str]:
 
 
 def _fetch_tpex_amount(allow_insecure_ssl: bool) -> Tuple[Optional[int], str]:
-    """
-    TPEX 成交金額（上櫃） best-effort
-    """
     url = "https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw"
     try:
         r = requests.get(url, timeout=10, verify=(not allow_insecure_ssl))
@@ -267,10 +259,6 @@ def _fetch_tpex_amount(allow_insecure_ssl: bool) -> Tuple[Optional[int], str]:
 
 
 def fetch_amount_total(allow_insecure_ssl: bool = False) -> MarketAmount:
-    """
-    回傳：上市、上櫃、合計成交金額（元）
-    allow_insecure_ssl=True 時允許 verify=False 以繞過舊憑證/鏈問題。
-    """
     twse_amt, twse_src = _fetch_twse_amount(allow_insecure_ssl)
     tpex_amt, tpex_src = _fetch_tpex_amount(allow_insecure_ssl)
 
@@ -297,11 +285,7 @@ def fetch_amount_total(allow_insecure_ssl: bool = False) -> MarketAmount:
 
 # =========================================================
 # Predator V16.3 Stable (Hybrid Edition)
-# Replace: compute_regime_metrics(), pick_regime(),
-#          inst_metrics_for_symbol(), classify_layer()
-# Plus: required helpers
 # =========================================================
-
 def _as_close_series(df: pd.DataFrame) -> pd.Series:
     if df is None or df.empty:
         raise ValueError("market_df is empty")
@@ -320,12 +304,6 @@ def _as_close_series(df: pd.DataFrame) -> pd.Series:
 
 
 def compute_regime_metrics(market_df: pd.DataFrame = None) -> dict:
-    """
-    回傳 dict，所有欄位皆為 scalar（不含 Series）
-    修正：
-      - drawdown_current_pct：當下回撤（只能用它觸發 CRASH_RISK）
-      - drawdown_max_pct：歷史最深回撤（只能做背景資訊）
-    """
     if market_df is None or len(market_df) < 10:
         return {
             "SMR": None,
@@ -362,22 +340,19 @@ def compute_regime_metrics(market_df: pd.DataFrame = None) -> dict:
     else:
         slope5 = float(smr_ma5_series.iloc[-1] - smr_ma5_series.iloc[-2])
 
-    # NEGATIVE_SLOPE_5D: slope < -EPS for 5 consecutive days
     recent_slopes = smr_ma5_series.diff().dropna().iloc[-5:]
     negative_slope_5d = bool((recent_slopes < -EPS).all()) if len(recent_slopes) == 5 else False
 
-    # MOMENTUM_LOCK: slope > EPS for 4 consecutive days
     momentum_lock = False
     if len(smr_ma5_series) >= 5:
         last4 = smr_ma5_series.diff().dropna().iloc[-4:]
         if len(last4) == 4:
             momentum_lock = bool((last4 > EPS).all())
 
-    # Drawdown
     rolling_high = close.cummax()
     dd_series = (close - rolling_high) / rolling_high
-    drawdown_current_pct = float(dd_series.iloc[-1])  # 當下回撤（最重要）
-    drawdown_max_pct = float(dd_series.min())         # 歷史最深回撤（背景）
+    drawdown_current_pct = float(dd_series.iloc[-1])
+    drawdown_max_pct = float(dd_series.min())
 
     return {
         "SMR": smr,
@@ -397,24 +372,13 @@ def pick_regime(
     close_price: float = None,
     close_below_ma_days: int = 0,
 ) -> tuple:
-    """
-    回傳 (regime_name, max_equity_pct)
-    V16.3:
-      - CRASH_RISK: VIX>35 OR drawdown_current_pct<=-18%
-      - HIBERNATION: close < MA14_Monthly*0.96 for 2 days
-      - MEAN_REVERSION / OVERHEAT: SMR>0.25 with slope split
-      - CONSOLIDATION: 0.08<=SMR<=0.18（簡化版）
-      - NORMAL: default
-    """
     smr = metrics.get("SMR")
     slope5 = metrics.get("Slope5")
     dd_cur = metrics.get("drawdown_current_pct")
 
-    # --- CRASH_RISK (ONLY current drawdown) ---
     if (vix is not None and float(vix) > 35) or (dd_cur is not None and float(dd_cur) <= -0.18):
         return "CRASH_RISK", 0.10
 
-    # --- HIBERNATION (2 days) ---
     if (
         ma14_monthly is not None
         and close_price is not None
@@ -423,14 +387,12 @@ def pick_regime(
     ):
         return "HIBERNATION", 0.20
 
-    # --- MEAN_REVERSION / OVERHEAT ---
     if smr is not None and slope5 is not None:
         if float(smr) > 0.25 and float(slope5) < -EPS:
             return "MEAN_REVERSION", 0.45
         if float(smr) > 0.25 and float(slope5) >= -EPS:
             return "OVERHEAT", 0.55
 
-    # --- CONSOLIDATION (simplified) ---
     if smr is not None and 0.08 <= float(smr) <= 0.18:
         return "CONSOLIDATION", 0.65
 
@@ -438,12 +400,6 @@ def pick_regime(
 
 
 def inst_metrics_for_symbol(panel: pd.DataFrame, symbol: str) -> dict:
-    """
-    統一輸出 scalar：
-      foreign_buy, trust_buy, inst_streak3, inst_status, inst_dir3, inst_net_3d
-    panel 欄位預期（若你接 FinMind 計算後請 rename 對齊）：
-      Symbol, Foreign_Net, Trust_Net, Inst_Streak3, Inst_Status, Inst_Dir3, Inst_Net_3d
-    """
     base = {
         "foreign_buy": False,
         "trust_buy": False,
@@ -454,7 +410,6 @@ def inst_metrics_for_symbol(panel: pd.DataFrame, symbol: str) -> dict:
     }
     if panel is None or panel.empty:
         return base
-
     if "Symbol" not in panel.columns:
         return base
 
@@ -463,7 +418,6 @@ def inst_metrics_for_symbol(panel: pd.DataFrame, symbol: str) -> dict:
         return base
 
     row = df.iloc[-1]
-
     foreign_buy = bool(_safe_float(row.get("Foreign_Net", 0), 0) > 0)
     trust_buy = bool(_safe_float(row.get("Trust_Net", 0), 0) > 0)
     inst_streak3 = _safe_int(row.get("Inst_Streak3", 0), 0)
@@ -489,23 +443,16 @@ def classify_layer(
     amount_ok: bool,
     inst_ok: bool,
 ) -> str:
-    """
-    V16.3 分層降級（deterministic）：
-      - inst_ok=False => 禁用 A/A+（直接跳過）
-      - amount_ok=False => 禁用 B（直接跳過）
-    """
     foreign_buy = bool(inst.get("foreign_buy", False))
     trust_buy = bool(inst.get("trust_buy", False))
     inst_streak3 = int(inst.get("inst_streak3", 0))
 
-    # ---- Layer A+ / A (requires inst_ok) ----
     if inst_ok:
         if foreign_buy and trust_buy and inst_streak3 >= 3:
             return "A+"
         if (foreign_buy or trust_buy) and inst_streak3 >= 3:
             return "A"
 
-    # ---- Layer B (requires amount_ok because vol_ratio reliability depends on volume chain) ----
     if amount_ok:
         vr = _safe_float(vol_ratio, None)
         if (
@@ -616,12 +563,6 @@ def build_institutional_panel_finmind(
     trade_date: str,
     token: Optional[str],
 ) -> Tuple[pd.DataFrame, bool, str]:
-    """
-    回傳：
-      (panel_df, inst_ok, inst_source_note)
-    panel_df columns (normalized):
-      Symbol, Foreign_Net, Trust_Net, Inst_Streak3, Inst_Status, Inst_Dir3, Inst_Net_3d
-    """
     fetch_fn, fetch_err = _try_import_finmind()
     calc_fn, calc_err = _try_import_inst_utils()
 
@@ -631,7 +572,6 @@ def build_institutional_panel_finmind(
             warnings_bus.push("INST_IMPORT_FAIL", f"finmind_institutional import fail: {fetch_err}", {})
         if calc_err:
             warnings_bus.push("INST_IMPORT_FAIL", f"institutional_utils import fail: {calc_err}", {})
-        # stub
         rows = []
         for s in symbols:
             rows.append(
@@ -647,8 +587,6 @@ def build_institutional_panel_finmind(
             )
         return pd.DataFrame(rows), False, note
 
-    # 抓最近 7 天（夠算 3 日）
-    # 注意：FinMind 是交易日才有資料；start_date 往前抓保險
     start_date = (pd.to_datetime(trade_date) - pd.Timedelta(days=14)).strftime("%Y-%m-%d")
     end_date = trade_date
 
@@ -659,7 +597,6 @@ def build_institutional_panel_finmind(
         inst_df = pd.DataFrame(columns=["date", "symbol", "net_amount"])
 
     if inst_df is None or inst_df.empty:
-        # inst unavailable
         rows = []
         for s in symbols:
             rows.append(
@@ -675,14 +612,9 @@ def build_institutional_panel_finmind(
             )
         return pd.DataFrame(rows), False, "FINMIND_EMPTY"
 
-    # 你提供的 institutional_utils.calc_inst_3d 是用「symbol, net_amount」三日方向
-    # 這裡先把三大法人合計 net_amount 當作「Foreign_Net」與「Trust_Net」的 proxy=0（不做假拆）
-    # 但 layer A 判定只需要 foreign_buy/trust_buy + streak3>=3
-    # 若你之後要拆外資/投信，請在此處改成兩份來源（或改 calc_inst_3d 接兩條）
     rows = []
     for s in symbols:
-        r3 = calc_fn(inst_df, symbol=s, trade_date=trade_date)  # uses net_amount sum of 3 days
-        # 方向與 streak 由 calc_inst_3d 決定；foreign/trust 不做假拆，避免誤導
+        r3 = calc_fn(inst_df, symbol=s, trade_date=trade_date)
         rows.append(
             {
                 "Symbol": s,
@@ -696,14 +628,12 @@ def build_institutional_panel_finmind(
         )
 
     panel = pd.DataFrame(rows)
-
-    # inst_ok：至少有一檔 READY 或資料列完整
     inst_ok = bool(len(panel) > 0 and panel["Inst_Status"].astype(str).isin(["READY"]).any())
     return panel, inst_ok, "FINMIND_3D_NET"
 
 
 # =========================
-# Build arbiter input (minimal)
+# Build arbiter input
 # =========================
 def build_arbiter_input(
     session: str,
@@ -715,7 +645,6 @@ def build_arbiter_input(
     finmind_token: Optional[str],
 ) -> Tuple[dict, List[dict]]:
 
-    # ---- Market data ----
     twii_df = fetch_history(TWII_SYMBOL, period="3y", interval="1d")
     vix_df = fetch_history(VIX_SYMBOL, period="2y", interval="1d")
 
@@ -726,7 +655,6 @@ def build_arbiter_input(
     except Exception:
         vix_last = None
 
-    # ---- Metrics ----
     twii_idx = twii_df.copy()
     if "Datetime" in twii_idx.columns:
         twii_idx["Datetime"] = pd.to_datetime(twii_idx["Datetime"])
@@ -745,20 +673,11 @@ def build_arbiter_input(
         close_below_ma_days=close_below_days,
     )
 
-    # ---- Market amount ----
     amount = fetch_amount_total(allow_insecure_ssl=allow_insecure_ssl)
-
     amount_ok = bool(amount.amount_total is not None)
     if not amount_ok:
         warnings_bus.push("AMOUNT_DEGRADED", "Market amount unavailable => disable Layer B", asdict(amount))
 
-    # ---- TopN symbols ----
-    default_pool = ["2330.TW", "2317.TW", "2454.TW", "2308.TW", "2881.TW", "2882.TW", "2603.TW", "2609.TW"]
-    sym_from_pos = [p.get("symbol") for p in positions if isinstance(p, dict) and p.get("symbol")]
-    symset = list(dict.fromkeys(sym_from_pos + default_pool))
-    symbols = symset[: max(1, int(topn))]
-
-    # ---- Institutional panel ----
     trade_date = None
     try:
         if not twii_df.empty and "Datetime" in twii_df.columns:
@@ -766,6 +685,11 @@ def build_arbiter_input(
     except Exception:
         trade_date = None
     trade_date = trade_date or time.strftime("%Y-%m-%d", time.localtime())
+
+    default_pool = ["2330.TW", "2317.TW", "2454.TW", "2308.TW", "2881.TW", "2882.TW", "2603.TW", "2609.TW"]
+    sym_from_pos = [p.get("symbol") for p in positions if isinstance(p, dict) and p.get("symbol")]
+    symset = list(dict.fromkeys(sym_from_pos + default_pool))
+    symbols = symset[: max(1, int(topn))]
 
     panel, inst_ok, inst_note = build_institutional_panel_finmind(
         symbols=symbols,
@@ -775,7 +699,6 @@ def build_arbiter_input(
     if not inst_ok:
         warnings_bus.push("INST_DEGRADED", "Institutional data unavailable => disable Layer A/A+", {"source": inst_note})
 
-    # ---- Layer locks -> market_status (layered) ----
     if amount_ok and inst_ok:
         market_status = "NORMAL"
     elif (not amount_ok) and (not inst_ok):
@@ -785,7 +708,6 @@ def build_arbiter_input(
     else:
         market_status = "DEGRADED_INST"
 
-    # ---- Build per-stock snapshot ----
     stocks = []
     for i, sym in enumerate(symbols, start=1):
         px = None
@@ -808,7 +730,6 @@ def build_arbiter_input(
             vol_ratio = None
 
         im = inst_metrics_for_symbol(panel, sym)
-
         layer = classify_layer(
             regime=regime,
             momentum_lock=bool(metrics.get("MOMENTUM_LOCK", False)),
@@ -838,7 +759,6 @@ def build_arbiter_input(
             }
         )
 
-    # ---- Portfolio summary ----
     current_exposure_pct = 0.0
     if positions:
         current_exposure_pct = min(1.0, len(positions) * 0.05)
@@ -889,6 +809,43 @@ def build_arbiter_input(
 # =========================
 def _json_str(payload: dict) -> str:
     return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def render_copy_button(label: str, text: str, height_px: int = 52):
+    """
+    明確的一鍵複製（跨瀏覽器：使用 Clipboard API）
+    """
+    safe = (
+        text.replace("\\", "\\\\")
+        .replace("`", "\\`")
+        .replace("${", "\\${")
+    )
+
+    html = f"""
+    <div style="display:flex; align-items:center; gap:10px;">
+      <button id="copyBtn"
+        style="padding:8px 12px; border-radius:8px; border:1px solid #bbb; cursor:pointer; background:white;">
+        {label}
+      </button>
+      <span id="copyMsg" style="font-size:13px; color:#555;"></span>
+    </div>
+    <script>
+      const txt = `{safe}`;
+      const btn = document.getElementById('copyBtn');
+      const msg = document.getElementById('copyMsg');
+      btn.addEventListener('click', async () => {{
+        try {{
+          await navigator.clipboard.writeText(txt);
+          msg.textContent = '已複製到剪貼簿';
+          setTimeout(()=>msg.textContent='', 1500);
+        }} catch (e) {{
+          msg.textContent = '複製失敗（瀏覽器限制）';
+          setTimeout(()=>msg.textContent='', 2000);
+        }}
+      }});
+    </script>
+    """
+    components.html(html, height=height_px)
 
 
 # =========================
@@ -970,8 +927,6 @@ def main():
         st.dataframe(pd.DataFrame(idx_rows), use_container_width=True)
 
         st.subheader("法人面板（FinMind / Debug）")
-        # 嘗試顯示 panel（若 inst_ok=False 也顯示，方便你查）
-        # 由於 panel 在 build_arbiter_input 內，這裡再重建一次輕量顯示（不影響 payload）
         try:
             symbols = [s.get("Symbol") for s in payload.get("stocks", [])]
             panel, inst_ok, inst_note = build_institutional_panel_finmind(
@@ -1005,6 +960,11 @@ def main():
 
         st.subheader("AI JSON（Arbiter Input）— 可回溯（SIM-FREE）")
         json_text = _json_str(payload)
+
+        # ✅ 明確的一鍵複製
+        render_copy_button("一鍵複製 AI JSON", json_text)
+
+        # 顯示與下載
         st.code(json_text, language="json")
         st.download_button(
             "下載 JSON（payload.json）",
@@ -1013,7 +973,6 @@ def main():
             mime="application/json",
             use_container_width=False,
         )
-        st.caption("複製：點選上方 code 區塊右上角的 copy（Streamlit 內建）。")
 
 
 if __name__ == "__main__":
