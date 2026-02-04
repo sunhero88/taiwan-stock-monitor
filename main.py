@@ -45,7 +45,13 @@ WARN_PRIORITY = [
     "TPEX_AMOUNT_SSL_ERROR",
     "TWSE_AMOUNT_FETCH_FAIL",
     "TPEX_AMOUNT_FETCH_FAIL",
+    "FINMIND_FETCH_FAIL",
+    "FINMIND_SCHEMA_MISMATCH",
+    "FINMIND_EMPTY_DATA",
 ]
+
+# ===== institutional rules (from your institutional_utils.py) =====
+NEUTRAL_THRESHOLD = 5_000_000  # 5,000,000 (你指定：5,000 萬？你程式寫 5,000,000，這裡完全照你原碼)
 
 
 def _now_ts() -> str:
@@ -63,7 +69,6 @@ def _safe_float(x, default=None) -> Optional[float]:
             if s == "":
                 return default
             return float(s)
-        # ndarray / Series -> 取最後一個 scalar
         if isinstance(x, (np.ndarray, pd.Series, list, tuple)):
             if len(x) == 0:
                 return default
@@ -112,8 +117,6 @@ def _flatten_yf_columns(df: pd.DataFrame) -> pd.DataFrame:
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = ["_".join([str(c) for c in col if str(c) != ""]) for col in df.columns.values]
 
-        # 常見會變成 Close_^TWII / Volume_^TWII
-        # 若存在 "Close_*" 且沒有 "Close"，就把第一個 Close_* rename 成 Close（同理 Volume）
         close_cols = [c for c in df.columns if c.startswith("Close")]
         vol_cols = [c for c in df.columns if c.startswith("Volume")]
 
@@ -134,12 +137,7 @@ class WarningBus:
 
     def push(self, code: str, msg: str, meta: Optional[dict] = None):
         self.items.append(
-            {
-                "ts": _now_ts(),
-                "code": code,
-                "msg": msg,
-                "meta": meta or {},
-            }
+            {"ts": _now_ts(), "code": code, "msg": msg, "meta": meta or {}}
         )
 
     def latest(self, n: int = 50) -> List[Dict[str, Any]]:
@@ -164,7 +162,7 @@ class MarketAmount:
 def _fetch_twse_amount(allow_insecure_ssl: bool) -> Tuple[Optional[int], str]:
     """
     TWSE 成交金額（上市）best-effort
-    資料來源：TWSE /exchangeReport/MI_INDEX
+    來源：TWSE /exchangeReport/MI_INDEX
     """
     url = "https://www.twse.com.tw/exchangeReport/MI_INDEX?response=json&type=ALLBUT0999"
     try:
@@ -186,7 +184,6 @@ def _fetch_twse_amount(allow_insecure_ssl: bool) -> Tuple[Optional[int], str]:
             )
             return None, "TWSE_FAIL:TABLE_MISSING"
 
-        # fields9/fields1 可能對應 data9/data1
         fields = js.get("fields9") or js.get("fields1") or js.get("fields") or []
         fields = [str(x) for x in fields] if isinstance(fields, list) else []
 
@@ -205,7 +202,6 @@ def _fetch_twse_amount(allow_insecure_ssl: bool) -> Tuple[Optional[int], str]:
             if isinstance(last, list) and amt_idx < len(last):
                 amount = _safe_int(last[amt_idx], default=None)
 
-        # fallback：掃描候選表最後幾列，取可解析數字的最大值（best-effort）
         if amount is None:
             best = None
             for _, tbl in candidate_tables:
@@ -248,7 +244,7 @@ def _fetch_twse_amount(allow_insecure_ssl: bool) -> Tuple[Optional[int], str]:
 def _fetch_tpex_amount(allow_insecure_ssl: bool) -> Tuple[Optional[int], str]:
     """
     TPEX 成交金額（上櫃）best-effort
-    資料來源：TPEX daily_trading_info/st43_result
+    來源：TPEX st43_result
     """
     url = "https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw"
     try:
@@ -268,14 +264,12 @@ def _fetch_tpex_amount(allow_insecure_ssl: bool) -> Tuple[Optional[int], str]:
         amount = None
         src = "TPEX_OK:st43_result"
 
-        # 嘗試常見 key
         for key in ["totalAmount", "成交金額", "trade_value", "amt", "amount", "total_amount"]:
             if key in js:
                 amount = _safe_int(js.get(key), default=None)
                 if amount is not None:
                     break
 
-        # aaData / data fallback：掃描數字最大值
         if amount is None:
             aa = js.get("aaData") or js.get("data")
             best = None
@@ -323,16 +317,13 @@ def fetch_amount_total(allow_insecure_ssl: bool = False) -> MarketAmount:
     twse_amt, twse_src = _fetch_twse_amount(allow_insecure_ssl)
     tpex_amt, tpex_src = _fetch_tpex_amount(allow_insecure_ssl)
 
-    amount_twse = twse_amt if twse_amt is not None else None
-    amount_tpex = tpex_amt if tpex_amt is not None else None
-
     total = None
-    if amount_twse is not None and amount_tpex is not None:
-        total = int(amount_twse) + int(amount_tpex)
+    if twse_amt is not None and tpex_amt is not None:
+        total = int(twse_amt) + int(tpex_amt)
 
     return MarketAmount(
-        amount_twse=amount_twse,
-        amount_tpex=amount_tpex,
+        amount_twse=twse_amt if twse_amt is not None else None,
+        amount_tpex=tpex_amt if tpex_amt is not None else None,
         amount_total=total,
         source_twse=twse_src,
         source_tpex=tpex_src,
@@ -341,25 +332,17 @@ def fetch_amount_total(allow_insecure_ssl: bool = False) -> MarketAmount:
 
 
 # =========================================================
-# Predator V16.3 Stable (Hybrid Edition)
-# Replace: compute_regime_metrics(), pick_regime(),
-#          inst_metrics_for_symbol(), classify_layer()
+# V16.3 regime (same as previous)
 # =========================================================
-
 def _as_close_series(df: pd.DataFrame) -> pd.Series:
-    """
-    強制回傳單一 Close Series（float），避免 DataFrame/Series 混用造成 ambiguous truth
-    """
     if df is None or df.empty:
         raise ValueError("market_df is empty")
 
-    # 允許 index 是 Datetime
     if "Close" in df.columns:
         s = df["Close"]
     elif "close" in df.columns:
         s = df["close"]
     else:
-        # 有些 yfinance 會變 Close_^TWII
         close_like = [c for c in df.columns if str(c).startswith("Close")]
         if close_like:
             s = df[close_like[0]]
@@ -374,11 +357,6 @@ def _as_close_series(df: pd.DataFrame) -> pd.Series:
 
 
 def _check_consolidation(smr_series: pd.Series, close_series: pd.Series) -> bool:
-    """
-    V16.3 CONSOLIDATION：
-      - 最近 10 日 SMR 全部落在 [0.08, 0.18]
-      - 最近 15 日價格波動 (max-min)/mean < 0.05
-    """
     try:
         s = smr_series.dropna()
         c = close_series.dropna()
@@ -401,9 +379,6 @@ def _check_consolidation(smr_series: pd.Series, close_series: pd.Series) -> bool
 
 
 def compute_regime_metrics(market_df: pd.DataFrame = None) -> dict:
-    """
-    回傳 dict，所有欄位皆為 scalar（不含 Series）
-    """
     if market_df is None or len(market_df) < 10:
         return {
             "SMR": None,
@@ -433,36 +408,29 @@ def compute_regime_metrics(market_df: pd.DataFrame = None) -> dict:
         }
 
     smr = float(smr_series.iloc[-1])
-
     smr_ma5_series = smr_series.rolling(5).mean().dropna()
     smr_ma5 = float(smr_ma5_series.iloc[-1]) if len(smr_ma5_series) > 0 else None
 
-    if len(smr_ma5_series) < 2:
-        slope5 = 0.0
-    else:
+    slope5 = 0.0
+    if len(smr_ma5_series) >= 2:
         slope5 = float(smr_ma5_series.iloc[-1] - smr_ma5_series.iloc[-2])
 
-    # NEGATIVE_SLOPE_5D：連續 5 日 slope < -EPS
     negative_slope_5d = True
     try:
         diffs = smr_ma5_series.diff().dropna()
         if len(diffs) >= 5:
-            recent5 = diffs.iloc[-5:]
-            negative_slope_5d = bool((recent5 < -EPS).all())
+            negative_slope_5d = bool((diffs.iloc[-5:] < -EPS).all())
     except Exception:
         negative_slope_5d = True
 
-    # MOMENTUM_LOCK：連續 4 日 slope > EPS
     momentum_lock = False
     try:
         diffs = smr_ma5_series.diff().dropna()
         if len(diffs) >= 4:
-            last4 = diffs.iloc[-4:]
-            momentum_lock = bool((last4 > EPS).all())
+            momentum_lock = bool((diffs.iloc[-4:] > EPS).all())
     except Exception:
         momentum_lock = False
 
-    # Drawdown：從歷史高點回撤（最小值，負數）
     rolling_high = close.cummax()
     dd = (close - rolling_high) / rolling_high
     drawdown_pct = float(dd.min()) if len(dd.dropna()) > 0 else None
@@ -487,26 +455,14 @@ def pick_regime(
     close_price: float = None,
     close_below_ma_days: int = 0,
 ) -> tuple:
-    """
-    回傳 (regime_name, max_equity_pct)
-    V16.3:
-      - CRASH_RISK：VIX > 35 或 drawdown <= -18%
-      - HIBERNATION：close < MA14_Monthly×0.96 且連續 >=2 交易日
-      - MEAN_REVERSION：SMR>0.25 且 Slope5<-0.0001
-      - OVERHEAT：SMR>0.25 且 Slope5>=-0.0001
-      - CONSOLIDATION：metrics['consolidation_detected']==True
-      - NORMAL：其餘
-    """
     smr = metrics.get("SMR")
     slope5 = metrics.get("Slope5")
     drawdown = metrics.get("drawdown_pct")
     consolidation = bool(metrics.get("consolidation_detected", False))
 
-    # CRASH_RISK
     if (vix is not None and float(vix) > 35) or (drawdown is not None and float(drawdown) <= -0.18):
         return "CRASH_RISK", 0.10
 
-    # HIBERNATION（2 日、0.96）
     if (
         ma14_monthly is not None
         and close_price is not None
@@ -515,60 +471,192 @@ def pick_regime(
     ):
         return "HIBERNATION", 0.20
 
-    # MEAN_REVERSION / OVERHEAT
     if smr is not None and slope5 is not None:
         if float(smr) > 0.25 and float(slope5) < -EPS:
             return "MEAN_REVERSION", 0.45
         if float(smr) > 0.25 and float(slope5) >= -EPS:
             return "OVERHEAT", 0.55
 
-    # CONSOLIDATION（嚴格偵測）
     if consolidation:
         return "CONSOLIDATION", 0.65
 
     return "NORMAL", 0.85
 
 
+# =========================================================
+# FinMind integration (merged from your finmind_institutional.py)
+# =========================================================
+FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
+A_NAMES = {"Foreign_Investor", "Investment_Trust", "Dealer_self", "Dealer_Hedging"}
+FOREIGN_NAME = "Foreign_Investor"
+TRUST_NAME = "Investment_Trust"
+
+
+def _headers(token: Optional[str]) -> dict:
+    if token:
+        # 依你原碼：Bearer token
+        return {"Authorization": f"Bearer {token}"}
+    return {}
+
+
+def _finmind_get(dataset: str, params: dict, token: Optional[str]) -> dict:
+    p = {"dataset": dataset, **params}
+    r = requests.get(FINMIND_URL, headers=_headers(token), params=p, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def normalize_inst_direction(net: float) -> str:
+    net = float(net or 0.0)
+    if abs(net) < NEUTRAL_THRESHOLD:
+        return "NEUTRAL"
+    return "POSITIVE" if net > 0 else "NEGATIVE"
+
+
+def calc_inst_3d(inst_df: pd.DataFrame, symbol: str, trade_date: str):
+    """
+    依你原 institutional_utils.py，完全照搬邏輯
+    inst_df 欄位：date(YYYY-MM-DD), symbol, net_amount
+    """
+    if inst_df is None or inst_df.empty:
+        return {"Inst_Status": "PENDING", "Inst_Streak3": 0, "Inst_Dir3": "PENDING", "Inst_Net_3d": 0.0}
+
+    df = inst_df[inst_df["symbol"] == symbol].copy()
+    if df.empty:
+        return {"Inst_Status": "PENDING", "Inst_Streak3": 0, "Inst_Dir3": "PENDING", "Inst_Net_3d": 0.0}
+
+    df = df.sort_values("date").tail(3)
+    if len(df) < 3:
+        return {"Inst_Status": "PENDING", "Inst_Streak3": 0, "Inst_Dir3": "PENDING", "Inst_Net_3d": 0.0}
+
+    df["net_amount"] = pd.to_numeric(df["net_amount"], errors="coerce").fillna(0)
+    dirs = [normalize_inst_direction(x) for x in df["net_amount"]]
+    net_sum = float(df["net_amount"].sum())
+
+    if all(d == "POSITIVE" for d in dirs):
+        return {"Inst_Status": "READY", "Inst_Streak3": 3, "Inst_Dir3": "POSITIVE", "Inst_Net_3d": net_sum}
+    if all(d == "NEGATIVE" for d in dirs):
+        return {"Inst_Status": "READY", "Inst_Streak3": 3, "Inst_Dir3": "NEGATIVE", "Inst_Net_3d": net_sum}
+
+    return {"Inst_Status": "READY", "Inst_Streak3": 0, "Inst_Dir3": "NEUTRAL", "Inst_Net_3d": net_sum}
+
+
+def fetch_finmind_investor_buysell_raw(
+    symbols: List[str],
+    start_date: str,
+    end_date: str,
+    token: Optional[str] = None,
+) -> pd.DataFrame:
+    """
+    抓 TaiwanStockInstitutionalInvestorsBuySell 原始明細，並保留 name 維度
+    需要欄位：date, stock_id, buy, sell, name
+    """
+    rows = []
+    for sym in symbols:
+        stock_id = sym.replace(".TW", "").strip()
+        try:
+            js = _finmind_get(
+                dataset="TaiwanStockInstitutionalInvestorsBuySell",
+                params={"data_id": stock_id, "start_date": start_date, "end_date": end_date},
+                token=token,
+            )
+            data = js.get("data", []) or []
+            if not data:
+                continue
+
+            df = pd.DataFrame(data)
+            need = {"date", "stock_id", "buy", "name", "sell"}
+            if not need.issubset(set(df.columns)):
+                warnings_bus.push(
+                    "FINMIND_SCHEMA_MISMATCH",
+                    "FinMind TaiwanStockInstitutionalInvestorsBuySell schema mismatch",
+                    {"symbol": sym, "have": list(df.columns), "need": sorted(list(need))},
+                )
+                continue
+
+            df["buy"] = pd.to_numeric(df["buy"], errors="coerce").fillna(0)
+            df["sell"] = pd.to_numeric(df["sell"], errors="coerce").fillna(0)
+            df["net"] = df["buy"] - df["sell"]
+
+            df = df[df["name"].isin(A_NAMES)].copy()
+            if df.empty:
+                continue
+
+            for _, r in df.iterrows():
+                rows.append(
+                    {
+                        "date": str(r["date"]),
+                        "symbol": sym,
+                        "name": str(r["name"]),
+                        "net": float(r["net"]),
+                    }
+                )
+
+        except Exception as e:
+            warnings_bus.push(
+                "FINMIND_FETCH_FAIL",
+                f"FinMind fetch fail: {e}",
+                {"symbol": sym, "dataset": "TaiwanStockInstitutionalInvestorsBuySell", "start": start_date, "end": end_date},
+            )
+            continue
+
+    if not rows:
+        return pd.DataFrame(columns=["date", "symbol", "name", "net"])
+
+    out = pd.DataFrame(rows).sort_values(["symbol", "date", "name"])
+    return out
+
+
+# =========================================================
+# Layer classification (V16.3)
+# =========================================================
 def inst_metrics_for_symbol(panel: pd.DataFrame, symbol: str) -> dict:
     """
-    輸出全為 scalar
-    需要 panel 欄位：
-      Symbol, Foreign_Net, Trust_Net, Inst_Streak3
+    panel 欄位：
+      Symbol, Foreign_Net, Trust_Net, Inst_Streak3, Inst_Dir3, Inst_Net_3d
     """
-    if panel is None or panel.empty:
-        return {"foreign_buy": False, "trust_buy": False, "inst_streak3": 0}
-
-    if "Symbol" not in panel.columns:
-        return {"foreign_buy": False, "trust_buy": False, "inst_streak3": 0}
+    if panel is None or panel.empty or "Symbol" not in panel.columns:
+        return {
+            "foreign_buy": False,
+            "trust_buy": False,
+            "inst_streak3": 0,
+            "inst_dir3": "PENDING",
+            "inst_net_3d": 0.0,
+            "inst_status": "PENDING",
+        }
 
     df = panel[panel["Symbol"] == symbol]
     if df.empty:
-        return {"foreign_buy": False, "trust_buy": False, "inst_streak3": 0}
+        return {
+            "foreign_buy": False,
+            "trust_buy": False,
+            "inst_streak3": 0,
+            "inst_dir3": "PENDING",
+            "inst_net_3d": 0.0,
+            "inst_status": "PENDING",
+        }
 
     row = df.iloc[-1]
+    fnet = _safe_float(row.get("Foreign_Net", 0), 0.0)
+    tnet = _safe_float(row.get("Trust_Net", 0), 0.0)
 
-    foreign_buy = bool(_safe_float(row.get("Foreign_Net", 0), 0) > 0)
-    trust_buy = bool(_safe_float(row.get("Trust_Net", 0), 0) > 0)
-    inst_streak3 = int(_safe_int(row.get("Inst_Streak3", 0), 0) or 0)
-
-    return {"foreign_buy": foreign_buy, "trust_buy": trust_buy, "inst_streak3": inst_streak3}
+    return {
+        "foreign_buy": bool(fnet > 0),
+        "trust_buy": bool(tnet > 0),
+        "inst_streak3": int(_safe_int(row.get("Inst_Streak3", 0), 0) or 0),
+        "inst_dir3": str(row.get("Inst_Dir3", "PENDING")),
+        "inst_net_3d": float(_safe_float(row.get("Inst_Net_3d", 0.0), 0.0) or 0.0),
+        "inst_status": str(row.get("Inst_Status", "PENDING")),
+    }
 
 
 def classify_layer(regime: str, momentum_lock: bool, vol_ratio: Optional[float], inst: dict) -> str:
-    """
-    V16.3 Layer：
-      A+：外資+投信皆買超 且 inst_streak3>=3
-      A ：外資或投信買超 且 inst_streak3>=3
-      B ：momentum_lock 且 vol_ratio>0.8 且 regime in [NORMAL, OVERHEAT, CONSOLIDATION]
-      NONE：其餘
-    """
     foreign_buy = bool(inst.get("foreign_buy", False))
     trust_buy = bool(inst.get("trust_buy", False))
     inst_streak3 = int(inst.get("inst_streak3", 0) or 0)
 
     if foreign_buy and trust_buy and inst_streak3 >= 3:
         return "A+"
-
     if (foreign_buy or trust_buy) and inst_streak3 >= 3:
         return "A"
 
@@ -579,7 +667,6 @@ def classify_layer(regime: str, momentum_lock: bool, vol_ratio: Optional[float],
         and regime in ["NORMAL", "OVERHEAT", "CONSOLIDATION"]
     ):
         return "B"
-
     return "NONE"
 
 
@@ -593,8 +680,8 @@ def fetch_history(symbol: str, period: str = "2y", interval: str = "1d") -> pd.D
         return pd.DataFrame()
 
     df = _flatten_yf_columns(df)
-
     df = df.reset_index()
+
     if "Date" in df.columns:
         df = df.rename(columns={"Date": "Datetime"})
     if "Datetime" not in df.columns:
@@ -602,7 +689,6 @@ def fetch_history(symbol: str, period: str = "2y", interval: str = "1d") -> pd.D
 
     df["Datetime"] = pd.to_datetime(df["Datetime"], errors="coerce")
     df = df.dropna(subset=["Datetime"])
-
     return df
 
 
@@ -622,11 +708,6 @@ def _extract_close_price(market_df: pd.DataFrame) -> Optional[float]:
 
 
 def _calc_ma14_monthly_from_daily(market_df: pd.DataFrame) -> Optional[float]:
-    """
-    用日線近似月線 MA14：
-      - resample 到月末收盤
-      - rolling 14 做 MA
-    """
     try:
         if market_df is None or market_df.empty:
             return None
@@ -646,9 +727,6 @@ def _calc_ma14_monthly_from_daily(market_df: pd.DataFrame) -> Optional[float]:
 
 
 def _count_close_below_ma_days(market_df: pd.DataFrame, ma14_monthly: Optional[float]) -> int:
-    """
-    計算最近收盤低於 MA14*0.96 的連續天數（用最近 5 日即可）
-    """
     try:
         if ma14_monthly is None or market_df is None or market_df.empty:
             return 0
@@ -672,17 +750,111 @@ def _count_close_below_ma_days(market_df: pd.DataFrame, ma14_monthly: Optional[f
 
 
 # =========================
-# Institutional panel stub
+# Build institutional panel (FinMind)
 # =========================
-def build_institutional_panel(symbols: List[str]) -> pd.DataFrame:
+def build_institutional_panel_finmind(
+    symbols: List[str],
+    trade_date: str,
+    token: Optional[str],
+) -> Tuple[pd.DataFrame, bool]:
     """
-    目前是可跑 stub（全部 0）。
-    你要接回真實法人資料時，只需要確保最後 rename 成：
-      Symbol, Foreign_Net, Trust_Net, Inst_Streak3
+    回傳：
+      panel DataFrame（Symbol, Foreign_Net, Trust_Net, Inst_Status, Inst_Streak3, Inst_Dir3, Inst_Net_3d）
+      inst_data_ok: bool（FinMind 是否成功拿到足夠資料）
     """
-    return pd.DataFrame(
-        [{"Symbol": s, "Foreign_Net": 0, "Trust_Net": 0, "Inst_Streak3": 0} for s in symbols]
+    if not symbols:
+        return pd.DataFrame(), False
+
+    # 抓近 12 天，涵蓋週末/休市，確保能湊滿近 3 個交易日
+    # 這裡不做交易日曆推算（避免再引入外部依賴）；用較寬日期窗處理。
+    try:
+        td = pd.to_datetime(trade_date)
+        start_date = (td - pd.Timedelta(days=12)).strftime("%Y-%m-%d")
+        end_date = trade_date
+    except Exception:
+        start_date = trade_date
+        end_date = trade_date
+
+    raw = fetch_finmind_investor_buysell_raw(
+        symbols=symbols,
+        start_date=start_date,
+        end_date=end_date,
+        token=token,
     )
+
+    if raw is None or raw.empty:
+        warnings_bus.push(
+            "FINMIND_EMPTY_DATA",
+            "FinMind returned empty institutional data",
+            {"trade_date": trade_date, "start_date": start_date, "end_date": end_date, "symbols": symbols[:10]},
+        )
+        # 全空 → 視為資料不可用
+        panel = pd.DataFrame(
+            [{"Symbol": s, "Foreign_Net": 0.0, "Trust_Net": 0.0,
+              "Inst_Status": "PENDING", "Inst_Streak3": 0, "Inst_Dir3": "PENDING", "Inst_Net_3d": 0.0}
+             for s in symbols]
+        )
+        return panel, False
+
+    # 1) 外資/投信當日淨額（以 trade_date 過濾；若 trade_date 沒資料，取該 symbol 最新日期）
+    # 2) 三大法人合計 net_amount（日合計）供 calc_inst_3d
+    panel_rows = []
+
+    # 三大合計：對每個 symbol/date，把 A_NAMES 淨額加總
+    total_by_day = raw.groupby(["symbol", "date"], as_index=False)["net"].sum()
+    total_by_day = total_by_day.rename(columns={"net": "net_amount"})  # calc_inst_3d 需要 net_amount
+
+    # 外資/投信：保留 name 維度
+    # 轉成 pivot：Foreign_Investor / Investment_Trust
+    pivot = raw.pivot_table(
+        index=["symbol", "date"],
+        columns="name",
+        values="net",
+        aggfunc="sum",
+        fill_value=0.0,
+    ).reset_index()
+
+    # 對每個 symbol 建面板
+    for sym in symbols:
+        # 找該 symbol 最新日期（避免 trade_date 無資料時全變 0）
+        sym_dates = pivot[pivot["symbol"] == sym]["date"]
+        latest_date = None
+        if not sym_dates.empty:
+            latest_date = str(sym_dates.max())
+
+        use_date = trade_date if trade_date in set(sym_dates.astype(str)) else latest_date
+
+        foreign_net = 0.0
+        trust_net = 0.0
+
+        if use_date is not None:
+            r = pivot[(pivot["symbol"] == sym) & (pivot["date"].astype(str) == str(use_date))]
+            if not r.empty:
+                row = r.iloc[0]
+                foreign_net = float(_safe_float(row.get(FOREIGN_NAME, 0.0), 0.0) or 0.0)
+                trust_net = float(_safe_float(row.get(TRUST_NAME, 0.0), 0.0) or 0.0)
+
+        # streak3 / dir3 / net_3d：用 total_by_day（合計）
+        inst3 = calc_inst_3d(total_by_day, sym, trade_date)
+
+        panel_rows.append(
+            {
+                "Symbol": sym,
+                "Foreign_Net": float(foreign_net),
+                "Trust_Net": float(trust_net),
+                "Inst_Status": str(inst3.get("Inst_Status", "PENDING")),
+                "Inst_Streak3": int(_safe_int(inst3.get("Inst_Streak3", 0), 0) or 0),
+                "Inst_Dir3": str(inst3.get("Inst_Dir3", "PENDING")),
+                "Inst_Net_3d": float(_safe_float(inst3.get("Inst_Net_3d", 0.0), 0.0) or 0.0),
+                "asof_date": str(use_date) if use_date else None,
+            }
+        )
+
+    panel = pd.DataFrame(panel_rows)
+
+    # 判定 inst_data_ok：至少有一檔拿到有效 asof_date（避免 token 沒設、全空）
+    inst_data_ok = bool(panel["asof_date"].notna().any()) if not panel.empty and "asof_date" in panel.columns else False
+    return panel, inst_data_ok
 
 
 # =========================
@@ -695,11 +867,22 @@ def build_arbiter_input(
     cash_balance: int,
     total_equity: int,
     allow_insecure_ssl: bool,
+    finmind_token: Optional[str],
 ) -> Tuple[dict, List[dict]]:
 
+    # ---- Market data ----
     twii_df = fetch_history(TWII_SYMBOL, period="3y", interval="1d")
     vix_df = fetch_history(VIX_SYMBOL, period="2y", interval="1d")
 
+    # trade_date（以 TWII 最新一根日線日期為準）
+    trade_date = None
+    try:
+        if not twii_df.empty and "Datetime" in twii_df.columns:
+            trade_date = twii_df["Datetime"].dropna().iloc[-1].strftime("%Y-%m-%d")
+    except Exception:
+        trade_date = None
+
+    # VIX last
     vix_last = None
     try:
         if not vix_df.empty:
@@ -707,7 +890,7 @@ def build_arbiter_input(
     except Exception:
         vix_last = None
 
-    # Metrics
+    # ---- Regime metrics ----
     twii_for_metrics = twii_df.copy()
     if "Datetime" in twii_for_metrics.columns:
         twii_for_metrics = twii_for_metrics.set_index("Datetime")
@@ -725,10 +908,11 @@ def build_arbiter_input(
         close_below_ma_days=close_below_days,
     )
 
-    # Market amount
+    # ---- Market amount ----
     amount = fetch_amount_total(allow_insecure_ssl=allow_insecure_ssl)
+    amount_ok = (amount.amount_twse is not None) and (amount.amount_tpex is not None) and (amount.amount_total is not None)
 
-    # TopN symbols（placeholder pool + positions）
+    # ---- Symbols pool ----
     default_pool = ["2330.TW", "2317.TW", "2454.TW", "2308.TW", "2881.TW", "2882.TW", "2603.TW", "2609.TW"]
     pos_syms = []
     for p in positions:
@@ -736,10 +920,19 @@ def build_arbiter_input(
             pos_syms.append(str(p["symbol"]))
     symbols = list(dict.fromkeys(pos_syms + default_pool))[: max(1, int(topn))]
 
-    # Institutional panel (stub)
-    panel = build_institutional_panel(symbols)
+    # ---- Institutional panel (FinMind) ----
+    panel = pd.DataFrame()
+    inst_data_ok = False
+    if trade_date is not None:
+        panel, inst_data_ok = build_institutional_panel_finmind(
+            symbols=symbols,
+            trade_date=trade_date,
+            token=finmind_token.strip() if isinstance(finmind_token, str) and finmind_token.strip() else None,
+        )
+    else:
+        warnings_bus.push("FINMIND_FETCH_FAIL", "trade_date is None; cannot fetch FinMind institutional data", {})
 
-    # Per-stock snapshot
+    # ---- Stocks snapshot ----
     stocks = []
     for i, sym in enumerate(symbols, start=1):
         px = None
@@ -772,17 +965,24 @@ def build_arbiter_input(
                 "Price": px,
                 "Vol_Ratio": vol_ratio,
                 "Layer": layer,
-                "Institutional": im,
+                "Institutional": {
+                    "foreign_buy": im.get("foreign_buy", False),
+                    "trust_buy": im.get("trust_buy", False),
+                    "inst_streak3": im.get("inst_streak3", 0),
+                    "inst_dir3": im.get("inst_dir3", "PENDING"),
+                    "inst_net_3d": im.get("inst_net_3d", 0.0),
+                    "inst_status": im.get("inst_status", "PENDING"),
+                },
             }
         )
 
-    # Portfolio summary（最小可跑）
+    # ---- Portfolio summary ----
     current_exposure_pct = 0.0
     if positions:
         current_exposure_pct = min(1.0, len(positions) * 0.05)
 
-    # V16.3：只要成交金額沒抓全，就降級（避免半盲）
-    degraded = (amount.amount_twse is None) or (amount.amount_tpex is None) or (amount.amount_total is None)
+    # V16.3：資料鏈路任一失明 → DEGRADED（成交金額 or 法人）
+    degraded = (not amount_ok) or (not inst_data_ok)
 
     payload = {
         "meta": {
@@ -794,7 +994,8 @@ def build_arbiter_input(
         },
         "macro": {
             "overview": {
-                "trade_date": (twii_df["Datetime"].dropna().iloc[-1].strftime("%Y-%m-%d") if not twii_df.empty else None),
+                "trade_date": trade_date,
+               s,
                 "twii_close": close_price,
                 "vix": vix_last,
                 "smr": metrics.get("SMR"),
@@ -804,6 +1005,7 @@ def build_arbiter_input(
                 "close_below_ma_days": int(close_below_days),
                 "consolidation_detected": bool(metrics.get("consolidation_detected", False)),
                 "max_equity_allowed_pct": float(max_equity),
+                "inst_data_ok": bool(inst_data_ok),
             },
             "market_amount": asdict(amount),
         },
@@ -815,6 +1017,7 @@ def build_arbiter_input(
         },
         "stocks": stocks,
         "positions_input": positions,
+        "inst_panel_debug": panel.to_dict(orient="records") if isinstance(panel, pd.DataFrame) and not panel.empty else [],
     }
 
     return payload, warnings_bus.latest(50)
@@ -830,6 +1033,10 @@ def main():
     topn = st.sidebar.selectbox("TopN（固定池化數量）", [10, 15, 20, 30, 50], index=2)
 
     allow_insecure_ssl = st.sidebar.checkbox("允許不安全 SSL (verify=False)", value=False)
+
+    st.sidebar.subheader("FinMind")
+    finmind_token = st.sidebar.text_input("FinMind Token（建議填）", value="", type="password")
+    st.sidebar.caption("若沒 token 或 token 無效，法人資料會被視為不可用 → market_status 進 DEGRADED")
 
     st.sidebar.subheader("持倉（手動貼 JSON array）")
     positions_text = st.sidebar.text_area("positions", value="[]", height=120)
@@ -860,6 +1067,7 @@ def main():
                 cash_balance=int(cash_balance),
                 total_equity=int(total_equity),
                 allow_insecure_ssl=bool(allow_insecure_ssl),
+                finmind_token=finmind_token,
             )
         except Exception as e:
             st.error("App 執行期間發生例外（已捕捉，不會白屏）。")
@@ -875,18 +1083,23 @@ def main():
         c5.metric("VIX", f"{_safe_float(ov.get('vix'), 0):.2f}" if ov.get("vix") is not None else "NA")
         c6.metric("Max Equity Allowed", f"{_pct(ov.get('max_equity_allowed_pct')):.1f}%" if ov.get("max_equity_allowed_pct") is not None else "NA")
 
+        # ---- Market Amount ----
         st.subheader("市場成交金額（best-effort / 可稽核）")
         st.json(payload.get("macro", {}).get("market_amount", {}))
 
-        st.subheader("指數快照（簡版）")
-        idx_df = pd.DataFrame(
-            [
-                {"symbol": TWII_SYMBOL, "name": "TAIEX", "last": ov.get("twii_close"), "asof": ov.get("trade_date")},
-                {"symbol": VIX_SYMBOL, "name": "VIX", "last": ov.get("vix"), "asof": ov.get("trade_date")},
-            ]
-        )
-        st.dataframe(idx_df, use_container_width=True)
+        # ---- Institutional Debug ----
+        st.subheader("法人面板（FinMind / Debug）")
+        inst_ok = bool(ov.get("inst_data_ok", False))
+        st.caption(f"inst_data_ok = {inst_ok}")
+        inst_df = pd.DataFrame(payload.get("inst_panel_debug", []))
+        if not inst_df.empty:
+            # 讓你能直觀看到 Foreign/Trust 以及 3D streak
+            show_cols = [c for c in ["Symbol", "asof_date", "Foreign_Net", "Trust_Net", "Inst_Status", "Inst_Streak3", "Inst_Dir3", "Inst_Net_3d"] if c in inst_df.columns]
+            st.dataframe(inst_df[show_cols], use_container_width=True)
+        else:
+            st.info("法人面板為空（token 未填、token 無效、或 FinMind 回傳空資料）")
 
+        # ---- Stocks table ----
         st.subheader("今日分析清單（TopN + 持倉）— Hybrid Layer")
         s_df = pd.json_normalize(payload.get("stocks", []))
         if not s_df.empty:
@@ -896,6 +1109,7 @@ def main():
         else:
             st.info("stocks 清單為空（資料源可能暫時不可用）。")
 
+        # ---- Warnings ----
         st.subheader("Warnings（最新 50 條）")
         w_df = pd.DataFrame(warns)
         if not w_df.empty and "code" in w_df.columns:
@@ -905,6 +1119,7 @@ def main():
         else:
             st.caption("（目前沒有 warnings）")
 
+        # ---- Arbiter Input JSON ----
         st.subheader("AI JSON（Arbiter Input）— 可回溯（SIM-FREE）")
         st.json(payload)
 
