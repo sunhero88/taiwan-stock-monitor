@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 import yfinance as yf
 
 # =========================
@@ -51,7 +52,7 @@ WARN_PRIORITY = [
 ]
 
 # ===== institutional rules (from your institutional_utils.py) =====
-NEUTRAL_THRESHOLD = 5_000_000  # 完全照你原碼
+NEUTRAL_THRESHOLD = 5_000_000  # 5,000,000（你指定的閾值）
 
 
 def _now_ts() -> str:
@@ -158,10 +159,6 @@ class MarketAmount:
 
 
 def _fetch_twse_amount(allow_insecure_ssl: bool) -> Tuple[Optional[int], str]:
-    """
-    TWSE 成交金額（上市）best-effort
-    來源：TWSE /exchangeReport/MI_INDEX
-    """
     url = "https://www.twse.com.tw/exchangeReport/MI_INDEX?response=json&type=ALLBUT0999"
     try:
         r = requests.get(url, timeout=10, verify=(not allow_insecure_ssl))
@@ -240,10 +237,6 @@ def _fetch_twse_amount(allow_insecure_ssl: bool) -> Tuple[Optional[int], str]:
 
 
 def _fetch_tpex_amount(allow_insecure_ssl: bool) -> Tuple[Optional[int], str]:
-    """
-    TPEX 成交金額（上櫃）best-effort
-    來源：TPEX st43_result
-    """
     url = "https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw"
     try:
         r = requests.get(url, timeout=10, verify=(not allow_insecure_ssl))
@@ -373,6 +366,11 @@ def _check_consolidation(smr_series: pd.Series, close_series: pd.Series) -> bool
 
 
 def compute_regime_metrics(market_df: pd.DataFrame = None) -> dict:
+    """
+    ✅ 修正重點：
+    - drawdown_current_pct：最後一筆相對「截至當日最高點」的回撤（創高≈0%）→ 用來判 CRASH_RISK
+    - drawdown_max_pct：區間最大回撤（歷史最深）只做資訊，不用來判 CRASH_RISK
+    """
     if market_df is None or len(market_df) < 10:
         return {
             "SMR": None,
@@ -380,7 +378,8 @@ def compute_regime_metrics(market_df: pd.DataFrame = None) -> dict:
             "Slope5": None,
             "NEGATIVE_SLOPE_5D": True,
             "MOMENTUM_LOCK": False,
-            "drawdown_pct": None,
+            "drawdown_current_pct": None,
+            "drawdown_max_pct": None,
             "consolidation_detected": False,
         }
 
@@ -396,7 +395,8 @@ def compute_regime_metrics(market_df: pd.DataFrame = None) -> dict:
             "Slope5": None,
             "NEGATIVE_SLOPE_5D": True,
             "MOMENTUM_LOCK": False,
-            "drawdown_pct": None,
+            "drawdown_current_pct": None,
+            "drawdown_max_pct": None,
             "consolidation_detected": False,
         }
 
@@ -424,9 +424,11 @@ def compute_regime_metrics(market_df: pd.DataFrame = None) -> dict:
     except Exception:
         momentum_lock = False
 
+    # ---- Drawdown: current vs max ----
     rolling_high = close.cummax()
-    dd = (close - rolling_high) / rolling_high
-    drawdown_pct = float(dd.min()) if len(dd.dropna()) > 0 else None
+    dd_series = (close - rolling_high) / rolling_high
+    drawdown_current_pct = float(dd_series.iloc[-1]) if len(dd_series.dropna()) > 0 else None
+    drawdown_max_pct = float(dd_series.min()) if len(dd_series.dropna()) > 0 else None
 
     consolidation_detected = _check_consolidation(smr_series, close)
 
@@ -436,7 +438,8 @@ def compute_regime_metrics(market_df: pd.DataFrame = None) -> dict:
         "Slope5": float(slope5),
         "NEGATIVE_SLOPE_5D": bool(negative_slope_5d),
         "MOMENTUM_LOCK": bool(momentum_lock),
-        "drawdown_pct": drawdown_pct,
+        "drawdown_current_pct": drawdown_current_pct,
+        "drawdown_max_pct": drawdown_max_pct,
         "consolidation_detected": bool(consolidation_detected),
     }
 
@@ -450,12 +453,14 @@ def pick_regime(
 ) -> tuple:
     smr = metrics.get("SMR")
     slope5 = metrics.get("Slope5")
-    drawdown = metrics.get("drawdown_pct")
+    dd_current = metrics.get("drawdown_current_pct")  # ✅ 用 current drawdown 判 CRASH_RISK
     consolidation = bool(metrics.get("consolidation_detected", False))
 
-    if (vix is not None and float(vix) > 35) or (drawdown is not None and float(drawdown) <= -0.18):
+    # --- CRASH_RISK ---
+    if (vix is not None and float(vix) > 35) or (dd_current is not None and float(dd_current) <= -0.18):
         return "CRASH_RISK", 0.10
 
+    # --- HIBERNATION (2日 × 0.96) ---
     if (
         ma14_monthly is not None
         and close_price is not None
@@ -464,15 +469,18 @@ def pick_regime(
     ):
         return "HIBERNATION", 0.20
 
+    # --- MEAN_REVERSION / OVERHEAT ---
     if smr is not None and slope5 is not None:
         if float(smr) > 0.25 and float(slope5) < -EPS:
             return "MEAN_REVERSION", 0.45
         if float(smr) > 0.25 and float(slope5) >= -EPS:
             return "OVERHEAT", 0.55
 
+    # --- CONSOLIDATION ---
     if consolidation:
         return "CONSOLIDATION", 0.65
 
+    # --- NORMAL ---
     return "NORMAL", 0.85
 
 
@@ -486,6 +494,7 @@ TRUST_NAME = "Investment_Trust"
 
 
 def _headers(token: Optional[str]) -> dict:
+    # 仍保留 Bearer；若你之後確認 FinMind 要用 query token，我再給你整包替換
     if token:
         return {"Authorization": f"Bearer {token}"}
     return {}
@@ -567,9 +576,7 @@ def fetch_finmind_investor_buysell_raw(
                 continue
 
             for _, r in df.iterrows():
-                rows.append(
-                    {"date": str(r["date"]), "symbol": sym, "name": str(r["name"]), "net": float(r["net"])}
-                )
+                rows.append({"date": str(r["date"]), "symbol": sym, "name": str(r["name"]), "net": float(r["net"])})
 
         except Exception as e:
             warnings_bus.push(
@@ -744,12 +751,7 @@ def build_institutional_panel_finmind(
         start_date = trade_date
         end_date = trade_date
 
-    raw = fetch_finmind_investor_buysell_raw(
-        symbols=symbols,
-        start_date=start_date,
-        end_date=end_date,
-        token=token,
-    )
+    raw = fetch_finmind_investor_buysell_raw(symbols, start_date, end_date, token=token)
 
     if raw is None or raw.empty:
         warnings_bus.push(
@@ -949,12 +951,15 @@ def build_arbiter_input(
                 "vix": vix_last,
                 "smr": metrics.get("SMR"),
                 "slope5": metrics.get("Slope5"),
-                "drawdown_pct": metrics.get("drawdown_pct"),
+                # ✅ 修正後兩個回撤
+                "drawdown_current_pct": metrics.get("drawdown_current_pct"),
+                "drawdown_max_pct": metrics.get("drawdown_max_pct"),
                 "ma14_monthly": ma14_monthly,
                 "close_below_ma_days": int(close_below_days),
                 "consolidation_detected": bool(metrics.get("consolidation_detected", False)),
                 "max_equity_allowed_pct": float(max_equity),
                 "inst_data_ok": bool(inst_data_ok),
+                "amount_data_ok": bool(amount_ok),
             },
             "market_amount": asdict(amount),
         },
@@ -973,6 +978,38 @@ def build_arbiter_input(
 
 
 # =========================
+# JSON copy button
+# =========================
+def render_copy_button(label: str, text: str, key: str = "copy_btn"):
+    safe = json.dumps(text)  # JS string literal safe
+    html = f"""
+    <div style="display:flex; gap:8px; align-items:center; margin:6px 0;">
+      <button id="{key}" style="
+        padding:6px 10px; border-radius:8px; border:1px solid #ccc;
+        background:#fff; cursor:pointer;">
+        {label}
+      </button>
+      <span id="{key}_msg" style="font-size:12px; color:#666;"></span>
+    </div>
+    <script>
+      const btn = document.getElementById("{key}");
+      const msg = document.getElementById("{key}_msg");
+      btn.addEventListener("click", async () => {{
+        try {{
+          await navigator.clipboard.writeText({safe});
+          msg.textContent = "已複製到剪貼簿";
+          setTimeout(() => msg.textContent = "", 1500);
+        }} catch (e) {{
+          msg.textContent = "複製失敗：瀏覽器限制或權限不足";
+          setTimeout(() => msg.textContent = "", 2000);
+        }}
+      }});
+    </script>
+    """
+    components.html(html, height=48)
+
+
+# =========================
 # UI
 # =========================
 def main():
@@ -985,7 +1022,7 @@ def main():
 
     st.sidebar.subheader("FinMind")
     finmind_token = st.sidebar.text_input("FinMind Token（建議填）", value="", type="password")
-    st.sidebar.caption("若沒 token 或 token 無效，法人資料會被視為不可用 → market_status 進 DEGRADED")
+    st.sidebar.caption("若 token 無效或取不到資料：inst_data_ok=false → market_status 可能進 DEGRADED")
 
     st.sidebar.subheader("持倉（手動貼 JSON array）")
     positions_text = st.sidebar.text_area("positions", value="[]", height=120)
@@ -1024,20 +1061,26 @@ def main():
             return
 
         ov = payload.get("macro", {}).get("overview", {})
-        c1, c2, c3, c4, c5, c6 = st.columns(6)
+
+        # ---- Header KPI ----
+        c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
         c1.metric("交易日", ov.get("trade_date", "-"))
         c2.metric("Regime", payload.get("meta", {}).get("current_regime", "-"))
         c3.metric("SMR", f"{_safe_float(ov.get('smr'), 0):.6f}" if ov.get("smr") is not None else "NA")
         c4.metric("Slope5", f"{_safe_float(ov.get('slope5'), 0):.6f}" if ov.get("slope5") is not None else "NA")
         c5.metric("VIX", f"{_safe_float(ov.get('vix'), 0):.2f}" if ov.get("vix") is not None else "NA")
-        c6.metric("Max Equity Allowed", f"{_pct(ov.get('max_equity_allowed_pct')):.1f}%" if ov.get("max_equity_allowed_pct") is not None else "NA")
+        c6.metric("DD Current", f"{_pct(ov.get('drawdown_current_pct')):.2f}%" if ov.get("drawdown_current_pct") is not None else "NA")
+        c7.metric("Max Equity Allowed", f"{_pct(ov.get('max_equity_allowed_pct')):.1f}%" if ov.get("max_equity_allowed_pct") is not None else "NA")
 
+        # ---- Market Amount ----
         st.subheader("市場成交金額（best-effort / 可稽核）")
         st.json(payload.get("macro", {}).get("market_amount", {}))
 
+        # ---- Institutional Debug ----
         st.subheader("法人面板（FinMind / Debug）")
         inst_ok = bool(ov.get("inst_data_ok", False))
-        st.caption(f"inst_data_ok = {inst_ok}")
+        amt_ok = bool(ov.get("amount_data_ok", False))
+        st.caption(f"inst_data_ok = {inst_ok} ｜ amount_data_ok = {amt_ok}")
         inst_df = pd.DataFrame(payload.get("inst_panel_debug", []))
         if not inst_df.empty:
             show_cols = [c for c in ["Symbol", "asof_date", "Foreign_Net", "Trust_Net", "Inst_Status", "Inst_Streak3", "Inst_Dir3", "Inst_Net_3d"] if c in inst_df.columns]
@@ -1045,6 +1088,7 @@ def main():
         else:
             st.info("法人面板為空（token 未填、token 無效、或 FinMind 回傳空資料）")
 
+        # ---- Stocks table ----
         st.subheader("今日分析清單（TopN + 持倉）— Hybrid Layer")
         s_df = pd.json_normalize(payload.get("stocks", []))
         if not s_df.empty:
@@ -1054,6 +1098,7 @@ def main():
         else:
             st.info("stocks 清單為空（資料源可能暫時不可用）。")
 
+        # ---- Warnings ----
         st.subheader("Warnings（最新 50 條）")
         w_df = pd.DataFrame(warns)
         if not w_df.empty and "code" in w_df.columns:
@@ -1063,8 +1108,24 @@ def main():
         else:
             st.caption("（目前沒有 warnings）")
 
+        # ---- Arbiter Input JSON (copy + download) ----
         st.subheader("AI JSON（Arbiter Input）— 可回溯（SIM-FREE）")
-        st.json(payload)
+
+        json_text = json.dumps(payload, ensure_ascii=False, indent=2)
+
+        # ✅ 複製鍵
+        render_copy_button("一鍵複製 JSON", json_text, key="copy_arbiter_json")
+
+        # ✅ 下載鍵
+        st.download_button(
+            label="下載 JSON 檔",
+            data=json_text.encode("utf-8"),
+            file_name=f"arbiter_input_{ov.get('trade_date','NA')}.json",
+            mime="application/json",
+        )
+
+        # 顯示（可手動選取）
+        st.code(json_text, language="json")
 
 
 if __name__ == "__main__":
