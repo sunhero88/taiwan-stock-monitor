@@ -1099,10 +1099,36 @@ def main():
             st.caption("（目前沒有 warnings）")
 
         # AI JSON
-        st.subheader("AI JSON（Arbiter Input）— 可回溯（SIM-FREE）")
+        # 使用 columns 將標題與按鈕並排
+        c1, c2 = st.columns([0.8, 0.2])
+        with c1:
+            st.subheader("AI JSON（Arbiter Input）— 可回溯（SIM-FREE）")
+        
+        # --- 新增功能區 ---
+        # 1. 將 JSON 物件轉為純文字字串
+        json_str = json.dumps(payload, indent=4, ensure_ascii=False)
+
+        with c2:
+            # 選項 A：提供下載按鈕 (最穩定，可直接存檔)
+            st.download_button(
+                label="📥 下載 JSON",
+                data=json_str,
+                file_name=f"arbiter_{payload['meta']['timestamp'].replace(':','-')}.json",
+                mime="application/json",
+                use_container_width=True
+            )
+
+        # 2. 原本的樹狀圖 (保留用於摺疊檢視)
         st.json(payload)
+
+        # 選項 B：提供「一鍵複製」區塊 (st.code 右上角自帶複製圖示)
+        # 放在 Expander 收折起來，不佔空間，需要複製時打開
+        with st.expander("📋 點擊展開以「一鍵複製」完整 JSON 代碼"):
+            st.code(json_str, language="json")
+        # ----------------
 
 
 if __name__ == "__main__":
     main()
+
 
