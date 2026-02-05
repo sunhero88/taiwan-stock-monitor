@@ -5,6 +5,7 @@
 # ✅ 修正 pick_regime(...) 參數不相容（vixpanic / vipxanic 等）
 # ✅ 修正 yfinance 取價/量比率偶發 TypeError（改為批次抓取 + 防呆展開）
 # ✅ drawdown_pct 改為「當前距離近一年高點回撤」(trailing 252D) 避免 ATH 卻 -28% 的誤判
+# ✅ 修正 _as_close_series() MultiIndex columns 問題
 # =========================================================
 
 from __future__ import annotations
@@ -327,6 +328,9 @@ def calc_inst_3d(inst_df: pd.DataFrame, symbol: str) -> dict:
 # =========================
 @st.cache_data(ttl=60 * 10, show_spinner=False)
 def fetch_history(symbol: str, period: str = "3y", interval: str = "1d") -> pd.DataFrame:
+    """
+    修正版：處理 yfinance 可能返回 MultiIndex columns 的問題
+    """
     try:
         df = yf.download(
             symbol,
@@ -339,14 +343,25 @@ def fetch_history(symbol: str, period: str = "3y", interval: str = "1d") -> pd.D
         )
         if df is None or df.empty:
             return pd.DataFrame()
+        
+        # 處理 MultiIndex columns (當單一 symbol 時，yfinance 有時仍會返回 MultiIndex)
         if isinstance(df.columns, pd.MultiIndex):
-            # 一般單一 symbol 不該是 MultiIndex，但仍做防呆
-            df.columns = ["_".join([str(x) for x in col if x != ""]) for col in df.columns]
+            # 嘗試壓平 MultiIndex
+            df.columns = [' '.join([str(c) for c in col if str(c) != '']).strip() for col in df.columns.values]
+            # 移除可能的 symbol 前綴
+            df.columns = [c.replace(f'{symbol} ', '').strip() for c in df.columns]
+        
         df = df.reset_index()
+        
+        # 統一日期欄位名稱
         if "Date" in df.columns:
             df = df.rename(columns={"Date": "Datetime"})
-        if "Datetime" not in df.columns:
+        elif "index" in df.columns:
+            df = df.rename(columns={"index": "Datetime"})
+        
+        if "Datetime" not in df.columns and df.index.name is not None:
             df.insert(0, "Datetime", pd.to_datetime(df.index))
+        
         return df
     except Exception as e:
         warnings_bus.push("YF_HISTORY_FAIL", f"{symbol} yfinance history fail: {e}", {"symbol": symbol})
@@ -420,20 +435,35 @@ def fetch_batch_prices_volratio(symbols: List[str]) -> pd.DataFrame:
 
 
 # =========================
-# Regime metrics (scalar-only)
+# Regime metrics (scalar-only) - 修正版
 # =========================
 def _as_close_series(df: pd.DataFrame) -> pd.Series:
+    """
+    修正版：強化處理 yfinance 返回的各種 column 格式
+    """
     if df is None or df.empty:
         raise ValueError("market_df is empty")
-    if "Close" in df.columns:
-        s = df["Close"]
-    elif "close" in df.columns:
-        s = df["close"]
-    else:
-        raise ValueError("Close column not found")
-    if isinstance(s, pd.DataFrame):
-        s = s.iloc[:, 0]
-    return s.astype(float)
+    
+    # 嘗試多種可能的欄位名稱
+    possible_names = ["Close", "close", "Adj Close", "adj close"]
+    
+    for name in possible_names:
+        if name in df.columns:
+            s = df[name]
+            # 如果是 DataFrame (MultiIndex 情況)，取第一欄
+            if isinstance(s, pd.DataFrame):
+                s = s.iloc[:, 0]
+            return s.astype(float)
+    
+    # 如果都找不到，嘗試從 columns 中尋找包含 'close' 的欄位
+    close_cols = [c for c in df.columns if 'close' in str(c).lower()]
+    if close_cols:
+        s = df[close_cols[0]]
+        if isinstance(s, pd.DataFrame):
+            s = s.iloc[:, 0]
+        return s.astype(float)
+    
+    raise ValueError(f"Close column not found. Available columns: {list(df.columns)}")
 
 
 def compute_regime_metrics(market_df: pd.DataFrame) -> dict:
@@ -452,7 +482,19 @@ def compute_regime_metrics(market_df: pd.DataFrame) -> dict:
             "drawdown_window_days": 252,
         }
 
-    close = _as_close_series(market_df)
+    try:
+        close = _as_close_series(market_df)
+    except ValueError as e:
+        warnings_bus.push("CLOSE_SERIES_FAIL", f"Failed to extract close series: {e}", {})
+        return {
+            "SMR": None,
+            "SMR_MA5": None,
+            "Slope5": None,
+            "NEGATIVE_SLOPE_5D": True,
+            "MOMENTUM_LOCK": False,
+            "drawdown_pct": None,
+            "drawdown_window_days": 252,
+        }
 
     ma200 = close.rolling(200).mean()
     smr_series = ((close - ma200) / ma200).dropna()
@@ -511,7 +553,8 @@ def _calc_ma14_monthly_from_daily(df_daily: pd.DataFrame) -> Optional[float]:
             return None
         ma14 = monthly.rolling(14).mean().dropna()
         return float(ma14.iloc[-1]) if len(ma14) else None
-    except Exception:
+    except Exception as e:
+        warnings_bus.push("MA14_CALC_FAIL", f"MA14 calculation failed: {e}", {})
         return None
 
 
@@ -519,9 +562,10 @@ def _extract_close_price(df_daily: pd.DataFrame) -> Optional[float]:
     try:
         if df_daily is None or df_daily.empty:
             return None
-        close = df_daily["Close"].dropna()
+        close = _as_close_series(df_daily)
         return float(close.iloc[-1]) if len(close) else None
-    except Exception:
+    except Exception as e:
+        warnings_bus.push("CLOSE_PRICE_FAIL", f"Close price extraction failed: {e}", {})
         return None
 
 
@@ -529,7 +573,7 @@ def _count_close_below_ma_days(df_daily: pd.DataFrame, ma14_monthly: Optional[fl
     try:
         if ma14_monthly is None or df_daily is None or df_daily.empty:
             return 0
-        close = df_daily["Close"].dropna()
+        close = _as_close_series(df_daily)
         if len(close) < 2:
             return 0
 
@@ -543,7 +587,8 @@ def _count_close_below_ma_days(df_daily: pd.DataFrame, ma14_monthly: Optional[fl
             else:
                 break
         return int(cnt)
-    except Exception:
+    except Exception as e:
+        warnings_bus.push("BELOW_MA_COUNT_FAIL", f"Below MA days count failed: {e}", {})
         return 0
 
 
@@ -714,9 +759,12 @@ def build_arbiter_input(
     vix_df = fetch_history(VIX_SYMBOL, period="2y", interval="1d")
 
     vix_last = None
-    if not vix_df.empty and "Close" in vix_df.columns:
-        v = vix_df["Close"].dropna()
-        vix_last = float(v.iloc[-1]) if len(v) else None
+    if not vix_df.empty:
+        try:
+            vix_close = _as_close_series(vix_df)
+            vix_last = float(vix_close.iloc[-1]) if len(vix_close) else None
+        except Exception as e:
+            warnings_bus.push("VIX_EXTRACT_FAIL", f"VIX extraction failed: {e}", {})
 
     # --- compute metrics ---
     metrics = compute_regime_metrics(twii_df) if not twii_df.empty else {
