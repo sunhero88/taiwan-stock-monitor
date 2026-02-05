@@ -1,10 +1,11 @@
 # main.py
 # =========================================================
 # Sunhero｜股市智能超盤中控台（Predator V16.3 Stable Hybrid）
-# V16.3.1 Hotfix:
-# ✅ 修復 KeyError: 'Institutional.Inst_Net_3d' 導致的核心持股雷達崩潰問題
-# ✅ 確保法人數據 (inst_map) 寫入正確的 Key (Inst_Net_3d, Inst_Streak3)
-# ✅ 維持所有中文化與 UI 優化
+# V16.3.2 Upgrade:
+# ✅ [Fix] 解決 KeyError: 'Institutional.Inst_Net_3d' 崩潰問題
+# ✅ [UI] Warnings (系統健康診斷) 加回儀表板，並提供清楚說明
+# ✅ [Logic] 強化持倉 (Positions) 追蹤：持倉股強制納入監控，並自動補上中文名稱
+# ✅ [Data] 確保法人數據欄位 (Capitalized Keys) 對齊前端需求
 # =========================================================
 
 from __future__ import annotations
@@ -47,14 +48,15 @@ A_NAMES = {"Foreign_Investor", "Investment_Trust", "Dealer_self", "Dealer_Hedgin
 
 NEUTRAL_THRESHOLD = 5_000_000 
 
-# --- 個股中文名稱對照表 ---
+# --- 個股中文名稱對照表 (可持續擴充) ---
 STOCK_NAME_MAP = {
     "2330.TW": "台積電", "2317.TW": "鴻海",   "2454.TW": "聯發科", "2308.TW": "台達電",
     "2382.TW": "廣達",   "3231.TW": "緯創",   "2376.TW": "技嘉",   "3017.TW": "奇鋐",
     "3324.TW": "雙鴻",   "3661.TW": "世芯-KY",
     "2881.TW": "富邦金", "2882.TW": "國泰金", "2891.TW": "中信金", "2886.TW": "兆豐金",
     "2603.TW": "長榮",   "2609.TW": "陽明",   "1605.TW": "華新",   "1513.TW": "中興電",
-    "1519.TW": "華城",   "2002.TW": "中鋼"
+    "1519.TW": "華城",   "2002.TW": "中鋼",
+    # 若持倉股不在上面，會顯示代號，或您可在此手動追加
 }
 
 # --- 欄位中文化對照表 ---
@@ -532,8 +534,13 @@ def build_arbiter_input(session: str, account_mode: str, topn: int, positions: L
     amount = fetch_amount_total(allow_insecure_ssl)
     market_inst_summary = fetch_market_inst_summary(allow_insecure_ssl)
 
-    # 3. Stocks Data
-    symbols = _default_symbols_pool(topn)
+    # 3. Stocks Data (TopN + Positions)
+    # 合併 TopN 與 Positions 的標的，去除重複
+    base_pool = _default_symbols_pool(topn)
+    pos_pool = [p.get("symbol") for p in positions if p.get("symbol")]
+    # 使用 dict.fromkeys 維持順序並去重
+    symbols = list(dict.fromkeys(base_pool + pos_pool))
+
     pv = fetch_batch_prices_volratio(symbols)
     
     trade_date = None
@@ -669,6 +676,8 @@ def main():
                                                int(cash_balance), int(total_equity), bool(allow_insecure_ssl), finmind_token)
         except Exception as e:
             st.error(f"系統錯誤: {e}")
+            # 顯示完整的 traceback 方便 debug (但前端只會看到上面的 error)
+            # st.exception(e) 
             return
 
         ov = payload.get("macro", {}).get("overview", {})
@@ -691,14 +700,12 @@ def main():
         chg = ov.get("twii_change")
         pct = ov.get("twii_pct")
         
-        # 顏色邏輯
         delta_color = "normal"
         if chg: delta_color = "normal" if chg >= 0 else "inverse"
 
         m1.metric("加權指數", f"{close:,.0f}" if close else "-", f"{chg:+.0f} ({pct:+.2%})" if chg else None, delta_color=delta_color)
         m2.metric("VIX 恐慌指數", f"{ov.get('vix'):.2f}" if ov.get("vix") else "-")
         
-        # 成交金額顯示 (億)
         amt_total = amount.get("amount_total")
         amt_str = f"{amt_total/1_0000_0000:.1f} 億" if amt_total else "數據缺失"
         m3.metric("市場總成交額", amt_str)
@@ -710,7 +717,7 @@ def main():
             cols = st.columns(len(inst_summary))
             for idx, item in enumerate(inst_summary):
                 net = item.get("Net", 0)
-                net_yi = net / 1_0000_0000 # 轉為億
+                net_yi = net / 1_0000_0000 
                 cols[idx].metric(item.get("Identity"), f"{net_yi:+.2f} 億")
         else:
             st.info("暫無今日法人統計資料 (通常下午 3 點後更新)")
@@ -723,14 +730,28 @@ def main():
                 if "CRITICAL" in a or "KILL" in a: st.error(a)
                 else: st.warning(a)
 
-        # --- 5. 個股分析 (Stocks) - 中文化表格 ---
+        # --- 5. 系統診斷 (Warnings) - 加回儀表板 ---
+        st.subheader("🛠️ 系統健康診斷 (System Health)")
+        if not warns:
+            st.success("✅ 系統運作正常，無錯誤日誌 (Clean Run)。")
+        else:
+            with st.expander(f"⚠️ 偵測到 {len(warns)} 條系統警示 (點擊查看詳情)", expanded=True):
+                st.warning("系統遭遇部分數據抓取失敗，已自動降級或使用備援數據。")
+                w_df = pd.DataFrame(warns)
+                # 簡單過濾關鍵欄位
+                if not w_df.empty and 'code' in w_df.columns:
+                    st.dataframe(w_df[['ts', 'code', 'msg']], use_container_width=True)
+                else:
+                    st.write(warns)
+
+        # --- 6. 個股分析 (Stocks) - 中文化表格 ---
         st.subheader("🎯 核心持股雷達 (Tactical Stocks)")
         s_df = pd.json_normalize(payload.get("stocks", []))
         if not s_df.empty:
             # 整理並重命名欄位 (確保 Institutional.Inst_Net_3d 存在)
             disp_cols = ["Symbol", "Name", "Price", "Vol_Ratio", "Layer", "Institutional.Inst_Net_3d", "Institutional.Inst_Streak3"]
             
-            # 使用 reindex 避免 KeyError (若某欄位仍缺失，會填入 NaN 而不崩潰)
+            # 使用 reindex 避免 KeyError
             s_df = s_df.reindex(columns=disp_cols, fill_value=0)
             
             s_df = s_df.rename(columns=COL_TRANSLATION)
@@ -740,21 +761,12 @@ def main():
             })
             st.dataframe(s_df, use_container_width=True)
 
-        # --- 6. 法人明細 (Institutional Panel) ---
+        # --- 7. 法人明細 (Institutional Panel) ---
         with st.expander("🔍 查看法人詳細數據 (Institutional Debug Panel)"):
             inst_df = pd.DataFrame(payload.get("institutional_panel", []))
             if not inst_df.empty:
                 st.dataframe(inst_df.rename(columns=COL_TRANSLATION), use_container_width=True)
         
-        # --- 7. 系統診斷 (Warnings) ---
-        with st.expander(f"🛠️ 系統健康診斷日誌 (Warnings: {len(warns)})"):
-            if not warns:
-                st.success("✅ 系統運作正常，無錯誤日誌。")
-            else:
-                st.markdown("**日誌說明**：此處記錄資料抓取失敗或連線錯誤。若出現 `SSL_ERROR` 或 `FETCH_FAIL`，代表外部資料源不穩定，系統可能使用舊資料或忽略部分指標。")
-                w_df = pd.DataFrame(warns)
-                st.dataframe(w_df, use_container_width=True)
-
         # --- 8. AI JSON 一鍵複製 (st.code) ---
         st.markdown("---")
         c_copy1, c_copy2 = st.columns([0.8, 0.2])
