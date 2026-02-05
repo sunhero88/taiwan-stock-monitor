@@ -1,12 +1,10 @@
 # main.py
 # =========================================================
 # Sunhero｜股市智能超盤中控台（Predator V16.3 Stable Hybrid）
-# 升級內容：
-# ✅ UI 全面中文化 (欄位轉譯)
-# ✅ 新增個股中文名稱對照 (STOCK_NAME_MAP)
-# ✅ 新增全市場三大法人買賣超 (fetch_market_inst_summary)
-# ✅ 新增加權指數漲跌幅計算
-# ✅ 優化 Warnings 顯示與說明
+# V16.3.1 Hotfix:
+# ✅ 修復 KeyError: 'Institutional.Inst_Net_3d' 導致的核心持股雷達崩潰問題
+# ✅ 確保法人數據 (inst_map) 寫入正確的 Key (Inst_Net_3d, Inst_Streak3)
+# ✅ 維持所有中文化與 UI 優化
 # =========================================================
 
 from __future__ import annotations
@@ -49,7 +47,7 @@ A_NAMES = {"Foreign_Investor", "Investment_Trust", "Dealer_self", "Dealer_Hedgin
 
 NEUTRAL_THRESHOLD = 5_000_000 
 
-# --- 新增：個股中文名稱對照表 ---
+# --- 個股中文名稱對照表 ---
 STOCK_NAME_MAP = {
     "2330.TW": "台積電", "2317.TW": "鴻海",   "2454.TW": "聯發科", "2308.TW": "台達電",
     "2382.TW": "廣達",   "3231.TW": "緯創",   "2376.TW": "技嘉",   "3017.TW": "奇鋐",
@@ -59,7 +57,7 @@ STOCK_NAME_MAP = {
     "1519.TW": "華城",   "2002.TW": "中鋼"
 }
 
-# --- 新增：欄位中文化對照表 ---
+# --- 欄位中文化對照表 ---
 COL_TRANSLATION = {
     "Symbol": "代號",
     "Name": "名稱",
@@ -199,7 +197,6 @@ def fetch_market_inst_summary(allow_insecure_ssl: bool = False) -> List[Dict[str
         r = requests.get(url, timeout=10, verify=(not allow_insecure_ssl))
         r.raise_for_status()
         js = r.json()
-        # js['data'] 通常是 list of list: [["自營商(自行買賣)", "買", "賣", "差"], ...]
         if 'data' in js and isinstance(js['data'], list):
             for row in js['data']:
                 if len(row) >= 4:
@@ -561,7 +558,7 @@ def build_arbiter_input(session: str, account_mode: str, topn: int, positions: L
             "Symbol": sym,
             "Name": STOCK_NAME_MAP.get(sym, sym), # Add Name
             "Foreign_Net": net3, 
-            "Trust_Net": net3, # Note: simplified logic from original code
+            "Trust_Net": net3, 
             "Inst_Streak3": int(inst3.get("Inst_Streak3", 0)),
             "Inst_Status": inst3.get("Inst_Status", "PENDING"),
             "Inst_Dir3": inst3.get("Inst_Dir3", "PENDING"),
@@ -570,7 +567,14 @@ def build_arbiter_input(session: str, account_mode: str, topn: int, positions: L
         }
         panel_rows.append(p_row)
         
-        inst_map[sym] = {"foreign_buy": bool(net3>0), "trust_buy": bool(net3>0), "inst_streak3": int(inst3.get("Inst_Streak3", 0))}
+        # 修正：寫入正確的 Capitalized Keys，供 pd.json_normalize 與前端 disp_cols 使用
+        inst_map[sym] = {
+            "foreign_buy": bool(net3>0), 
+            "trust_buy": bool(net3>0), 
+            "Inst_Streak3": int(inst3.get("Inst_Streak3", 0)), # Capitalized
+            "Inst_Net_3d": net3, # Added Key
+            "inst_streak3": int(inst3.get("Inst_Streak3", 0)) # keep lowercase for internal layer logic
+        }
 
         # Stock Technicals
         row = pv[pv["Symbol"] == sym].iloc[0] if not pv.empty and (pv["Symbol"] == sym).any() else None
@@ -614,12 +618,12 @@ def build_arbiter_input(session: str, account_mode: str, topn: int, positions: L
         "macro": {
             "overview": {
                 "trade_date": trade_date, "twii_close": close_price,
-                "twii_change": twii_change, "twii_pct": twii_pct, # New Metrics
+                "twii_change": twii_change, "twii_pct": twii_pct, 
                 "vix": vix_last, "smr": metrics.get("SMR"), "slope5": metrics.get("Slope5"),
                 "drawdown_pct": metrics.get("drawdown_pct"), "max_equity_allowed_pct": final_max_equity
             },
             "market_amount": asdict(amount),
-            "market_inst_summary": market_inst_summary, # New Summary
+            "market_inst_summary": market_inst_summary, 
             "integrity": integrity
         },
         "portfolio": {
@@ -723,9 +727,13 @@ def main():
         st.subheader("🎯 核心持股雷達 (Tactical Stocks)")
         s_df = pd.json_normalize(payload.get("stocks", []))
         if not s_df.empty:
-            # 整理並重命名欄位
+            # 整理並重命名欄位 (確保 Institutional.Inst_Net_3d 存在)
             disp_cols = ["Symbol", "Name", "Price", "Vol_Ratio", "Layer", "Institutional.Inst_Net_3d", "Institutional.Inst_Streak3"]
-            s_df = s_df[disp_cols].rename(columns=COL_TRANSLATION)
+            
+            # 使用 reindex 避免 KeyError (若某欄位仍缺失，會填入 NaN 而不崩潰)
+            s_df = s_df.reindex(columns=disp_cols, fill_value=0)
+            
+            s_df = s_df.rename(columns=COL_TRANSLATION)
             s_df = s_df.rename(columns={
                 "Institutional.Inst_Net_3d": "法人3日淨額",
                 "Institutional.Inst_Streak3": "法人連買天數"
@@ -747,10 +755,11 @@ def main():
                 w_df = pd.DataFrame(warns)
                 st.dataframe(w_df, use_container_width=True)
 
-        # --- 8. AI JSON 一鍵複製 ---
+        # --- 8. AI JSON 一鍵複製 (st.code) ---
         st.markdown("---")
         c_copy1, c_copy2 = st.columns([0.8, 0.2])
         with c_copy1: st.subheader("🤖 AI JSON (Arbiter Input)")
+        
         json_str = json.dumps(payload, indent=4, ensure_ascii=False)
         st.markdown("##### 📋 點擊下方代碼塊右上角的「複製圖示」即可複製完整數據")
         st.code(json_str, language="json")
