@@ -740,8 +740,39 @@ def build_active_alerts(integrity: dict, amount: MarketAmount) -> List[str]:
 # Arbiter input builder
 # =========================
 def _default_symbols_pool(topn: int) -> List[str]:
-    pool = ["2330.TW", "2317.TW", "2454.TW", "2308.TW", "2881.TW", "2882.TW", "2603.TW", "2609.TW"]
-    return pool[: max(1, int(topn))]
+    # 2026 戰術核心監控名單 (Tactical 20)
+    pool = [
+        # --- 權值錨點 (Anchors) ---
+        "2330.TW", # 台積電 (半導體核心)
+        "2317.TW", # 鴻海 (AI伺服器/權值)
+        "2454.TW", # 聯發科 (IC設計龍頭)
+        "2308.TW", # 台達電 (綠能/電源)
+        
+        # --- AI 攻擊矛頭 (Alpha Leaders) ---
+        "2382.TW", # 廣達 (AI伺服器代工)
+        "3231.TW", # 緯創 (AI伺服器代工)
+        "2376.TW", # 技嘉 (AI主機板/顯卡)
+        "3017.TW", # 奇鋐 (散熱龍頭)
+        "3324.TW", # 雙鴻 (散熱雙雄)
+        "3661.TW", # 世芯-KY (IP/ASIC)
+        
+        # --- 金融防禦 (Financial Defenders) ---
+        "2881.TW", # 富邦金 (獲利王)
+        "2882.TW", # 國泰金 (壽險雙雄)
+        "2891.TW", # 中信金 (銀行獲利穩)
+        "2886.TW", # 兆豐金 (官股匯銀)
+
+        # --- 傳產/週期 (Cyclical/Value) ---
+        "2603.TW", # 長榮 (航運指標)
+        "2609.TW", # 陽明 (航運)
+        "1605.TW", # 華新 (電線電纜/原物料)
+        "1513.TW", # 中興電 (重電/政策股)
+        "1519.TW", # 華城 (重電/變壓器)
+        "2002.TW"  # 中鋼 (鋼鐵龍頭/最後防線)
+    ]
+    # 確保返回數量不超過 pool 長度，避免 index error
+    limit = min(len(pool), max(1, int(topn)))
+    return pool[:limit]
 
 
 def build_arbiter_input(
@@ -1074,3 +1105,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
