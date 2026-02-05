@@ -1099,36 +1099,24 @@ def main():
             st.caption("（目前沒有 warnings）")
 
         # AI JSON
-        # 使用 columns 將標題與按鈕並排
-        c1, c2 = st.columns([0.8, 0.2])
-        with c1:
-            st.subheader("AI JSON（Arbiter Input）— 可回溯（SIM-FREE）")
+        st.subheader("AI JSON（Arbiter Input）— 可回溯（SIM-FREE）")
         
-        # --- 新增功能區 ---
-        # 1. 將 JSON 物件轉為純文字字串
+        # 1. 先將 JSON 轉為易讀的字串 (保留中文不亂碼)
         json_str = json.dumps(payload, indent=4, ensure_ascii=False)
 
-        with c2:
-            # 選項 A：提供下載按鈕 (最穩定，可直接存檔)
-            st.download_button(
-                label="📥 下載 JSON",
-                data=json_str,
-                file_name=f"arbiter_{payload['meta']['timestamp'].replace(':','-')}.json",
-                mime="application/json",
-                use_container_width=True
-            )
-
-        # 2. 原本的樹狀圖 (保留用於摺疊檢視)
-        st.json(payload)
-
-        # 選項 B：提供「一鍵複製」區塊 (st.code 右上角自帶複製圖示)
-        # 放在 Expander 收折起來，不佔空間，需要複製時打開
-        with st.expander("📋 點擊展開以「一鍵複製」完整 JSON 代碼"):
-            st.code(json_str, language="json")
-        # ----------------
+        # 2. 使用 st.code 顯示
+        # ⚠️ 關鍵：st.code 的區塊右上角，滑鼠移過去會自動出現一個「複製 (Copy)」的小圖示
+        # 點一下該圖示，內容就會直接進剪貼簿，您就可以直接去貼給 AI 了
+        st.markdown("##### 📋 點擊下方代碼塊右上角的「複製圖示」即可")
+        st.code(json_str, language="json")
+        
+        # (選擇性) 如果您還是想看原本的摺疊樹狀圖，保留這行，不想看可刪除
+        with st.expander("🔍 查看樹狀結構 (Tree View)"):
+            st.json(payload)
 
 
 if __name__ == "__main__":
     main()
+
 
 
