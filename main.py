@@ -1,9 +1,10 @@
 # main.py
 # =========================================================
-# Sunhero | 股市智能超盤中控台
-# TopN + 持倉監控 / Predator V16.3 Stable Hybrid
-# （已併入 V16.2 Enhanced Kill-Switch）
-# Single-file Streamlit app (drop-in runnable)
+# Sunhero｜股市智能超盤中控台（TopN + 持倉監控 / Predator V16.3 Stable Hybrid）
+# ✅ 併入 Kill-Switch（V16.2 Enhanced）
+# ✅ 修正 pick_regime(...) 參數不相容（vixpanic / vipxanic 等）
+# ✅ 修正 yfinance 取價/量比率偶發 TypeError（改為批次抓取 + 防呆展開）
+# ✅ drawdown_pct 改為「當前距離近一年高點回撤」(trailing 252D) 避免 ATH 卻 -28% 的誤判
 # =========================================================
 
 from __future__ import annotations
@@ -31,10 +32,9 @@ APP_TITLE = "Sunhero｜股市智能超盤中控台（TopN + 持倉監控 / Preda
 st.title(APP_TITLE)
 
 # =========================
-# Constants
+# Constants / helpers
 # =========================
 EPS = 1e-4
-
 TWII_SYMBOL = "^TWII"
 VIX_SYMBOL = "^VIX"
 
@@ -42,22 +42,13 @@ DEFAULT_TOPN = 8
 DEFAULT_CASH = 2_000_000
 DEFAULT_EQUITY = 2_000_000
 
-# Kill-Switch 規則（可調，但請保守）
-KILL_CORE_MISSING_THRESHOLD = 0.50  # 核心缺失率 > 50% 直接 KILL
-KILL_REQUIRE_PRICE_RATIO = 1.00     # Price null 比率達 100%（全部 missing）直接 KILL
-KILL_REQUIRE_VOLRATIO_RATIO = 1.00  # Vol_Ratio null 比率達 100% 直接 KILL
-
-# 法人「中性」閾值（你指定：5,000 萬）
-NEUTRAL_THRESHOLD = 50_000_000
-
 FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
 A_NAMES = {"Foreign_Investor", "Investment_Trust", "Dealer_self", "Dealer_Hedging"}
 B_FOREIGN_NAME = "Foreign_Investor"
 
+NEUTRAL_THRESHOLD = 5_000_000  # 5,000,000 (你指定門檻)
 
-# =========================
-# Basic helpers
-# =========================
+
 def _now_ts() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
 
@@ -93,14 +84,10 @@ def _safe_int(x, default=None) -> Optional[int]:
         return default
 
 
-def _pct(x: Optional[float]) -> Optional[float]:
+def _pct01_to_pct100(x: Optional[float]) -> Optional[float]:
     if x is None:
         return None
-    return round(float(x) * 100.0, 4)
-
-
-def _json_copyable(obj: Any) -> str:
-    return json.dumps(obj, ensure_ascii=False, indent=2, default=str)
+    return float(x) * 100.0
 
 
 # =========================
@@ -119,7 +106,6 @@ class WarningBus:
 
 warnings_bus = WarningBus()
 
-
 # =========================
 # Market amount (TWSE/TPEX) best-effort
 # =========================
@@ -136,12 +122,12 @@ class MarketAmount:
 def _fetch_twse_amount(allow_insecure_ssl: bool) -> Tuple[Optional[int], str]:
     url = "https://www.twse.com.tw/exchangeReport/MI_INDEX?response=json&type=ALLBUT0999"
     try:
-        r = requests.get(url, timeout=12, verify=(not allow_insecure_ssl))
+        r = requests.get(url, timeout=10, verify=(not allow_insecure_ssl))
         r.raise_for_status()
         js = r.json()
 
-        # heuristic: 先找 fields9/fields1 的「成交金額」，再取 data9/data1 最末列
-        fields = js.get("fields9") or js.get("fields1") or js.get("fields") or []
+        # heuristic: try fields9 + data9 total row
+        fields = js.get("fields9") or js.get("fields") or []
         fields = [str(x) for x in fields] if isinstance(fields, list) else []
         amt_idx = None
         for i, f in enumerate(fields):
@@ -149,42 +135,20 @@ def _fetch_twse_amount(allow_insecure_ssl: bool) -> Tuple[Optional[int], str]:
                 amt_idx = i
                 break
 
-        candidate = None
-        if isinstance(js.get("data9"), list) and js.get("data9"):
-            candidate = js.get("data9")
-        elif isinstance(js.get("data1"), list) and js.get("data1"):
-            candidate = js.get("data1")
-
-        amount = None
-        if candidate is not None and amt_idx is not None:
-            last = candidate[-1]
+        data = js.get("data9")
+        if isinstance(data, list) and len(data) > 0 and amt_idx is not None:
+            last = data[-1]
             if isinstance(last, list) and amt_idx < len(last):
                 amount = _safe_int(last[amt_idx], default=None)
+                if amount is not None:
+                    return int(amount), "TWSE_OK:MI_INDEX"
 
-        if amount is None:
-            # fallback：掃描末端 5 列的最大數字（避免全 NULL）
-            best = None
-            for key in ["data9", "data1", "data2", "data3", "data4", "data5", "data6", "data7", "data8"]:
-                tbl = js.get(key)
-                if not (isinstance(tbl, list) and tbl):
-                    continue
-                for row in tbl[-5:]:
-                    if not isinstance(row, list):
-                        continue
-                    for cell in row:
-                        v = _safe_int(cell, default=None)
-                        if v is None:
-                            continue
-                        if best is None or v > best:
-                            best = v
-            amount = best
-            if amount is None:
-                warnings_bus.push("TWSE_AMOUNT_PARSE_FAIL", "TWSE amount parse none", {"url": url})
-                return None, "TWSE_FAIL:PARSE_NONE"
-            warnings_bus.push("TWSE_AMOUNT_PARSE_WARN", "TWSE amount fallback max-scan", {"amount": amount, "url": url})
-            return int(amount), "TWSE_WARN:FALLBACK_MAXSCAN"
-
-        return int(amount), "TWSE_OK:MI_INDEX"
+        warnings_bus.push(
+            "TWSE_AMOUNT_PARSE_FAIL",
+            "TWSE amount parse failed (schema changed?)",
+            {"url": url, "keys": list(js.keys())[:30]},
+        )
+        return None, "TWSE_FAIL:PARSE"
 
     except requests.exceptions.SSLError as e:
         warnings_bus.push("TWSE_AMOUNT_SSL_ERROR", f"TWSE SSL error: {e}", {"url": url})
@@ -197,40 +161,32 @@ def _fetch_twse_amount(allow_insecure_ssl: bool) -> Tuple[Optional[int], str]:
 def _fetch_tpex_amount(allow_insecure_ssl: bool) -> Tuple[Optional[int], str]:
     url = "https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw"
     try:
-        r = requests.get(url, timeout=12, verify=(not allow_insecure_ssl))
+        r = requests.get(url, timeout=10, verify=(not allow_insecure_ssl))
         r.raise_for_status()
 
         try:
             js = r.json()
         except Exception as e:
-            warnings_bus.push("TPEX_AMOUNT_PARSE_FAIL", f"TPEX JSON decode error: {e}", {"url": url, "text_head": r.text[:200]})
+            warnings_bus.push(
+                "TPEX_AMOUNT_PARSE_FAIL",
+                f"TPEX JSON decode error: {e}",
+                {"url": url, "text_head": r.text[:200]},
+            )
             return None, "TPEX_FAIL:JSONDecodeError"
 
-        # 嘗試常見 key
-        for key in ["totalAmount", "成交金額", "trade_value", "amt", "amount"]:
+        # try common keys
+        for key in ["totalAmount", "trade_value", "amount", "amt", "成交金額"]:
             if key in js:
                 v = _safe_int(js.get(key), default=None)
                 if v is not None:
                     return int(v), "TPEX_OK:st43_result"
 
-        # fallback：掃描 aaData/data 的最大數字
-        aa = js.get("aaData") or js.get("data")
-        best = None
-        if isinstance(aa, list):
-            for row in aa[-10:]:
-                if isinstance(row, list):
-                    for cell in row:
-                        v = _safe_int(cell, default=None)
-                        if v is None:
-                            continue
-                        if best is None or v > best:
-                            best = v
-        if best is None:
-            warnings_bus.push("TPEX_AMOUNT_PARSE_FAIL", "TPEX amount parse none", {"url": url, "keys": list(js.keys())[:30]})
-            return None, "TPEX_FAIL:PARSE_NONE"
-
-        warnings_bus.push("TPEX_AMOUNT_PARSE_WARN", "TPEX amount fallback max-scan", {"amount": best, "url": url})
-        return int(best), "TPEX_WARN:FALLBACK_MAXSCAN"
+        warnings_bus.push(
+            "TPEX_AMOUNT_PARSE_FAIL",
+            "TPEX amount parse failed (no numeric keys)",
+            {"url": url, "keys": list(js.keys())[:30]},
+        )
+        return None, "TPEX_FAIL:PARSE"
 
     except requests.exceptions.SSLError as e:
         warnings_bus.push("TPEX_AMOUNT_SSL_ERROR", f"TPEX SSL error: {e}", {"url": url})
@@ -263,114 +219,318 @@ def fetch_amount_total(allow_insecure_ssl: bool = False) -> MarketAmount:
 
 
 # =========================
-# yfinance fetchers（修掉 MultiIndex / 解析炸裂）
+# FinMind helpers
 # =========================
-def _flatten_yf_columns(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return df
-    if isinstance(df.columns, pd.MultiIndex):
-        # 常見：('Close','^TWII') 之類 → 取第一層
-        df.columns = [c[0] if isinstance(c, tuple) else str(c) for c in df.columns.to_list()]
-    # 有時候欄名大小寫或空白不一致
-    df = df.rename(columns={c: str(c).strip() for c in df.columns})
-    return df
+def _finmind_headers(token: Optional[str]) -> dict:
+    if token:
+        return {"Authorization": f"Bearer {token}"}
+    return {}
 
 
-@st.cache_data(ttl=600, show_spinner=False)
-def fetch_history(symbol: str, period: str = "2y", interval: str = "1d") -> pd.DataFrame:
+def _finmind_get(dataset: str, params: dict, token: Optional[str]) -> dict:
+    p = {"dataset": dataset, **params}
+    r = requests.get(FINMIND_URL, headers=_finmind_headers(token), params=p, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def normalize_inst_direction(net: float) -> str:
+    net = float(net or 0.0)
+    if abs(net) < NEUTRAL_THRESHOLD:
+        return "NEUTRAL"
+    return "POSITIVE" if net > 0 else "NEGATIVE"
+
+
+def fetch_finmind_institutional(
+    symbols: List[str],
+    start_date: str,
+    end_date: str,
+    token: Optional[str] = None,
+) -> pd.DataFrame:
+    """
+    個股法人淨額（外資+投信+自營(含避險)）
+    回傳 columns: date, symbol, net_amount
+    """
+    rows = []
+    for sym in symbols:
+        stock_id = sym.replace(".TW", "").strip()
+        try:
+            js = _finmind_get(
+                dataset="TaiwanStockInstitutionalInvestorsBuySell",
+                params={"data_id": stock_id, "start_date": start_date, "end_date": end_date},
+                token=token,
+            )
+        except Exception as e:
+            warnings_bus.push("FINMIND_INST_FETCH_FAIL", f"{sym} fetch fail: {e}", {"symbol": sym})
+            continue
+
+        data = js.get("data", []) or []
+        if not data:
+            continue
+
+        df = pd.DataFrame(data)
+        need = {"date", "stock_id", "buy", "name", "sell"}
+        if not need.issubset(set(df.columns)):
+            continue
+
+        df["buy"] = pd.to_numeric(df["buy"], errors="coerce").fillna(0)
+        df["sell"] = pd.to_numeric(df["sell"], errors="coerce").fillna(0)
+
+        df = df[df["name"].isin(A_NAMES)].copy()
+        if df.empty:
+            continue
+
+        df["net"] = df["buy"] - df["sell"]
+        g = df.groupby("date", as_index=False)["net"].sum()
+        for _, r in g.iterrows():
+            rows.append({"date": str(r["date"]), "symbol": sym, "net_amount": float(r["net"])})
+
+    if not rows:
+        return pd.DataFrame(columns=["date", "symbol", "net_amount"])
+
+    return pd.DataFrame(rows).sort_values(["symbol", "date"])
+
+
+def calc_inst_3d(inst_df: pd.DataFrame, symbol: str) -> dict:
+    """
+    回傳：
+      Inst_Status: READY/PENDING
+      Inst_Streak3: 3 或 0
+      Inst_Dir3: POSITIVE/NEGATIVE/NEUTRAL/PENDING
+      Inst_Net_3d: 三日加總
+    """
+    if inst_df is None or inst_df.empty:
+        return {"Inst_Status": "PENDING", "Inst_Streak3": 0, "Inst_Dir3": "PENDING", "Inst_Net_3d": 0.0}
+
+    df = inst_df[inst_df["symbol"] == symbol].copy()
+    if df.empty:
+        return {"Inst_Status": "PENDING", "Inst_Streak3": 0, "Inst_Dir3": "PENDING", "Inst_Net_3d": 0.0}
+
+    df = df.sort_values("date").tail(3)
+    if len(df) < 3:
+        return {"Inst_Status": "PENDING", "Inst_Streak3": 0, "Inst_Dir3": "PENDING", "Inst_Net_3d": 0.0}
+
+    df["net_amount"] = pd.to_numeric(df["net_amount"], errors="coerce").fillna(0)
+    dirs = [normalize_inst_direction(x) for x in df["net_amount"]]
+    net_sum = float(df["net_amount"].sum())
+
+    if all(d == "POSITIVE" for d in dirs):
+        return {"Inst_Status": "READY", "Inst_Streak3": 3, "Inst_Dir3": "POSITIVE", "Inst_Net_3d": net_sum}
+    if all(d == "NEGATIVE" for d in dirs):
+        return {"Inst_Status": "READY", "Inst_Streak3": 3, "Inst_Dir3": "NEGATIVE", "Inst_Net_3d": net_sum}
+
+    return {"Inst_Status": "READY", "Inst_Streak3": 0, "Inst_Dir3": "NEUTRAL", "Inst_Net_3d": net_sum}
+
+
+# =========================
+# yfinance fetchers (robust)
+# =========================
+@st.cache_data(ttl=60 * 10, show_spinner=False)
+def fetch_history(symbol: str, period: str = "3y", interval: str = "1d") -> pd.DataFrame:
     try:
         df = yf.download(
-            tickers=symbol,
+            symbol,
             period=period,
             interval=interval,
             auto_adjust=False,
-            group_by="column",
             progress=False,
+            group_by="column",
             threads=False,
         )
         if df is None or df.empty:
             return pd.DataFrame()
-        df = _flatten_yf_columns(df.copy())
+        if isinstance(df.columns, pd.MultiIndex):
+            # 一般單一 symbol 不該是 MultiIndex，但仍做防呆
+            df.columns = ["_".join([str(x) for x in col if x != ""]) for col in df.columns]
         df = df.reset_index()
-
-        # 統一時間欄位
         if "Date" in df.columns:
             df = df.rename(columns={"Date": "Datetime"})
         if "Datetime" not in df.columns:
-            # fallback
             df.insert(0, "Datetime", pd.to_datetime(df.index))
-
-        # 統一 Adj Close 欄位名
-        if "Adj Close" in df.columns:
-            df = df.rename(columns={"Adj Close": "Adj_Close"})
-
-        # 強制存在 Close/Volume（沒有就留空）
-        for col in ["Open", "High", "Low", "Close", "Volume"]:
-            if col not in df.columns:
-                df[col] = np.nan
-
         return df
     except Exception as e:
-        warnings_bus.push("YF_FETCH_FAIL", f"{symbol} yfinance fetch fail: {e}", {"symbol": symbol})
+        warnings_bus.push("YF_HISTORY_FAIL", f"{symbol} yfinance history fail: {e}", {"symbol": symbol})
         return pd.DataFrame()
 
 
+@st.cache_data(ttl=60 * 5, show_spinner=False)
+def fetch_batch_prices_volratio(symbols: List[str]) -> pd.DataFrame:
+    """
+    批次抓：last_close、vol_ratio(20D)
+    回傳 columns: Symbol, Price, Vol_Ratio, source
+    """
+    out = pd.DataFrame({"Symbol": symbols})
+    out["Price"] = None
+    out["Vol_Ratio"] = None
+    out["source"] = "NONE"
+
+    if not symbols:
+        return out
+
+    try:
+        df = yf.download(
+            symbols,
+            period="6mo",
+            interval="1d",
+            auto_adjust=False,
+            progress=False,
+            group_by="ticker",
+            threads=False,
+        )
+    except Exception as e:
+        warnings_bus.push("YF_BATCH_FAIL", f"yfinance batch fail: {e}", {"n": len(symbols)})
+        return out
+
+    if df is None or df.empty:
+        warnings_bus.push("YF_BATCH_EMPTY", "yfinance batch returned empty dataframe", {"n": len(symbols)})
+        return out
+
+    # df 可能是：
+    # - 多標的：columns MultiIndex (Ticker, Field)
+    # - 單標的：columns 單層 (Open/High/Low/Close/Adj Close/Volume)
+    for sym in symbols:
+        try:
+            if isinstance(df.columns, pd.MultiIndex):
+                if sym not in df.columns.get_level_values(0):
+                    warnings_bus.push("YF_SYMBOL_MISSING", f"{sym} missing in batch", {"symbol": sym})
+                    continue
+                close = df[(sym, "Close")].dropna()
+                vol = df[(sym, "Volume")].dropna()
+            else:
+                # 單一標的情境：df 就是該 symbol
+                close = df["Close"].dropna() if "Close" in df.columns else pd.Series(dtype=float)
+                vol = df["Volume"].dropna() if "Volume" in df.columns else pd.Series(dtype=float)
+
+            price = float(close.iloc[-1]) if len(close) else None
+            vol_ratio = None
+            if len(vol) >= 20:
+                ma20 = float(vol.rolling(20).mean().iloc[-1])
+                if ma20 and ma20 > 0:
+                    vol_ratio = float(vol.iloc[-1] / ma20)
+
+            out.loc[out["Symbol"] == sym, "Price"] = price
+            out.loc[out["Symbol"] == sym, "Vol_Ratio"] = vol_ratio
+            out.loc[out["Symbol"] == sym, "source"] = "YF"
+
+        except Exception as e:
+            warnings_bus.push("YF_SYMBOL_FAIL", f"{sym} yfinance parse fail: {e}", {"symbol": sym})
+            continue
+
+    return out
+
+
+# =========================
+# Regime metrics (scalar-only)
+# =========================
 def _as_close_series(df: pd.DataFrame) -> pd.Series:
     if df is None or df.empty:
         raise ValueError("market_df is empty")
-    if "Close" not in df.columns:
+    if "Close" in df.columns:
+        s = df["Close"]
+    elif "close" in df.columns:
+        s = df["close"]
+    else:
         raise ValueError("Close column not found")
-    s = df["Close"]
     if isinstance(s, pd.DataFrame):
         s = s.iloc[:, 0]
-    s = pd.to_numeric(s, errors="coerce").astype(float)
-    return s
+    return s.astype(float)
 
 
-def _extract_close_price(market_df: pd.DataFrame) -> Optional[float]:
+def compute_regime_metrics(market_df: pd.DataFrame) -> dict:
+    """
+    SMR / Slope5 / momentum_lock / drawdown_pct
+    drawdown_pct：改為「當前距離近一年(252D)高點回撤」，避免 ATH 卻觸發 CRASH_RISK
+    """
+    if market_df is None or market_df.empty or len(market_df) < 260:
+        return {
+            "SMR": None,
+            "SMR_MA5": None,
+            "Slope5": None,
+            "NEGATIVE_SLOPE_5D": True,
+            "MOMENTUM_LOCK": False,
+            "drawdown_pct": None,
+            "drawdown_window_days": 252,
+        }
+
+    close = _as_close_series(market_df)
+
+    ma200 = close.rolling(200).mean()
+    smr_series = ((close - ma200) / ma200).dropna()
+    if len(smr_series) < 10:
+        return {
+            "SMR": None,
+            "SMR_MA5": None,
+            "Slope5": None,
+            "NEGATIVE_SLOPE_5D": True,
+            "MOMENTUM_LOCK": False,
+            "drawdown_pct": None,
+            "drawdown_window_days": 252,
+        }
+
+    smr = float(smr_series.iloc[-1])
+    smr_ma5 = smr_series.rolling(5).mean().dropna()
+    slope5 = float(smr_ma5.iloc[-1] - smr_ma5.iloc[-2]) if len(smr_ma5) >= 2 else 0.0
+
+    recent_slopes = smr_ma5.diff().dropna().iloc[-5:]
+    negative_slope_5d = bool((recent_slopes < -EPS).all()) if len(recent_slopes) else True
+
+    momentum_lock = False
+    if len(smr_ma5) >= 5:
+        last4 = smr_ma5.diff().dropna().iloc[-4:]
+        momentum_lock = bool((last4 > EPS).all()) if len(last4) == 4 else False
+
+    # trailing drawdown: current vs rolling 252D high
+    window = 252
+    rolling_high = close.rolling(window).max()
+    if np.isnan(rolling_high.iloc[-1]):
+        drawdown_pct = None
+    else:
+        drawdown_pct = float(close.iloc[-1] / rolling_high.iloc[-1] - 1.0)
+
+    return {
+        "SMR": smr,
+        "SMR_MA5": float(smr_ma5.iloc[-1]) if len(smr_ma5) else None,
+        "Slope5": slope5,
+        "NEGATIVE_SLOPE_5D": negative_slope_5d,
+        "MOMENTUM_LOCK": momentum_lock,
+        "drawdown_pct": drawdown_pct,
+        "drawdown_window_days": window,
+    }
+
+
+def _calc_ma14_monthly_from_daily(df_daily: pd.DataFrame) -> Optional[float]:
     try:
-        if market_df is None or market_df.empty:
+        if df_daily is None or df_daily.empty:
             return None
-        df = market_df.copy()
-        if "Datetime" in df.columns:
-            df["Datetime"] = pd.to_datetime(df["Datetime"])
-            df = df.sort_values("Datetime")
-        close = pd.to_numeric(df["Close"], errors="coerce").dropna()
-        if close.empty:
-            return None
-        return float(close.iloc[-1])
-    except Exception:
-        return None
-
-
-def _calc_ma14_monthly_from_daily(market_df: pd.DataFrame) -> Optional[float]:
-    try:
-        if market_df is None or market_df.empty:
-            return None
-        df = market_df.copy()
+        df = df_daily.copy()
         df["Datetime"] = pd.to_datetime(df["Datetime"])
-        df = df.set_index("Datetime").sort_index()
-        close = _as_close_series(df).dropna()
+        df = df.set_index("Datetime")
+        close = _as_close_series(df)
         monthly = close.resample("M").last().dropna()
         if len(monthly) < 14:
             return None
         ma14 = monthly.rolling(14).mean().dropna()
-        if ma14.empty:
-            return None
-        return float(ma14.iloc[-1])
+        return float(ma14.iloc[-1]) if len(ma14) else None
     except Exception:
         return None
 
 
-def _count_close_below_ma_days(market_df: pd.DataFrame, ma14_monthly: Optional[float]) -> int:
+def _extract_close_price(df_daily: pd.DataFrame) -> Optional[float]:
     try:
-        if ma14_monthly is None or market_df is None or market_df.empty:
+        if df_daily is None or df_daily.empty:
+            return None
+        close = df_daily["Close"].dropna()
+        return float(close.iloc[-1]) if len(close) else None
+    except Exception:
+        return None
+
+
+def _count_close_below_ma_days(df_daily: pd.DataFrame, ma14_monthly: Optional[float]) -> int:
+    try:
+        if ma14_monthly is None or df_daily is None or df_daily.empty:
             return 0
-        df = market_df.copy()
-        df["Datetime"] = pd.to_datetime(df["Datetime"])
-        df = df.sort_values("Datetime")
-        close = pd.to_numeric(df["Close"], errors="coerce").dropna()
-        if close.empty:
+        close = df_daily["Close"].dropna()
+        if len(close) < 2:
             return 0
 
         thresh = float(ma14_monthly) * 0.96
@@ -387,122 +547,38 @@ def _count_close_below_ma_days(market_df: pd.DataFrame, ma14_monthly: Optional[f
         return 0
 
 
-def fetch_last_price_and_volratio(symbol: str) -> Tuple[Optional[float], Optional[float], str]:
-    """
-    回傳 (Price, Vol_Ratio, source_tag)
-    Vol_Ratio = 今日量 / 20日均量
-    """
-    try:
-        h = fetch_history(symbol, period="6mo", interval="1d")
-        if h is None or h.empty:
-            return None, None, "NONE"
-
-        h = h.copy()
-        h["Datetime"] = pd.to_datetime(h["Datetime"])
-        h = h.sort_values("Datetime")
-
-        close = pd.to_numeric(h["Close"], errors="coerce").dropna()
-        vol = pd.to_numeric(h["Volume"], errors="coerce").dropna()
-
-        px = float(close.iloc[-1]) if not close.empty else None
-
-        vr = None
-        if len(vol) >= 20:
-            ma20 = vol.rolling(20).mean().iloc[-1]
-            if pd.notna(ma20) and float(ma20) > 0:
-                vr = float(vol.iloc[-1] / ma20)
-
-        return px, vr, "YF"
-    except Exception as e:
-        warnings_bus.push("YF_SYMBOL_FAIL", f"{symbol} yfinance parse fail: {e}", {"symbol": symbol})
-        return None, None, "NONE"
-
-
 # =========================
-# Predator V16.3：Regime metrics / regime pick / layer classify
+# pick_regime (兼容 vixpanic / vipxanic)
 # =========================
-def compute_regime_metrics(market_df: pd.DataFrame = None) -> dict:
-    """
-    回傳 dict，所有欄位皆為 scalar（不含 Series）
-    """
-    try:
-        if market_df is None or len(market_df) < 60:
-            return {"SMR": None, "SMR_MA5": None, "Slope5": None, "NEGATIVE_SLOPE_5D": True, "MOMENTUM_LOCK": False, "drawdown_pct": None}
-
-        df = market_df.copy()
-        if "Datetime" in df.columns:
-            df["Datetime"] = pd.to_datetime(df["Datetime"])
-            df = df.sort_values("Datetime")
-
-        close = pd.to_numeric(df["Close"], errors="coerce").dropna()
-        if len(close) < 60:
-            return {"SMR": None, "SMR_MA5": None, "Slope5": None, "NEGATIVE_SLOPE_5D": True, "MOMENTUM_LOCK": False, "drawdown_pct": None}
-
-        ma200 = close.rolling(200).mean()
-        smr_series = (close - ma200) / ma200
-        smr_series = smr_series.dropna()
-        if len(smr_series) < 6:
-            return {"SMR": None, "SMR_MA5": None, "Slope5": None, "NEGATIVE_SLOPE_5D": True, "MOMENTUM_LOCK": False, "drawdown_pct": None}
-
-        smr = float(smr_series.iloc[-1])
-
-        smr_ma5 = smr_series.rolling(5).mean().dropna()
-        slope5 = 0.0
-        if len(smr_ma5) >= 2:
-            slope5 = float(smr_ma5.iloc[-1] - smr_ma5.iloc[-2])
-
-        # NEGATIVE_SLOPE_5D：最近 5 個 slope 是否全部 < -EPS
-        negative_slope_5d = True
-        d = smr_ma5.diff().dropna()
-        if len(d) >= 5:
-            negative_slope_5d = bool((d.iloc[-5:] < -EPS).all())
-        else:
-            negative_slope_5d = True
-
-        # MOMENTUM_LOCK：最近 4 天 slope 是否全部 > EPS
-        momentum_lock = False
-        if len(d) >= 4:
-            momentum_lock = bool((d.iloc[-4:] > EPS).all())
-
-        # Drawdown：相對歷史最高點的最大回撤（應接近 0 表示創高）
-        rolling_high = close.cummax()
-        drawdown_series = (close - rolling_high) / rolling_high
-        drawdown_pct = float(drawdown_series.min()) if len(drawdown_series) else None
-
-        return {
-            "SMR": smr,
-            "SMR_MA5": float(smr_ma5.iloc[-1]) if len(smr_ma5) else None,
-            "Slope5": slope5,
-            "NEGATIVE_SLOPE_5D": negative_slope_5d,
-            "MOMENTUM_LOCK": momentum_lock,
-            "drawdown_pct": drawdown_pct,
-        }
-    except Exception as e:
-        warnings_bus.push("REGIME_METRICS_FAIL", f"compute_regime_metrics fail: {e}", {})
-        return {"SMR": None, "SMR_MA5": None, "Slope5": None, "NEGATIVE_SLOPE_5D": True, "MOMENTUM_LOCK": False, "drawdown_pct": None}
-
-
 def pick_regime(
     metrics: dict,
-    vix: float = None,
-    ma14_monthly: float = None,
-    close_price: float = None,
+    vix: Optional[float] = None,
+    ma14_monthly: Optional[float] = None,
+    close_price: Optional[float] = None,
     close_below_ma_days: int = 0,
-    **_ignored,  # ✅ 防炸：吃掉未使用參數，避免 TypeError（你現在遇到的那種）
-) -> tuple:
+    vix_panic: float = 35.0,
+    **kwargs,
+) -> Tuple[str, float]:
     """
     回傳 (regime_name, max_equity_pct)
-    V16.3: HIBERNATION 放寬至 2日 × 0.96
+    - vix_panic：VIX panic 門檻，預設 35
+    - **kwargs：吞掉你專案裡舊參數（vixpanic / vipxanic 等），避免 TypeError
     """
+    # 吞掉常見錯字/舊欄位
+    if "vixpanic" in kwargs and kwargs["vixpanic"] is not None:
+        vix_panic = float(kwargs["vixpanic"])
+    if "vipxanic" in kwargs and kwargs["vipxanic"] is not None:
+        vix_panic = float(kwargs["vipxanic"])  # 兼容你截圖的參數名
+
     smr = metrics.get("SMR")
     slope5 = metrics.get("Slope5")
     drawdown = metrics.get("drawdown_pct")
 
-    # CRASH_RISK（數據層）
-    if (vix is not None and float(vix) > 35) or (drawdown is not None and float(drawdown) <= -0.18):
+    # --- CRASH_RISK (改用 trailing drawdown：<= -18%) ---
+    if (vix is not None and float(vix) > float(vix_panic)) or (drawdown is not None and float(drawdown) <= -0.18):
         return "CRASH_RISK", 0.10
 
-    # HIBERNATION（長期均線跌破）
+    # --- HIBERNATION（2日 × 0.96） ---
     if (
         ma14_monthly is not None
         and close_price is not None
@@ -511,234 +587,81 @@ def pick_regime(
     ):
         return "HIBERNATION", 0.20
 
-    # MEAN_REVERSION / OVERHEAT
+    # --- MEAN_REVERSION / OVERHEAT ---
     if smr is not None and slope5 is not None:
         if float(smr) > 0.25 and float(slope5) < -EPS:
             return "MEAN_REVERSION", 0.45
         if float(smr) > 0.25 and float(slope5) >= -EPS:
             return "OVERHEAT", 0.55
 
-    # CONSOLIDATION（簡化：SMR 落在區間）
+    # --- CONSOLIDATION ---
     if smr is not None and 0.08 <= float(smr) <= 0.18:
         return "CONSOLIDATION", 0.65
 
+    # --- NORMAL ---
     return "NORMAL", 0.85
 
 
+# =========================
+# Layer logic
+# =========================
 def classify_layer(regime: str, momentum_lock: bool, vol_ratio: Optional[float], inst: dict) -> str:
     foreign_buy = bool(inst.get("foreign_buy", False))
     trust_buy = bool(inst.get("trust_buy", False))
     inst_streak3 = int(inst.get("inst_streak3", 0))
 
-    # Layer A+
     if foreign_buy and trust_buy and inst_streak3 >= 3:
         return "A+"
-
-    # Layer A
     if (foreign_buy or trust_buy) and inst_streak3 >= 3:
         return "A"
 
-    # Layer B
     vr = _safe_float(vol_ratio, None)
-    if (
-        bool(momentum_lock)
-        and (vr is not None and float(vr) > 0.8)
-        and regime in ["NORMAL", "OVERHEAT", "CONSOLIDATION"]
-    ):
+    if bool(momentum_lock) and (vr is not None and float(vr) > 0.8) and regime in ["NORMAL", "OVERHEAT", "CONSOLIDATION"]:
         return "B"
 
     return "NONE"
 
 
 # =========================
-# FinMind：法人資料（淨買賣）
+# Kill-Switch (V16.2 Enhanced) — 併入 V16.3
 # =========================
-def _fm_headers(token: Optional[str]) -> dict:
-    if token:
-        return {"Authorization": f"Bearer {token}"}
-    return {}
-
-
-def _fm_get(dataset: str, params: dict, token: Optional[str]) -> dict:
-    p = {"dataset": dataset, **params}
-    r = requests.get(FINMIND_URL, headers=_fm_headers(token), params=p, timeout=30)
-    r.raise_for_status()
-    return r.json()
-
-
-def normalize_inst_direction(net: float) -> str:
-    net = float(net or 0.0)
-    if abs(net) < NEUTRAL_THRESHOLD:
-        return "NEUTRAL"
-    return "POSITIVE" if net > 0 else "NEGATIVE"
-
-
-def fetch_finmind_institutional(symbols: List[str], start_date: str, end_date: str, token: Optional[str]) -> pd.DataFrame:
-    """
-    回傳欄位：date, symbol, net_amount（A_NAMES 合計）
-    """
-    rows = []
-    for sym in symbols:
-        stock_id = sym.replace(".TW", "").strip()
-        try:
-            js = _fm_get(
-                dataset="TaiwanStockInstitutionalInvestorsBuySell",
-                params={"data_id": stock_id, "start_date": start_date, "end_date": end_date},
-                token=token,
-            )
-            data = js.get("data", []) or []
-            if not data:
-                continue
-            df = pd.DataFrame(data)
-            need = {"date", "stock_id", "buy", "name", "sell"}
-            if not need.issubset(set(df.columns)):
-                continue
-
-            df["buy"] = pd.to_numeric(df["buy"], errors="coerce").fillna(0)
-            df["sell"] = pd.to_numeric(df["sell"], errors="coerce").fillna(0)
-
-            df = df[df["name"].isin(A_NAMES)].copy()
-            if df.empty:
-                continue
-
-            df["net"] = df["buy"] - df["sell"]
-            g = df.groupby("date", as_index=False)["net"].sum()
-            for _, r in g.iterrows():
-                rows.append({"date": str(r["date"]), "symbol": sym, "net_amount": float(r["net"])})
-        except Exception as e:
-            warnings_bus.push("FINMIND_INST_FAIL", f"{sym} finmind inst fail: {e}", {"symbol": sym})
-
-    if not rows:
-        return pd.DataFrame(columns=["date", "symbol", "net_amount"])
-    return pd.DataFrame(rows).sort_values(["symbol", "date"])
-
-
-def calc_inst_3d(inst_df: pd.DataFrame, symbol: str) -> dict:
-    """
-    回傳：
-    - foreign_buy/trust_buy：布林（此版簡化：使用同一個 net_amount 當作兩者，維持一致可回溯）
-    - inst_streak3：3 或 0（連 3 日同向才給 3）
-    - Inst_Status, Inst_Dir3, Inst_Net_3d：除錯/稽核用
-    """
-    if inst_df is None or inst_df.empty:
-        return {"foreign_buy": False, "trust_buy": False, "inst_streak3": 0, "Inst_Status": "PENDING", "Inst_Dir3": "PENDING", "Inst_Net_3d": 0.0}
-
-    df = inst_df[inst_df["symbol"] == symbol].copy()
-    if df.empty:
-        return {"foreign_buy": False, "trust_buy": False, "inst_streak3": 0, "Inst_Status": "PENDING", "Inst_Dir3": "PENDING", "Inst_Net_3d": 0.0}
-
-    df = df.sort_values("date").tail(3)
-    if len(df) < 3:
-        return {"foreign_buy": False, "trust_buy": False, "inst_streak3": 0, "Inst_Status": "PENDING", "Inst_Dir3": "PENDING", "Inst_Net_3d": 0.0}
-
-    df["net_amount"] = pd.to_numeric(df["net_amount"], errors="coerce").fillna(0)
-    dirs = [normalize_inst_direction(x) for x in df["net_amount"]]
-    net_sum = float(df["net_amount"].sum())
-
-    # 連3日同向才 streak=3
-    if all(d == "POSITIVE" for d in dirs):
-        return {"foreign_buy": True, "trust_buy": True, "inst_streak3": 3, "Inst_Status": "READY", "Inst_Dir3": "POSITIVE", "Inst_Net_3d": net_sum}
-    if all(d == "NEGATIVE" for d in dirs):
-        return {"foreign_buy": False, "trust_buy": False, "inst_streak3": 3, "Inst_Status": "READY", "Inst_Dir3": "NEGATIVE", "Inst_Net_3d": net_sum}
-
-    # NEUTRAL / 混合
-    # foreign_buy / trust_buy 仍可用「三日淨額」作方向，但 streak 不給
-    foreign_buy = bool(net_sum > NEUTRAL_THRESHOLD)
-    trust_buy = bool(net_sum > NEUTRAL_THRESHOLD)
-    return {"foreign_buy": foreign_buy, "trust_buy": trust_buy, "inst_streak3": 0, "Inst_Status": "READY", "Inst_Dir3": "NEUTRAL", "Inst_Net_3d": net_sum}
-
-
-def build_institutional_panel(symbols: List[str], trade_date: str, finmind_token: Optional[str]) -> pd.DataFrame:
-    """
-    產出欄位（供 UI 顯示 & Layer 判定用）：
-    Symbol, Foreign_Net, Trust_Net, Inst_Streak3, Inst_Status, Inst_Dir3, Inst_Net_3d
-    """
-    # 取 trade_date 往回抓 10 天（足夠覆蓋 3 個交易日）
-    # 注意：FinMind 用 YYYY-MM-DD
-    try:
-        start = (pd.to_datetime(trade_date) - pd.Timedelta(days=14)).strftime("%Y-%m-%d")
-        end = trade_date
-    except Exception:
-        start = trade_date
-        end = trade_date
-
-    inst_df = fetch_finmind_institutional(symbols, start, end, token=finmind_token)
-
-    rows = []
-    for sym in symbols:
-        m = calc_inst_3d(inst_df, sym)
-        # 此版的 Foreign_Net / Trust_Net 先用 Inst_Net_3d（保持可回溯一致），你之後要拆外資/投信可再擴充
-        rows.append(
-            {
-                "Symbol": sym,
-                "Foreign_Net": float(m.get("Inst_Net_3d", 0.0)),
-                "Trust_Net": float(m.get("Inst_Net_3d", 0.0)),
-                "Inst_Streak3": int(m.get("inst_streak3", 0)),
-                "Inst_Status": m.get("Inst_Status", "PENDING"),
-                "Inst_Dir3": m.get("Inst_Dir3", "PENDING"),
-                "Inst_Net_3d": float(m.get("Inst_Net_3d", 0.0)),
-            }
-        )
-    return pd.DataFrame(rows)
-
-
-def inst_metrics_for_symbol(panel: pd.DataFrame, symbol: str) -> dict:
-    if panel is None or panel.empty:
-        return {"foreign_buy": False, "trust_buy": False, "inst_streak3": 0}
-
-    df = panel[panel["Symbol"] == symbol]
-    if df.empty:
-        return {"foreign_buy": False, "trust_buy": False, "inst_streak3": 0}
-
-    row = df.iloc[-1]
-    foreign_buy = bool(_safe_float(row.get("Foreign_Net", 0), 0) > NEUTRAL_THRESHOLD)
-    trust_buy = bool(_safe_float(row.get("Trust_Net", 0), 0) > NEUTRAL_THRESHOLD)
-    inst_streak3 = int(_safe_int(row.get("Inst_Streak3", 0), 0) or 0)
-    return {"foreign_buy": foreign_buy, "trust_buy": trust_buy, "inst_streak3": inst_streak3}
-
-
-# =========================
-# Kill-Switch：資料完整性評分/決策
-# =========================
-def compute_integrity(stocks: List[dict], amount: MarketAmount) -> dict:
-    n = int(len(stocks))
+def compute_integrity_and_kill(
+    stocks: List[dict],
+    amount: MarketAmount,
+) -> dict:
+    n = len(stocks)
     price_null = sum(1 for s in stocks if s.get("Price") is None)
     volratio_null = sum(1 for s in stocks if s.get("Vol_Ratio") is None)
 
-    # 核心欄位定義（可再擴充）
-    # 目前核心：Price、Vol_Ratio、amount_total
-    core_total = n * 2 + 1  # 每檔 2 個 + 市場 1 個
-    core_missing = price_null + volratio_null + (1 if amount.amount_total is None else 0)
-    core_missing_pct = float(core_missing / core_total) if core_total > 0 else 1.0
+    amount_total_null = (amount.amount_total is None)
+    # 核心缺失率：Price + Vol_Ratio + amount_total  三塊
+    denom = max(1, (2 * n + 1))
+    core_missing = price_null + volratio_null + (1 if amount_total_null else 0)
+    core_missing_pct = float(core_missing / denom)
 
-    price_null_ratio = float(price_null / n) if n > 0 else 1.0
-    volratio_null_ratio = float(volratio_null / n) if n > 0 else 1.0
-
+    # Kill 觸發條件（你貼的規則：核心缺失 > 50% / 兩項全滅 / amount 全滅）
     kill = False
     reasons = []
-
-    if core_missing_pct > KILL_CORE_MISSING_THRESHOLD:
-        kill = True
-        reasons.append(f"core_missing_pct={core_missing_pct:.2f} > {KILL_CORE_MISSING_THRESHOLD:.2f}")
-
-    if price_null_ratio >= KILL_REQUIRE_PRICE_RATIO and n > 0:
+    if n > 0 and price_null == n:
         kill = True
         reasons.append(f"price_null={price_null}/{n}")
-
-    if volratio_null_ratio >= KILL_REQUIRE_VOLRATIO_RATIO and n > 0:
+    if n > 0 and volratio_null == n:
         kill = True
         reasons.append(f"volratio_null={volratio_null}/{n}")
-
-    if amount.amount_total is None:
+    if amount_total_null:
         reasons.append("amount_total_null=True")
+    if core_missing_pct >= 0.50:
+        kill = True
+        reasons.append(f"core_missing_pct={core_missing_pct:.2f}")
 
     reason = "DATA_MISSING " + ", ".join(reasons) if reasons else "OK"
 
     return {
         "n": n,
-        "price_null": int(price_null),
-        "volratio_null": int(volratio_null),
-        "core_missing_pct": float(core_missing_pct),
+        "price_null": price_null,
+        "volratio_null": volratio_null,
+        "core_missing_pct": core_missing_pct,
+        "amount_total_null": amount_total_null,
         "kill": bool(kill),
         "reason": reason,
     }
@@ -752,13 +675,13 @@ def build_active_alerts(integrity: dict, amount: MarketAmount) -> List[str]:
     if amount.amount_total is None:
         alerts.append("DEGRADED_AMOUNT: 成交量數據完全缺失 (TWSE_FAIL + TPEX_FAIL)")
 
-    n = int(integrity.get("n", 0) or 0)
-    if n > 0 and int(integrity.get("price_null", 0)) == n:
+    n = int(integrity.get("n") or 0)
+    if n > 0 and int(integrity.get("price_null") or 0) == n:
         alerts.append("CRITICAL: 所有個股價格 = null (無法執行任何決策)")
-    if n > 0 and int(integrity.get("volratio_null", 0)) == n:
+    if n > 0 and int(integrity.get("volratio_null") or 0) == n:
         alerts.append("CRITICAL: 所有個股 Vol_Ratio = null (Layer B 判定不可能)")
 
-    cm = float(integrity.get("core_missing_pct", 0.0) or 0.0)
+    cm = float(integrity.get("core_missing_pct") or 0.0)
     if cm >= 0.50:
         alerts.append(f"DATA_INTEGRITY_FAILURE: 核心數據缺失率={cm:.2f}")
 
@@ -769,8 +692,13 @@ def build_active_alerts(integrity: dict, amount: MarketAmount) -> List[str]:
 
 
 # =========================
-# Build arbiter input (with Kill-Switch)
+# Arbiter input builder
 # =========================
+def _default_symbols_pool(topn: int) -> List[str]:
+    pool = ["2330.TW", "2317.TW", "2454.TW", "2308.TW", "2881.TW", "2882.TW", "2603.TW", "2609.TW"]
+    return pool[: max(1, int(topn))]
+
+
 def build_arbiter_input(
     session: str,
     account_mode: str,
@@ -781,113 +709,132 @@ def build_arbiter_input(
     allow_insecure_ssl: bool,
     finmind_token: Optional[str],
 ) -> Tuple[dict, List[dict]]:
-    # ---- Market data ----
-    twii_df = fetch_history(TWII_SYMBOL, period="3y", interval="1d")
+    # --- market history ---
+    twii_df = fetch_history(TWII_SYMBOL, period="5y", interval="1d")
     vix_df = fetch_history(VIX_SYMBOL, period="2y", interval="1d")
 
     vix_last = None
-    try:
-        if not vix_df.empty:
-            vix_last = float(pd.to_numeric(vix_df["Close"], errors="coerce").dropna().iloc[-1])
-    except Exception:
-        vix_last = None
+    if not vix_df.empty and "Close" in vix_df.columns:
+        v = vix_df["Close"].dropna()
+        vix_last = float(v.iloc[-1]) if len(v) else None
 
-    # ---- Metrics ----
-    metrics = compute_regime_metrics(twii_df)
-    ma14_monthly = _calc_ma14_monthly_from_daily(twii_df)
+    # --- compute metrics ---
+    metrics = compute_regime_metrics(twii_df) if not twii_df.empty else {
+        "SMR": None, "Slope5": None, "MOMENTUM_LOCK": False, "drawdown_pct": None, "drawdown_window_days": 252
+    }
     close_price = _extract_close_price(twii_df)
+    ma14_monthly = _calc_ma14_monthly_from_daily(twii_df)
     close_below_days = _count_close_below_ma_days(twii_df, ma14_monthly)
 
+    # --- regime (先依 V16.3 算；若 Kill-Switch 觸發，後面覆蓋為 UNKNOWN / 0%) ---
     regime, max_equity = pick_regime(
         metrics=metrics,
         vix=vix_last,
         ma14_monthly=ma14_monthly,
         close_price=close_price,
         close_below_ma_days=close_below_days,
+        # 若你專案仍有 vixpanic/vipxanic 參數會傳進來，也不會炸
     )
 
-    # ---- Market amount ----
+    # --- market amount ---
     amount = fetch_amount_total(allow_insecure_ssl=allow_insecure_ssl)
 
-    # ---- Symbols（固定池 + positions 代碼補入）----
-    default_pool = ["2330.TW", "2317.TW", "2454.TW", "2308.TW", "2881.TW", "2882.TW", "2603.TW", "2609.TW"]
-    pos_syms = []
-    for p in positions:
-        if isinstance(p, dict) and p.get("symbol"):
-            pos_syms.append(str(p["symbol"]).strip())
-    symset = list(dict.fromkeys(pos_syms + default_pool))
-    symbols = symset[: max(1, int(topn))]
+    # --- symbols ---
+    symbols = _default_symbols_pool(topn)
 
-    # ---- Trade date ----
+    # --- prices & vol_ratio (robust batch) ---
+    pv = fetch_batch_prices_volratio(symbols)
+
+    # --- FinMind institutional (3D) ---
+    # 取最近 7 天的資料以確保涵蓋 3 個交易日（遇到連假/週末不會缺）
     trade_date = None
-    try:
-        if not twii_df.empty:
-            trade_date = pd.to_datetime(twii_df["Datetime"].dropna().iloc[-1]).strftime("%Y-%m-%d")
-    except Exception:
-        trade_date = None
+    if not twii_df.empty and "Datetime" in twii_df.columns:
+        trade_date = pd.to_datetime(twii_df["Datetime"].dropna().iloc[-1]).strftime("%Y-%m-%d")
 
-    # ---- Institutional panel（FinMind）----
-    inst_panel = build_institutional_panel(symbols, trade_date or time.strftime("%Y-%m-%d"), finmind_token=finmind_token)
+    end_date = trade_date or time.strftime("%Y-%m-%d", time.localtime())
+    start_date = (pd.to_datetime(end_date) - pd.Timedelta(days=10)).strftime("%Y-%m-%d")
 
-    # ---- Per-stock snapshot ----
+    inst_df = fetch_finmind_institutional(symbols, start_date=start_date, end_date=end_date, token=finmind_token)
+    panel_rows = []
+    inst_map = {}  # Symbol -> inst dict for layer
+    for sym in symbols:
+        inst3 = calc_inst_3d(inst_df, sym)
+        # 這裡先用同一套 net 做 Foreign/Trust（你之後若拆分外資/投信，可改這兩欄）
+        net3 = float(inst3.get("Inst_Net_3d", 0.0))
+        panel_rows.append(
+            {
+                "Symbol": sym,
+                "Foreign_Net": net3,
+                "Trust_Net": net3,
+                "Inst_Streak3": int(inst3.get("Inst_Streak3", 0)),
+                "Inst_Status": inst3.get("Inst_Status", "PENDING"),
+                "Inst_Dir3": inst3.get("Inst_Dir3", "PENDING"),
+                "Inst_Net_3d": net3,
+                "inst_source": "FINMIND_3D_NET",
+            }
+        )
+        inst_map[sym] = {
+            "foreign_buy": bool(net3 > 0),
+            "trust_buy": bool(net3 > 0),
+            "inst_streak3": int(inst3.get("Inst_Streak3", 0)),
+        }
+
+    institutional_panel = pd.DataFrame(panel_rows)
+
+    # --- stocks snapshot ---
     stocks = []
     for i, sym in enumerate(symbols, start=1):
-        px, vr, src = fetch_last_price_and_volratio(sym)
+        row = pv[pv["Symbol"] == sym].iloc[0] if not pv.empty and (pv["Symbol"] == sym).any() else None
+        price = None if row is None else row["Price"]
+        vol_ratio = None if row is None else row["Vol_Ratio"]
 
-        if px is None:
-            warnings_bus.push("PRICE_NULL", f"{sym} Price is null after fallback (YF)", {"source": src, "symbol": sym})
-        if vr is None:
-            warnings_bus.push("VOLRATIO_NULL", f"{sym} Vol_Ratio is null after fallback (YF)", {"source": src, "symbol": sym})
+        if price is None:
+            warnings_bus.push("PRICE_NULL", f"{sym} Price is null after yfinance batch", {"symbol": sym})
+        if vol_ratio is None:
+            warnings_bus.push("VOLRATIO_NULL", f"{sym} Vol_Ratio is null after yfinance batch", {"symbol": sym})
 
-        im = inst_metrics_for_symbol(inst_panel, sym)
-        layer = classify_layer(regime, bool(metrics.get("MOMENTUM_LOCK", False)), vr, im)
+        inst = inst_map.get(sym, {"foreign_buy": False, "trust_buy": False, "inst_streak3": 0})
+        layer = classify_layer(regime, bool(metrics.get("MOMENTUM_LOCK", False)), vol_ratio, inst)
 
         stocks.append(
             {
                 "Symbol": sym,
-                "Name": sym,  # 你要中文名可之後接對照表
+                "Name": sym,  # TODO：你要中文名稱可在此用對照表替換
                 "Tier": i,
-                "Price": px,
-                "Vol_Ratio": vr,
+                "Price": None if pd.isna(price) else price,
+                "Vol_Ratio": None if pd.isna(vol_ratio) else vol_ratio,
                 "Layer": layer,
-                "Institutional": im,
+                "Institutional": inst,
             }
         )
 
-    # ---- Integrity / Kill-Switch ----
-    integrity = compute_integrity(stocks, amount)
+    # --- integrity + kill-switch ---
+    integrity = compute_integrity_and_kill(stocks, amount)
     active_alerts = build_active_alerts(integrity, amount)
 
-    # ---- Portfolio summary ----
+    # --- portfolio ---
     current_exposure_pct = 0.0
     if positions:
-        # 最小可跑：每個持倉估 5%（你之後可改成真實市值）
         current_exposure_pct = min(1.0, len(positions) * 0.05)
 
-    cash_pct = 100.0 - float(current_exposure_pct * 100.0)
-    cash_pct = max(0.0, min(100.0, cash_pct))
-
-    # ---- Kill 覆寫（SHELTER / UNKNOWN / max_equity=0）----
-    audit_log: List[dict] = []
-    market_status = "NORMAL"
+    # --- market_status + override when kill ---
+    market_status = "NORMAL" if (amount.amount_total is not None) else "DEGRADED"
     final_regime = regime
     final_max_equity = max_equity
 
-    if integrity.get("kill"):
+    audit_log = []
+    if integrity["kill"]:
         market_status = "SHELTER"
         final_regime = "UNKNOWN"
         final_max_equity = 0.0
-
-        # 全部 Layer 強制 NONE（避免任何進場）
-        for s in stocks:
-            s["Layer"] = "NONE"
+        current_exposure_pct = 0.0
 
         audit_log.append(
             {
                 "symbol": "ALL",
                 "event": "KILL_SWITCH_TRIGGERED",
                 "attribution": "DATA_MISSING",
-                "comment": integrity.get("reason", "DATA_MISSING"),
+                "comment": integrity["reason"],
             }
         )
         audit_log.append(
@@ -895,7 +842,7 @@ def build_arbiter_input(
                 "symbol": "ALL",
                 "event": "DEGRADED_STATUS_CRITICAL",
                 "attribution": "MARKET_AMOUNT_FAILURE",
-                "comment": f"amount_total={amount.amount_total}, source_twse={amount.source_twse}, source_tpex={amount.source_tpex}",
+                "comment": f"amount_total=None, source_twse={amount.source_twse}, source_tpex={amount.source_tpex}",
             }
         )
         audit_log.append(
@@ -906,16 +853,7 @@ def build_arbiter_input(
                 "comment": "核心哲學: In Doubt → Cash. 當前數據品質無法支持任何進場決策",
             }
         )
-        # 曝險強制 0（UI 顯示一致）
-        current_exposure_pct = 0.0
-        cash_pct = 100.0
 
-    else:
-        # amount_total 缺失但未達 kill → 降級
-        if amount.amount_total is None:
-            market_status = "DEGRADED"
-
-    # ---- Payload ----
     payload = {
         "meta": {
             "timestamp": _now_ts(),
@@ -923,7 +861,7 @@ def build_arbiter_input(
             "market_status": market_status,
             "current_regime": final_regime,
             "account_mode": account_mode,
-            "audit_tag": "V16.3_STABLE_HYBRID_WITH_KILL_SWITCH",
+            "audit_tag": "V16.3_STABLE_HYBRID_KILLSWITCH",
         },
         "macro": {
             "overview": {
@@ -933,24 +871,32 @@ def build_arbiter_input(
                 "smr": metrics.get("SMR"),
                 "slope5": metrics.get("Slope5"),
                 "drawdown_pct": metrics.get("drawdown_pct"),
+                "drawdown_window_days": metrics.get("drawdown_window_days"),
                 "ma14_monthly": ma14_monthly,
                 "close_below_ma_days": close_below_days,
-                "max_equity_allowed_pct": float(final_max_equity),
+                "max_equity_allowed_pct": final_max_equity,
             },
             "market_amount": asdict(amount),
-            "integrity": integrity,
+            "integrity": {
+                "n": integrity["n"],
+                "price_null": integrity["price_null"],
+                "volratio_null": integrity["volratio_null"],
+                "core_missing_pct": integrity["core_missing_pct"],
+                "kill": integrity["kill"],
+                "reason": integrity["reason"],
+            },
         },
         "portfolio": {
             "total_equity": int(total_equity),
             "cash_balance": int(cash_balance),
-            "current_exposure_pct": float(current_exposure_pct * 100.0),  # 用百分比顯示（0~100）
-            "cash_pct": float(cash_pct),
+            "current_exposure_pct": float(current_exposure_pct),
+            "cash_pct": float(100.0 * max(0.0, 1.0 - current_exposure_pct)),
             "active_alerts": active_alerts,
         },
-        "institutional_panel": inst_panel.to_dict(orient="records") if isinstance(inst_panel, pd.DataFrame) else [],
+        "institutional_panel": institutional_panel.to_dict(orient="records"),
         "stocks": stocks,
         "positions_input": positions,
-        "decisions": [],  # Arbiter 決策層（此 App 只輸出 input + 監控）
+        "decisions": [],
         "audit_log": audit_log,
     }
 
@@ -965,22 +911,23 @@ def main():
 
     session = st.sidebar.selectbox("Session", ["INTRADAY", "EOD"], index=0)
     account_mode = st.sidebar.selectbox("帳戶模式", ["Conservative", "Balanced", "Aggressive"], index=0)
-    topn = st.sidebar.selectbox("TopN（固定池化數量）", [8, 10, 15, 20, 30, 50], index=0)
+    topn = st.sidebar.selectbox("TopN（固定池化數量）", [8, 10, 15, 20, 30], index=0)
 
     allow_insecure_ssl = st.sidebar.checkbox("允許不安全 SSL (verify=False)", value=False)
 
     st.sidebar.subheader("FinMind")
     finmind_token = st.sidebar.text_input("FinMind Token（選填）", value="", type="password")
+    finmind_token = finmind_token.strip() or None
 
     st.sidebar.subheader("持倉（手動貼 JSON 陣列）")
-    positions_text = st.sidebar.text_area("positions", value="[]", height=140)
+    positions_text = st.sidebar.text_area("positions", value="[]", height=120)
 
-    cash_balance = st.sidebar.number_input("現金餘額（新台幣）", min_value=0, value=DEFAULT_CASH, step=10_000)
-    total_equity = st.sidebar.number_input("總權益（新台幣）", min_value=0, value=DEFAULT_EQUITY, step=10_000)
+    cash_balance = st.sidebar.number_input("現金餘額（新台幣）", min_value=0, value=DEFAULT_CASH, step=10000)
+    total_equity = st.sidebar.number_input("總權益（新台幣）", min_value=0, value=DEFAULT_EQUITY, step=10000)
 
     run_btn = st.sidebar.button("跑步")
 
-    # ---- Parse positions ----
+    # parse positions
     positions = []
     try:
         positions = json.loads(positions_text) if positions_text.strip() else []
@@ -1002,7 +949,7 @@ def main():
                 cash_balance=int(cash_balance),
                 total_equity=int(total_equity),
                 allow_insecure_ssl=bool(allow_insecure_ssl),
-                finmind_token=(finmind_token.strip() or None),
+                finmind_token=finmind_token,
             )
         except Exception as e:
             st.error("App 執行期間發生例外（已捕捉，不會白屏）。")
@@ -1010,37 +957,39 @@ def main():
             return
 
         ov = payload.get("macro", {}).get("overview", {})
+        meta = payload.get("meta", {})
         integrity = payload.get("macro", {}).get("integrity", {})
-        active_alerts = payload.get("portfolio", {}).get("active_alerts", [])
+        portfolio = payload.get("portfolio", {})
 
-        # ---- KPI ----
+        # KPI row
         c1, c2, c3, c4, c5, c6 = st.columns(6)
         c1.metric("交易日", ov.get("trade_date", "-"))
-        c2.metric("market_status", payload.get("meta", {}).get("market_status", "-"))
-        c3.metric("regime", payload.get("meta", {}).get("current_regime", "-"))
+        c2.metric("market_status", meta.get("market_status", "-"))
+        c3.metric("regime", meta.get("current_regime", "-"))
         c4.metric("SMR", f"{_safe_float(ov.get('smr'), 0):.6f}" if ov.get("smr") is not None else "NA")
         c5.metric("Slope5", f"{_safe_float(ov.get('slope5'), 0):.6f}" if ov.get("slope5") is not None else "NA")
-        c6.metric("Max Equity", f"{_pct(ov.get('max_equity_allowed_pct')):.1f}%" if ov.get("max_equity_allowed_pct") is not None else "NA")
+        c6.metric("Max Equity", f"{_pct01_to_pct100(ov.get('max_equity_allowed_pct')):.1f}%" if ov.get("max_equity_allowed_pct") is not None else "NA")
 
         st.caption(
-            f"Integrity | Price null={integrity.get('price_null')}/{integrity.get('n')} | "
-            f"Vol_Ratio null={integrity.get('volratio_null')}/{integrity.get('n')} | "
-            f"core_missing_pct={float(integrity.get('core_missing_pct', 0.0)):.2f}"
+            f"Integrity｜Price null={integrity.get('price_null')}/{integrity.get('n')}｜"
+            f"Vol_Ratio null={integrity.get('volratio_null')}/{integrity.get('n')}｜"
+            f"core_missing_pct={integrity.get('core_missing_pct'):.2f}"
         )
 
-        # ---- Active Alerts ----
+        # Active Alerts
         st.subheader("Active Alerts")
-        if active_alerts:
-            for a in active_alerts:
-                st.error(a) if ("CRITICAL" in a or "KILL" in a or "FAILURE" in a) else st.warning(a)
+        alerts = portfolio.get("active_alerts", []) or []
+        if alerts:
+            for a in alerts:
+                st.error(a) if "CRITICAL" in a or "KILL" in a else st.warning(a)
         else:
-            st.success("（目前沒有警示）")
+            st.success("（目前沒有 alerts）")
 
-        # ---- Market Amount ----
+        # Market amount
         st.subheader("市場成交金額（best-effort / 可稽核）")
-        st.code(_json_copyable(payload.get("macro", {}).get("market_amount", {})), language="json")
+        st.json(payload.get("macro", {}).get("market_amount", {}))
 
-        # ---- Indices snapshot ----
+        # Indices snapshot
         st.subheader("指數快照（簡版）")
         idx_rows = [
             {"symbol": TWII_SYMBOL, "name": "TAIEX", "last": ov.get("twii_close"), "asof": ov.get("trade_date")},
@@ -1048,50 +997,31 @@ def main():
         ]
         st.dataframe(pd.DataFrame(idx_rows), use_container_width=True)
 
-        # ---- Institutional panel ----
+        # FinMind panel
         st.subheader("法人面板（FinMind / Debug）")
-        ip = payload.get("institutional_panel", [])
-        ip_df = pd.DataFrame(ip)
-        if not ip_df.empty:
-            st.dataframe(ip_df, use_container_width=True)
-        else:
-            st.info("法人資料空（FinMind token 未填或 API 無資料）。")
+        inst_df = pd.DataFrame(payload.get("institutional_panel", []))
+        st.dataframe(inst_df, use_container_width=True)
 
-        # ---- Stocks table ----
+        # Stocks
         st.subheader("今日分析清單（TopN + 持倉）— Hybrid Layer")
         s_df = pd.json_normalize(payload.get("stocks", []))
-        if not s_df.empty:
-            if "Tier" in s_df.columns:
-                s_df = s_df.sort_values("Tier", ascending=True)
-            st.dataframe(s_df, use_container_width=True)
-        else:
-            st.info("stocks 清單為空（資料源可能暫時不可用）。")
+        st.dataframe(s_df, use_container_width=True)
 
-        # ---- Warnings ----
+        # Warnings
         st.subheader("Warnings（最新 50 條）")
         w_df = pd.DataFrame(warns)
         if not w_df.empty:
-            key_fail = w_df["code"].isin(
-                [
-                    "TWSE_AMOUNT_PARSE_FAIL",
-                    "TPEX_AMOUNT_PARSE_FAIL",
-                    "TWSE_AMOUNT_SSL_ERROR",
-                    "TPEX_AMOUNT_SSL_ERROR",
-                    "YF_FETCH_FAIL",
-                    "YF_SYMBOL_FAIL",
-                    "PRICE_NULL",
-                    "VOLRATIO_NULL",
-                    "FINMIND_INST_FAIL",
-                ]
+            key = w_df["code"].isin(
+                ["TWSE_AMOUNT_SSL_ERROR", "TPEX_AMOUNT_SSL_ERROR", "TPEX_AMOUNT_PARSE_FAIL", "YF_BATCH_FAIL", "YF_SYMBOL_FAIL", "PRICE_NULL", "VOLRATIO_NULL"]
             )
-            w_df = pd.concat([w_df[key_fail], w_df[~key_fail]], ignore_index=True)
+            w_df = pd.concat([w_df[key], w_df[~key]], ignore_index=True)
             st.dataframe(w_df, use_container_width=True)
         else:
             st.caption("（目前沒有 warnings）")
 
-        # ---- AI JSON（可複製：用 st.code 取代 st.json，會出現複製鍵）----
+        # AI JSON
         st.subheader("AI JSON（Arbiter Input）— 可回溯（SIM-FREE）")
-        st.code(_json_copyable(payload), language="json")
+        st.json(payload)
 
 
 if __name__ == "__main__":
