@@ -6,6 +6,8 @@
 # ✅ 修正 yfinance 取價/量比率偶發 TypeError（改為批次抓取 + 防呆展開）
 # ✅ drawdown_pct 改為「當前距離近一年高點回撤」(trailing 252D) 避免 ATH 卻 -28% 的誤判
 # ✅ 修正 _as_close_series() MultiIndex columns 問題
+# ✅ 修正 Active Alerts 顯示亂碼問題
+# ✅ 新增 JSON 一鍵複製功能 (st.code)
 # =========================================================
 
 from __future__ import annotations
@@ -39,7 +41,8 @@ EPS = 1e-4
 TWII_SYMBOL = "^TWII"
 VIX_SYMBOL = "^VIX"
 
-DEFAULT_TOPN = 8
+# 預設改為 20，符合您的戰術需求
+DEFAULT_TOPN = 20  
 DEFAULT_CASH = 2_000_000
 DEFAULT_EQUITY = 2_000_000
 
@@ -1055,12 +1058,15 @@ def main():
             f"core_missing_pct={integrity.get('core_missing_pct'):.2f}"
         )
 
-        # Active Alerts
+        # Active Alerts (已修正亂碼問題)
         st.subheader("Active Alerts")
         alerts = portfolio.get("active_alerts", []) or []
         if alerts:
             for a in alerts:
-                st.error(a) if "CRITICAL" in a or "KILL" in a else st.warning(a)
+                if "CRITICAL" in a or "KILL" in a:
+                    st.error(a)
+                else:
+                    st.warning(a)
         else:
             st.success("（目前沒有 alerts）")
 
@@ -1098,25 +1104,20 @@ def main():
         else:
             st.caption("（目前沒有 warnings）")
 
-        # AI JSON
+        # AI JSON (已新增複製功能)
         st.subheader("AI JSON（Arbiter Input）— 可回溯（SIM-FREE）")
         
         # 1. 先將 JSON 轉為易讀的字串 (保留中文不亂碼)
         json_str = json.dumps(payload, indent=4, ensure_ascii=False)
 
-        # 2. 使用 st.code 顯示
-        # ⚠️ 關鍵：st.code 的區塊右上角，滑鼠移過去會自動出現一個「複製 (Copy)」的小圖示
-        # 點一下該圖示，內容就會直接進剪貼簿，您就可以直接去貼給 AI 了
+        # 2. 使用 st.code 顯示 (自帶複製按鈕)
         st.markdown("##### 📋 點擊下方代碼塊右上角的「複製圖示」即可")
         st.code(json_str, language="json")
         
-        # (選擇性) 如果您還是想看原本的摺疊樹狀圖，保留這行，不想看可刪除
+        # (選擇性) 樹狀結構檢視
         with st.expander("🔍 查看樹狀結構 (Tree View)"):
             st.json(payload)
 
 
 if __name__ == "__main__":
     main()
-
-
-
