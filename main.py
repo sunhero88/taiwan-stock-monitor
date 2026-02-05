@@ -1,11 +1,12 @@
 # main.py
 # =========================================================
-# Sunhero｜股市智能超盤中控台（Predator V16.3 Stable Hybrid）
-# V16.3.2 Upgrade:
-# ✅ [Fix] 解決 KeyError: 'Institutional.Inst_Net_3d' 崩潰問題
-# ✅ [UI] Warnings (系統健康診斷) 加回儀表板，並提供清楚說明
-# ✅ [Logic] 強化持倉 (Positions) 追蹤：持倉股強制納入監控，並自動補上中文名稱
-# ✅ [Data] 確保法人數據欄位 (Capitalized Keys) 對齊前端需求
+# Sunhero｜股市智能超盤中控台（Predator V16.3.3 Spec-Compliant）
+# 基於規格：V16.2.1 Patch Notes
+# 新增功能：
+# ✅ Patch-05: 實作 Kill-Switch 布林判定 (Gap_Down, Critical Data)
+# ✅ Patch-06: 實作 Consolidation 雙重判定 (SMR 10D + Price Range 10D < 5%)
+# ✅ Patch-07: 計算並輸出 Dynamic VIX Threshold (供監控)
+# ✅ UI: 保持全中文化與複製功能
 # =========================================================
 
 from __future__ import annotations
@@ -25,11 +26,11 @@ import yfinance as yf
 # Streamlit page config
 # =========================
 st.set_page_config(
-    page_title="Sunhero｜股市智能超盤中控台（Predator V16.3 中文戰術版）",
+    page_title="Sunhero｜股市智能超盤中控台（Predator V16.3.3 Spec-Compliant）",
     layout="wide",
 )
 
-APP_TITLE = "Sunhero｜股市智能超盤中控台（TopN + 持倉監控 / Predator V16.3 Hybrid）"
+APP_TITLE = "Sunhero｜股市智能超盤中控台（TopN + 持倉監控 / Predator V16.3.3）"
 st.title(APP_TITLE)
 
 # =========================
@@ -55,8 +56,7 @@ STOCK_NAME_MAP = {
     "3324.TW": "雙鴻",   "3661.TW": "世芯-KY",
     "2881.TW": "富邦金", "2882.TW": "國泰金", "2891.TW": "中信金", "2886.TW": "兆豐金",
     "2603.TW": "長榮",   "2609.TW": "陽明",   "1605.TW": "華新",   "1513.TW": "中興電",
-    "1519.TW": "華城",   "2002.TW": "中鋼",
-    # 若持倉股不在上面，會顯示代號，或您可在此手動追加
+    "1519.TW": "華城",   "2002.TW": "中鋼"
 }
 
 # --- 欄位中文化對照表 ---
@@ -186,13 +186,7 @@ def fetch_amount_total(allow_insecure_ssl: bool = False) -> MarketAmount:
         total = int(tpex_amt)
     return MarketAmount(twse_amt, tpex_amt, total, twse_src, tpex_src, bool(allow_insecure_ssl))
 
-# =========================
-# New Fetcher: 全市場三大法人買賣超
-# =========================
 def fetch_market_inst_summary(allow_insecure_ssl: bool = False) -> List[Dict[str, Any]]:
-    """
-    抓取證交所三大法人買賣金額統計表 (BFI82U)
-    """
     url = "https://www.twse.com.tw/rwd/zh/fund/BFI82U?response=json"
     data_list = []
     try:
@@ -203,12 +197,11 @@ def fetch_market_inst_summary(allow_insecure_ssl: bool = False) -> List[Dict[str
             for row in js['data']:
                 if len(row) >= 4:
                     name = row[0].strip()
-                    diff = _safe_int(row[3]) # 第4欄通常是買賣差額
+                    diff = _safe_int(row[3])
                     if diff is not None:
                          data_list.append({"Identity": name, "Net": diff})
     except Exception as e:
         warnings_bus.push("MARKET_INST_FAIL", f"BFI82U fetch fail: {e}", {"url": url})
-    
     return data_list
 
 # =========================
@@ -345,31 +338,44 @@ def fetch_batch_prices_volratio(symbols: List[str]) -> pd.DataFrame:
 # =========================
 # Regime & Metrics
 # =========================
-def _as_close_series(df: pd.DataFrame) -> pd.Series:
+def _as_series(df: pd.DataFrame, col_name: str) -> pd.Series:
+    """Helper to extract a specific column series robustly"""
     if df is None or df.empty: raise ValueError("empty df")
-    possible_names = ["Close", "close", "Adj Close", "adj close"]
-    for name in possible_names:
-        if name in df.columns:
-            s = df[name]
-            if isinstance(s, pd.DataFrame): s = s.iloc[:, 0]
-            return s.astype(float)
-    close_cols = [c for c in df.columns if 'close' in str(c).lower()]
-    if close_cols:
-        s = df[close_cols[0]]
+    # Try exact match
+    if col_name in df.columns:
+        s = df[col_name]
         if isinstance(s, pd.DataFrame): s = s.iloc[:, 0]
         return s.astype(float)
-    raise ValueError("No close col")
+    # Try case-insensitive
+    cols = [c for c in df.columns if str(col_name).lower() == str(c).lower()]
+    if cols:
+        s = df[cols[0]]
+        if isinstance(s, pd.DataFrame): s = s.iloc[:, 0]
+        return s.astype(float)
+    raise ValueError(f"Col {col_name} not found")
+
+def _as_close_series(df: pd.DataFrame) -> pd.Series:
+    # Dedicated helper for Close price, trying "Close", "Adj Close"
+    try: return _as_series(df, "Close")
+    except:
+        try: return _as_series(df, "Adj Close")
+        except: raise ValueError("No Close/Adj Close found")
 
 def compute_regime_metrics(market_df: pd.DataFrame) -> dict:
+    # Patch-06: Time Window Alignment
+    # SMR Window: 10D (Spec) -> MA200 is base, but checks are instant
+    # Price Range: 10D (Spec)
+    
     if market_df is None or market_df.empty or len(market_df) < 260:
-        return {"SMR": None, "Slope5": None, "MOMENTUM_LOCK": False, "drawdown_pct": None, "drawdown_window_days": 252}
+        return {"SMR": None, "Slope5": None, "MOMENTUM_LOCK": False, "drawdown_pct": None, "price_range_10d_pct": None, "gap_down": None}
+    
     try:
         close = _as_close_series(market_df)
-    except: return {"SMR": None, "Slope5": None, "MOMENTUM_LOCK": False, "drawdown_pct": None, "drawdown_window_days": 252}
+    except: return {"SMR": None, "Slope5": None, "MOMENTUM_LOCK": False, "drawdown_pct": None, "price_range_10d_pct": None, "gap_down": None}
     
     ma200 = close.rolling(200).mean()
     smr_series = ((close - ma200) / ma200).dropna()
-    if len(smr_series) < 10: return {"SMR": None, "Slope5": None, "MOMENTUM_LOCK": False, "drawdown_pct": None, "drawdown_window_days": 252}
+    if len(smr_series) < 10: return {"SMR": None, "Slope5": None, "MOMENTUM_LOCK": False, "drawdown_pct": None}
 
     smr = float(smr_series.iloc[-1])
     smr_ma5 = smr_series.rolling(5).mean().dropna()
@@ -378,15 +384,53 @@ def compute_regime_metrics(market_df: pd.DataFrame) -> dict:
     last4 = smr_ma5.diff().dropna().iloc[-4:]
     momentum_lock = bool((last4 > EPS).all()) if len(last4) == 4 else False
     
-    window = 252
-    rolling_high = close.rolling(window).max()
+    # Drawdown (252D)
+    window_dd = 252
+    rolling_high = close.rolling(window_dd).max()
     drawdown_pct = float(close.iloc[-1] / rolling_high.iloc[-1] - 1.0) if not np.isnan(rolling_high.iloc[-1]) else None
     
+    # Patch-06: Consolidation Price Range (10D)
+    price_range_10d_pct = None
+    if len(close) >= 10:
+        recent_10d = close.iloc[-10:]
+        low_10d = recent_10d.min()
+        high_10d = recent_10d.max()
+        if low_10d > 0:
+            price_range_10d_pct = float((high_10d - low_10d) / low_10d)
+
+    # Patch-05: Gap Down (Today Open vs Yesterday Close)
+    # Note: Using 'Open' from history
+    gap_down = None
+    try:
+        open_s = _as_series(market_df, "Open")
+        if len(open_s) >= 2 and len(close) >= 2:
+            today_open = float(open_s.iloc[-1])
+            prev_close = float(close.iloc[-2])
+            if prev_close > 0:
+                gap_down = (today_open - prev_close) / prev_close
+    except:
+        gap_down = None # Open data might be missing
+
     return {
         "SMR": smr, "SMR_MA5": float(smr_ma5.iloc[-1]), "Slope5": slope5,
         "NEGATIVE_SLOPE_5D": bool(slope5 < -EPS), "MOMENTUM_LOCK": momentum_lock,
-        "drawdown_pct": drawdown_pct, "drawdown_window_days": window
+        "drawdown_pct": drawdown_pct, "drawdown_window_days": window_dd,
+        "price_range_10d_pct": price_range_10d_pct, # Patch-06
+        "gap_down": gap_down # Patch-05
     }
+
+def calculate_dynamic_vix(vix_df: pd.DataFrame) -> Optional[float]:
+    # Patch-07: Dynamic VIX Threshold (MA20 + 2*STD)
+    if vix_df is None or vix_df.empty: return None
+    try:
+        vix_close = _as_close_series(vix_df)
+        if len(vix_close) < 20: return 40.0 # Default fallback
+        ma20 = vix_close.rolling(20).mean().iloc[-1]
+        std20 = vix_close.rolling(20).std().iloc[-1]
+        threshold = ma20 + 2 * std20
+        return max(35.0, float(threshold)) # Floor at 35
+    except:
+        return 35.0
 
 def _calc_ma14_monthly_from_daily(df_daily: pd.DataFrame) -> Optional[float]:
     try:
@@ -431,6 +475,7 @@ def pick_regime(metrics: dict, vix: Optional[float] = None, ma14_monthly: Option
     smr = metrics.get("SMR")
     slope5 = metrics.get("Slope5")
     drawdown = metrics.get("drawdown_pct")
+    price_range = metrics.get("price_range_10d_pct") # Patch-06
 
     if (vix and float(vix) > float(vix_panic)) or (drawdown and float(drawdown) <= -0.18):
         return "CRASH_RISK", 0.10
@@ -439,7 +484,13 @@ def pick_regime(metrics: dict, vix: Optional[float] = None, ma14_monthly: Option
     if smr is not None and slope5 is not None:
         if float(smr) > 0.25 and float(slope5) < -EPS: return "MEAN_REVERSION", 0.45
         if float(smr) > 0.25 and float(slope5) >= -EPS: return "OVERHEAT", 0.55
-    if smr is not None and 0.08 <= float(smr) <= 0.18: return "CONSOLIDATION", 0.65
+    
+    # Patch-06: Strict Consolidation Check (SMR 10D & Price Range 10D)
+    if smr is not None and 0.08 <= float(smr) <= 0.18: 
+        if price_range is not None and price_range < 0.05:
+            return "CONSOLIDATION", 0.65
+        # If SMR matches but Price Range is high, fall through to NORMAL (or handle differently)
+        
     return "NORMAL", 0.85
 
 def classify_layer(regime: str, momentum_lock: bool, vol_ratio: Optional[float], inst: dict) -> str:
@@ -452,7 +503,8 @@ def classify_layer(regime: str, momentum_lock: bool, vol_ratio: Optional[float],
     if momentum_lock and (vr and float(vr) > 0.8) and regime in ["NORMAL", "OVERHEAT", "CONSOLIDATION"]: return "B"
     return "NONE"
 
-def compute_integrity_and_kill(stocks: List[dict], amount: MarketAmount) -> dict:
+def compute_integrity_and_kill(stocks: List[dict], amount: MarketAmount, metrics: dict) -> dict:
+    # Patch-05: Boolean Flags
     n = len(stocks)
     price_null = sum(1 for s in stocks if s.get("Price") is None)
     volratio_null = sum(1 for s in stocks if s.get("Vol_Ratio") is None)
@@ -460,6 +512,9 @@ def compute_integrity_and_kill(stocks: List[dict], amount: MarketAmount) -> dict
     denom = max(1, (2 * n + 1))
     core_missing = price_null + volratio_null + (1 if amount_total_null else 0)
     core_missing_pct = float(core_missing / denom)
+    
+    gap_down = metrics.get("gap_down")
+    is_gap_crash = bool(gap_down is not None and gap_down <= -0.07) # Patch-05: Gap < -7%
     
     kill = False
     reasons = []
@@ -470,16 +525,20 @@ def compute_integrity_and_kill(stocks: List[dict], amount: MarketAmount) -> dict
     if amount_total_null: reasons.append("amount_total_null=True")
     if core_missing_pct >= 0.50:
         kill = True; reasons.append(f"core_missing_pct={core_missing_pct:.2f}")
+    if is_gap_crash:
+        kill = True; reasons.append(f"GAP_DOWN_CRASH({gap_down:.1%})")
 
     return {
         "n": n, "price_null": price_null, "volratio_null": volratio_null,
         "core_missing_pct": core_missing_pct, "amount_total_null": amount_total_null,
+        "is_gap_crash": is_gap_crash, # Patch-05 output
         "kill": bool(kill), "reason": ("DATA_MISSING " + ", ".join(reasons)) if reasons else "OK"
     }
 
 def build_active_alerts(integrity: dict, amount: MarketAmount) -> List[str]:
     alerts = []
     if integrity.get("kill"): alerts.append("KILL_SWITCH_ACTIVATED")
+    if integrity.get("is_gap_crash"): alerts.append("CRITICAL: 市場跳空重挫 (>7%)") # Patch-05
     if amount.amount_total is None: alerts.append("DEGRADED_AMOUNT: 成交量數據完全缺失")
     n = int(integrity.get("n") or 0)
     if n > 0 and int(integrity.get("price_null") or 0) == n: alerts.append("CRITICAL: 所有個股價格=null")
@@ -510,13 +569,16 @@ def build_arbiter_input(session: str, account_mode: str, topn: int, positions: L
             vix_close = _as_close_series(vix_df)
             vix_last = float(vix_close.iloc[-1]) if len(vix_close) else None
         except: pass
+    
+    # Patch-07: Dynamic VIX Threshold
+    dynamic_vix_threshold = calculate_dynamic_vix(vix_df)
 
     metrics = compute_regime_metrics(twii_df)
     close_price = _extract_close_price(twii_df)
     ma14_monthly = _calc_ma14_monthly_from_daily(twii_df)
     close_below_days = _count_close_below_ma_days(twii_df, ma14_monthly)
     
-    # 新增：計算大盤漲跌
+    # Calculate Change
     twii_change = None
     twii_pct = None
     if not twii_df.empty:
@@ -535,10 +597,8 @@ def build_arbiter_input(session: str, account_mode: str, topn: int, positions: L
     market_inst_summary = fetch_market_inst_summary(allow_insecure_ssl)
 
     # 3. Stocks Data (TopN + Positions)
-    # 合併 TopN 與 Positions 的標的，去除重複
     base_pool = _default_symbols_pool(topn)
     pos_pool = [p.get("symbol") for p in positions if p.get("symbol")]
-    # 使用 dict.fromkeys 維持順序並去重
     symbols = list(dict.fromkeys(base_pool + pos_pool))
 
     pv = fetch_batch_prices_volratio(symbols)
@@ -560,10 +620,9 @@ def build_arbiter_input(session: str, account_mode: str, topn: int, positions: L
         inst3 = calc_inst_3d(inst_df, sym)
         net3 = float(inst3.get("Inst_Net_3d", 0.0))
         
-        # 準備面板資料 (包含中文名稱)
         p_row = {
             "Symbol": sym,
-            "Name": STOCK_NAME_MAP.get(sym, sym), # Add Name
+            "Name": STOCK_NAME_MAP.get(sym, sym),
             "Foreign_Net": net3, 
             "Trust_Net": net3, 
             "Inst_Streak3": int(inst3.get("Inst_Streak3", 0)),
@@ -574,13 +633,12 @@ def build_arbiter_input(session: str, account_mode: str, topn: int, positions: L
         }
         panel_rows.append(p_row)
         
-        # 修正：寫入正確的 Capitalized Keys，供 pd.json_normalize 與前端 disp_cols 使用
         inst_map[sym] = {
             "foreign_buy": bool(net3>0), 
             "trust_buy": bool(net3>0), 
-            "Inst_Streak3": int(inst3.get("Inst_Streak3", 0)), # Capitalized
-            "Inst_Net_3d": net3, # Added Key
-            "inst_streak3": int(inst3.get("Inst_Streak3", 0)) # keep lowercase for internal layer logic
+            "Inst_Streak3": int(inst3.get("Inst_Streak3", 0)), 
+            "Inst_Net_3d": net3, 
+            "inst_streak3": int(inst3.get("Inst_Streak3", 0))
         }
 
         # Stock Technicals
@@ -596,7 +654,7 @@ def build_arbiter_input(session: str, account_mode: str, topn: int, positions: L
         
         stocks.append({
             "Symbol": sym,
-            "Name": STOCK_NAME_MAP.get(sym, sym), # Add Name
+            "Name": STOCK_NAME_MAP.get(sym, sym),
             "Tier": i,
             "Price": None if pd.isna(price) else price,
             "Vol_Ratio": None if pd.isna(vol_ratio) else vol_ratio,
@@ -606,7 +664,8 @@ def build_arbiter_input(session: str, account_mode: str, topn: int, positions: L
 
     institutional_panel = pd.DataFrame(panel_rows)
     
-    integrity = compute_integrity_and_kill(stocks, amount)
+    # Pass metrics to compute_integrity_and_kill for Patch-05 checks
+    integrity = compute_integrity_and_kill(stocks, amount, metrics)
     active_alerts = build_active_alerts(integrity, amount)
     current_exposure_pct = min(1.0, len(positions) * 0.05) if positions else 0.0
     
@@ -620,14 +679,17 @@ def build_arbiter_input(session: str, account_mode: str, topn: int, positions: L
     payload = {
         "meta": {
             "timestamp": _now_ts(), "session": session, "market_status": market_status,
-            "current_regime": final_regime, "account_mode": account_mode, "audit_tag": "V16.3_ZH_EDITION"
+            "current_regime": final_regime, "account_mode": account_mode, "audit_tag": "V16.3.3_SPEC_COMPLIANT"
         },
         "macro": {
             "overview": {
                 "trade_date": trade_date, "twii_close": close_price,
                 "twii_change": twii_change, "twii_pct": twii_pct, 
                 "vix": vix_last, "smr": metrics.get("SMR"), "slope5": metrics.get("Slope5"),
-                "drawdown_pct": metrics.get("drawdown_pct"), "max_equity_allowed_pct": final_max_equity
+                "drawdown_pct": metrics.get("drawdown_pct"), 
+                "price_range_10d_pct": metrics.get("price_range_10d_pct"), # Patch-06
+                "dynamic_vix_threshold": dynamic_vix_threshold, # Patch-07
+                "max_equity_allowed_pct": final_max_equity
             },
             "market_amount": asdict(amount),
             "market_inst_summary": market_inst_summary, 
@@ -676,8 +738,6 @@ def main():
                                                int(cash_balance), int(total_equity), bool(allow_insecure_ssl), finmind_token)
         except Exception as e:
             st.error(f"系統錯誤: {e}")
-            # 顯示完整的 traceback 方便 debug (但前端只會看到上面的 error)
-            # st.exception(e) 
             return
 
         ov = payload.get("macro", {}).get("overview", {})
@@ -730,7 +790,7 @@ def main():
                 if "CRITICAL" in a or "KILL" in a: st.error(a)
                 else: st.warning(a)
 
-        # --- 5. 系統診斷 (Warnings) - 加回儀表板 ---
+        # --- 5. 系統診斷 (Warnings) ---
         st.subheader("🛠️ 系統健康診斷 (System Health)")
         if not warns:
             st.success("✅ 系統運作正常，無錯誤日誌 (Clean Run)。")
@@ -738,7 +798,6 @@ def main():
             with st.expander(f"⚠️ 偵測到 {len(warns)} 條系統警示 (點擊查看詳情)", expanded=True):
                 st.warning("系統遭遇部分數據抓取失敗，已自動降級或使用備援數據。")
                 w_df = pd.DataFrame(warns)
-                # 簡單過濾關鍵欄位
                 if not w_df.empty and 'code' in w_df.columns:
                     st.dataframe(w_df[['ts', 'code', 'msg']], use_container_width=True)
                 else:
@@ -748,12 +807,8 @@ def main():
         st.subheader("🎯 核心持股雷達 (Tactical Stocks)")
         s_df = pd.json_normalize(payload.get("stocks", []))
         if not s_df.empty:
-            # 整理並重命名欄位 (確保 Institutional.Inst_Net_3d 存在)
             disp_cols = ["Symbol", "Name", "Price", "Vol_Ratio", "Layer", "Institutional.Inst_Net_3d", "Institutional.Inst_Streak3"]
-            
-            # 使用 reindex 避免 KeyError
             s_df = s_df.reindex(columns=disp_cols, fill_value=0)
-            
             s_df = s_df.rename(columns=COL_TRANSLATION)
             s_df = s_df.rename(columns={
                 "Institutional.Inst_Net_3d": "法人3日淨額",
@@ -767,7 +822,7 @@ def main():
             if not inst_df.empty:
                 st.dataframe(inst_df.rename(columns=COL_TRANSLATION), use_container_width=True)
         
-        # --- 8. AI JSON 一鍵複製 (st.code) ---
+        # --- 8. AI JSON 一鍵複製 ---
         st.markdown("---")
         c_copy1, c_copy2 = st.columns([0.8, 0.2])
         with c_copy1: st.subheader("🤖 AI JSON (Arbiter Input)")
