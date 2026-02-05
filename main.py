@@ -2,7 +2,8 @@
 # =========================================================
 # Sunhero | 股市智能超盤中控台 (TopN + 持倉監控 / Predator V16.3 Stable Hybrid)
 # + V16.2 Enhanced Kill-Switch (SHELTER) merged into V16.3
-# Single-file Streamlit app (drop-in runnable)
+# + Price/Volume FinMind Fallback (fix Price=null/Vol_Ratio=null on Streamlit Cloud)
+# + drawdown_pct fixed: current drawdown; add drawdown_max_pct
 # =========================================================
 
 import json
@@ -17,7 +18,6 @@ import streamlit as st
 import streamlit.components.v1 as components
 import yfinance as yf
 
-
 # =========================
 # Streamlit page config
 # =========================
@@ -28,7 +28,6 @@ st.set_page_config(
 
 APP_TITLE = "Sunhero｜股市智能超盤中控台（TopN + 持倉監控 / Predator V16.3 Stable Hybrid）"
 st.title(APP_TITLE)
-
 
 # =========================
 # Constants / helpers
@@ -46,6 +45,9 @@ DEFAULT_EQUITY = 2_000_000
 KILL_PRICE_NULL_PCT = 0.50        # Price 缺失 >= 50% 觸發
 KILL_VOLRATIO_NULL_PCT = 0.50     # Vol_Ratio 缺失 >= 50% 觸發
 KILL_CORE_MISSING_PCT = 0.50      # 核心缺失率 >= 50% 觸發（Price/Vol_Ratio/Amount_total）
+
+# ===== FinMind endpoints =====
+FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
 
 
 def _now_ts() -> str:
@@ -97,9 +99,7 @@ class WarningBus:
         self.items: List[Dict[str, Any]] = []
 
     def push(self, code: str, msg: str, meta: Optional[dict] = None):
-        self.items.append(
-            {"ts": _now_ts(), "code": code, "msg": msg, "meta": meta or {}}
-        )
+        self.items.append({"ts": _now_ts(), "code": code, "msg": msg, "meta": meta or {}})
 
     def latest(self, n: int = 50) -> List[Dict[str, Any]]:
         return self.items[-n:]
@@ -107,17 +107,13 @@ class WarningBus:
 
 warnings_bus = WarningBus()
 
-
 # =========================
 # Optional external modules
 # =========================
-# 若 repo 內有 finmind_institutional.py / institutional_utils.py 會直接用
-# 若沒有，走 stub（不會白屏）
 try:
-    from finmind_institutional import fetch_finmind_institutional, fetch_finmind_market_inst_net_ab  # type: ignore
+    from finmind_institutional import fetch_finmind_institutional  # type: ignore
 except Exception:
     fetch_finmind_institutional = None
-    fetch_finmind_market_inst_net_ab = None
 
 try:
     from institutional_utils import calc_inst_3d  # type: ignore
@@ -152,11 +148,7 @@ def _fetch_twse_amount(allow_insecure_ssl: bool) -> Tuple[Optional[int], str]:
                 candidate_tables.append((k, v))
 
         if not candidate_tables:
-            warnings_bus.push(
-                "TWSE_AMOUNT_PARSE_FAIL",
-                "TWSE JSON missing expected tables (data1..data9)",
-                {"url": url, "keys": list(js.keys())[:30]},
-            )
+            warnings_bus.push("TWSE_AMOUNT_PARSE_FAIL", "TWSE JSON missing expected tables", {"url": url})
             return None, "TWSE_FAIL:TABLE_MISSING"
 
         fields = js.get("fields9") or js.get("fields1") or js.get("fields") or []
@@ -214,11 +206,7 @@ def _fetch_tpex_amount(allow_insecure_ssl: bool) -> Tuple[Optional[int], str]:
         try:
             js = r.json()
         except Exception as e:
-            warnings_bus.push(
-                "TPEX_AMOUNT_PARSE_FAIL",
-                f"TPEX JSON decode error: {e}",
-                {"url": url, "text_head": r.text[:200]},
-            )
+            warnings_bus.push("TPEX_AMOUNT_PARSE_FAIL", f"TPEX JSON decode error: {e}", {"url": url, "text_head": r.text[:200]})
             return None, "TPEX_FAIL:JSONDecodeError"
 
         amount = None
@@ -302,6 +290,10 @@ def _as_close_series(df: pd.DataFrame) -> pd.Series:
 
 
 def compute_regime_metrics(market_df: pd.DataFrame = None) -> dict:
+    """
+    drawdown_pct：當下回撤（current drawdown）
+    drawdown_max_pct：區間最大回撤（max drawdown）
+    """
     if market_df is None or len(market_df) < 10:
         return {
             "SMR": None,
@@ -310,6 +302,7 @@ def compute_regime_metrics(market_df: pd.DataFrame = None) -> dict:
             "NEGATIVE_SLOPE_5D": True,
             "MOMENTUM_LOCK": False,
             "drawdown_pct": None,
+            "drawdown_max_pct": None,
         }
 
     close = _as_close_series(market_df)
@@ -326,6 +319,7 @@ def compute_regime_metrics(market_df: pd.DataFrame = None) -> dict:
             "NEGATIVE_SLOPE_5D": True,
             "MOMENTUM_LOCK": False,
             "drawdown_pct": None,
+            "drawdown_max_pct": None,
         }
 
     smr = float(smr_series.iloc[-1])
@@ -346,7 +340,8 @@ def compute_regime_metrics(market_df: pd.DataFrame = None) -> dict:
 
     rolling_high = close.cummax()
     drawdown_series = (close - rolling_high) / rolling_high
-    drawdown_pct = float(drawdown_series.min())
+    drawdown_current = float(drawdown_series.iloc[-1])           # ✅ 當下回撤
+    drawdown_max = float(drawdown_series.min())                  # ✅ 區間最大回撤（可留作風險背景）
 
     return {
         "SMR": smr,
@@ -354,7 +349,8 @@ def compute_regime_metrics(market_df: pd.DataFrame = None) -> dict:
         "Slope5": slope5,
         "NEGATIVE_SLOPE_5D": negative_slope_5d,
         "MOMENTUM_LOCK": momentum_lock,
-        "drawdown_pct": drawdown_pct,
+        "drawdown_pct": drawdown_current,
+        "drawdown_max_pct": drawdown_max,
     }
 
 
@@ -362,10 +358,10 @@ def pick_regime(metrics: dict, vix: float = None, ma14_monthly: float = None,
                 close_price: float = None, close_below_ma_days: int = 0) -> tuple:
     smr = metrics.get("SMR")
     slope5 = metrics.get("Slope5")
-    drawdown = metrics.get("drawdown_pct")
+    drawdown_current = metrics.get("drawdown_pct")  # ✅ 用「當下回撤」判斷
 
     # CRASH_RISK
-    if (vix is not None and float(vix) > 35) or (drawdown is not None and float(drawdown) <= -0.18):
+    if (vix is not None and float(vix) > 35) or (drawdown_current is not None and float(drawdown_current) <= -0.18):
         return "CRASH_RISK", 0.10
 
     # HIBERNATION (放寬至 2日 × 0.96)
@@ -444,7 +440,7 @@ def _extract_close_price(market_df: pd.DataFrame) -> Optional[float]:
         close = _as_close_series(df)
         if len(close) == 0:
             return None
-        return float(close.dropna().iloc[-1])
+        return float(pd.to_numeric(close, errors="coerce").dropna().iloc[-1])
     except Exception:
         return None
 
@@ -473,16 +469,13 @@ def _count_close_below_ma_days(market_df: pd.DataFrame, ma14_monthly: Optional[f
     try:
         if ma14_monthly is None or market_df is None or market_df.empty:
             return 0
-
         df = market_df.copy()
         if "Datetime" in df.columns:
             df["Datetime"] = pd.to_datetime(df["Datetime"])
             df = df.set_index("Datetime")
-
         close = _as_close_series(df).dropna()
         recent = close.iloc[-5:]
         thresh = float(ma14_monthly) * 0.96
-
         cnt = 0
         for v in reversed(recent.tolist()):
             if float(v) < thresh:
@@ -495,7 +488,104 @@ def _count_close_below_ma_days(market_df: pd.DataFrame, ma14_monthly: Optional[f
 
 
 # =========================
-# FinMind institutional (merged)
+# FinMind Price/Volume fallback (NEW)
+# =========================
+def _finmind_headers(token: Optional[str]) -> dict:
+    if token:
+        return {"Authorization": f"Bearer {token}"}
+    return {}
+
+
+def fetch_finmind_price_ohlcv(symbol: str, start_date: str, end_date: str, token: Optional[str]) -> pd.DataFrame:
+    """
+    用 FinMind 取日 OHLCV（dataset: TaiwanStockPrice）
+    欄位常見：date, stock_id, open, max, min, close, Trading_Volume / volume...
+    """
+    stock_id = symbol.replace(".TW", "").strip()
+    params = {
+        "dataset": "TaiwanStockPrice",
+        "data_id": stock_id,
+        "start_date": start_date,
+        "end_date": end_date,
+    }
+    r = requests.get(FINMIND_URL, headers=_finmind_headers(token), params=params, timeout=30)
+    r.raise_for_status()
+    js = r.json()
+    data = js.get("data", []) or []
+    if not data:
+        return pd.DataFrame()
+    df = pd.DataFrame(data)
+    return df
+
+
+def get_price_volratio_with_fallback(symbol: str, finmind_token: Optional[str]) -> Tuple[Optional[float], Optional[float], str]:
+    """
+    回傳 (price, vol_ratio, source)
+    source: YF / FINMIND / NONE
+    """
+    # 1) yfinance
+    try:
+        h = fetch_history(symbol, period="6mo", interval="1d")
+        if not h.empty and "Close" in h.columns:
+            close = pd.to_numeric(h["Close"], errors="coerce").dropna()
+            vol = pd.to_numeric(h["Volume"], errors="coerce").dropna() if "Volume" in h.columns else pd.Series(dtype=float)
+            if len(close) > 0:
+                px = float(close.iloc[-1])
+                vr = None
+                if len(vol) >= 20:
+                    ma20 = float(vol.rolling(20).mean().iloc[-1])
+                    if ma20 != 0:
+                        vr = float(vol.iloc[-1] / ma20)
+                return px, vr, "YF"
+    except Exception as e:
+        warnings_bus.push("YF_SYMBOL_FAIL", f"{symbol} yfinance parse fail: {e}", {"symbol": symbol})
+
+    # 2) FinMind fallback（需要 token；沒有 token 就回 None）
+    if not finmind_token:
+        return None, None, "NONE"
+
+    try:
+        end = time.strftime("%Y-%m-%d", time.localtime())
+        start = (pd.to_datetime(end) - pd.Timedelta(days=90)).strftime("%Y-%m-%d")
+        df = fetch_finmind_price_ohlcv(symbol, start, end, finmind_token)
+        if df.empty:
+            return None, None, "NONE"
+
+        # normalize columns
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.sort_values("date")
+
+        # close
+        if "close" not in df.columns:
+            return None, None, "NONE"
+        close = pd.to_numeric(df["close"], errors="coerce").dropna()
+        if len(close) == 0:
+            return None, None, "NONE"
+        px = float(close.iloc[-1])
+
+        # volume column candidates
+        vol_col = None
+        for c in ["Trading_Volume", "trading_volume", "volume", "Trading_Volume(share)"]:
+            if c in df.columns:
+                vol_col = c
+                break
+        vr = None
+        if vol_col:
+            vol = pd.to_numeric(df[vol_col], errors="coerce").dropna()
+            if len(vol) >= 20:
+                ma20 = float(vol.rolling(20).mean().iloc[-1])
+                if ma20 != 0:
+                    vr = float(vol.iloc[-1] / ma20)
+
+        return px, vr, "FINMIND"
+
+    except Exception as e:
+        warnings_bus.push("FINMIND_PRICE_FAIL", f"{symbol} FinMind price fail: {e}", {"symbol": symbol})
+        return None, None, "NONE"
+
+
+# =========================
+# FinMind institutional panel
 # =========================
 def _get_trade_date_from_twii(twii_df: pd.DataFrame) -> str:
     if twii_df is None or twii_df.empty:
@@ -507,36 +597,28 @@ def _get_trade_date_from_twii(twii_df: pd.DataFrame) -> str:
 
 
 def build_institutional_panel_finmind(symbols: List[str], trade_date: str, token: Optional[str]) -> pd.DataFrame:
-    """
-    產出欄位（供 UI / Layer 判定）：
-    Symbol, Foreign_Net, Trust_Net, Inst_Streak3, Inst_Status, Inst_Dir3, Inst_Net_3d
-    """
-    # default stub
     base = pd.DataFrame([{
         "Symbol": s, "Foreign_Net": 0.0, "Trust_Net": 0.0,
         "Inst_Streak3": 0, "Inst_Status": "PENDING", "Inst_Dir3": "PENDING", "Inst_Net_3d": 0.0
     } for s in symbols])
 
     if fetch_finmind_institutional is None or calc_inst_3d is None:
-        warnings_bus.push("FINMIND_MODULE_MISSING", "finmind_institutional.py 或 institutional_utils.py 不存在，法人資料降級為 0", {})
+        warnings_bus.push("FINMIND_INST_MODULE_MISSING", "法人模組缺失：institutional 降級為 0", {})
         return base
 
-    # 抓近 7 日以覆蓋 3 日連續判定
     end_date = trade_date
     start_date = (pd.to_datetime(trade_date) - pd.Timedelta(days=10)).strftime("%Y-%m-%d")
 
     try:
         inst_df = fetch_finmind_institutional(symbols=symbols, start_date=start_date, end_date=end_date, token=token)
     except Exception as e:
-        warnings_bus.push("FINMIND_FETCH_FAIL", f"FinMind 法人抓取失敗：{e}", {})
+        warnings_bus.push("FINMIND_INST_FETCH_FAIL", f"FinMind 法人抓取失敗：{e}", {})
         return base
 
     if inst_df is None or inst_df.empty:
-        warnings_bus.push("FINMIND_EMPTY", "FinMind 法人回傳空資料", {"start": start_date, "end": end_date})
+        warnings_bus.push("FINMIND_INST_EMPTY", "FinMind 法人回傳空資料", {"start": start_date, "end": end_date})
         return base
 
-    # 這裡只有「三大法人合計 net_amount」，我們把它同時餵給 Foreign_Net/Trust_Net（方向用 bool 判斷仍可用）
-    # 若你要分拆外資/投信，需另抓 dataset 或你原專案已分拆則改這段。
     out_rows = []
     for s in symbols:
         r = calc_inst_3d(inst_df=inst_df, symbol=s, trade_date=trade_date)
@@ -547,8 +629,8 @@ def build_institutional_panel_finmind(symbols: List[str], trade_date: str, token
 
         out_rows.append({
             "Symbol": s,
-            "Foreign_Net": net3,   # placeholder（合併值）
-            "Trust_Net": net3,     # placeholder（合併值）
+            "Foreign_Net": net3,
+            "Trust_Net": net3,
             "Inst_Streak3": streak3,
             "Inst_Status": status,
             "Inst_Dir3": dir3,
@@ -561,16 +643,13 @@ def build_institutional_panel_finmind(symbols: List[str], trade_date: str, token
 def inst_metrics_for_symbol(panel: pd.DataFrame, symbol: str) -> dict:
     if panel is None or panel.empty:
         return {"foreign_buy": False, "trust_buy": False, "inst_streak3": 0}
-
     df = panel[panel["Symbol"] == symbol]
     if df.empty:
         return {"foreign_buy": False, "trust_buy": False, "inst_streak3": 0}
-
     row = df.iloc[-1]
     foreign_buy = bool(_safe_float(row.get("Foreign_Net", 0), 0) > 0)
     trust_buy = bool(_safe_float(row.get("Trust_Net", 0), 0) > 0)
     inst_streak3 = _safe_int(row.get("Inst_Streak3", 0), 0)
-
     return {"foreign_buy": foreign_buy, "trust_buy": trust_buy, "inst_streak3": inst_streak3}
 
 
@@ -669,9 +748,15 @@ def build_arbiter_input(
         vix_last = None
 
     # ---- Metrics ----
-    metrics = compute_regime_metrics(
-        twii_df.set_index("Datetime")[["Close"]] if (not twii_df.empty and "Datetime" in twii_df.columns and "Close" in twii_df.columns) else None
-    )
+    metrics = None
+    if not twii_df.empty and "Datetime" in twii_df.columns and "Close" in twii_df.columns:
+        tmp = twii_df.copy()
+        tmp["Datetime"] = pd.to_datetime(tmp["Datetime"])
+        tmp = tmp.set_index("Datetime")
+        metrics = compute_regime_metrics(tmp[["Close"]])
+    else:
+        metrics = compute_regime_metrics(None)
+
     ma14_monthly = _calc_ma14_monthly_from_daily(twii_df)
     close_price = _extract_close_price(twii_df)
     close_below_days = _count_close_below_ma_days(twii_df, ma14_monthly)
@@ -695,28 +780,15 @@ def build_arbiter_input(
     # ---- Institutional panel (FinMind) ----
     panel = build_institutional_panel_finmind(symbols, trade_date=trade_date, token=finmind_token)
 
-    # ---- Per-stock snapshot ----
+    # ---- Per-stock snapshot (Price/Vol_Ratio with FinMind fallback) ----
     stocks = []
     for i, sym in enumerate(symbols, start=1):
-        px = None
-        vol_ratio = None
-        try:
-            h = fetch_history(sym, period="6mo", interval="1d")
-            if not h.empty and "Close" in h.columns:
-                close = pd.to_numeric(h["Close"], errors="coerce").dropna()
-                if len(close) > 0:
-                    px = float(close.iloc[-1])
+        px, vol_ratio, src = get_price_volratio_with_fallback(sym, finmind_token)
 
-            if not h.empty and "Volume" in h.columns:
-                v = pd.to_numeric(h["Volume"], errors="coerce").dropna()
-                if len(v) >= 20:
-                    ma20 = v.rolling(20).mean().iloc[-1]
-                    if ma20 and not (pd.isna(ma20) or float(ma20) == 0.0):
-                        vol_ratio = float(v.iloc[-1] / ma20)
-        except Exception as e:
-            warnings_bus.push("STOCK_FETCH_FAIL", f"{sym} price/volume fetch fail: {e}", {"symbol": sym})
-            px = None
-            vol_ratio = None
+        if px is None:
+            warnings_bus.push("PRICE_NULL", f"{sym} Price is null after fallback (YF+FinMind)", {"symbol": sym, "source": src})
+        if vol_ratio is None:
+            warnings_bus.push("VOLRATIO_NULL", f"{sym} Vol_Ratio is null after fallback (YF+FinMind)", {"symbol": sym, "source": src})
 
         im = inst_metrics_for_symbol(panel, sym)
         layer = classify_layer(regime, bool(metrics.get("MOMENTUM_LOCK", False)), vol_ratio, im)
@@ -724,11 +796,12 @@ def build_arbiter_input(
         stocks.append(
             {
                 "Symbol": sym,
-                "Name": sym,  # 可接代碼→中文名表
+                "Name": sym,
                 "Tier": i,
                 "Price": px,
                 "Vol_Ratio": vol_ratio,
                 "Layer": layer,
+                "Price_Source": src,      # ✅ 稽核
                 "Institutional": im,
             }
         )
@@ -739,11 +812,9 @@ def build_arbiter_input(
     market_status = "DEGRADED" if (amount.amount_total is None) else "NORMAL"
     audit_tag = "V16.3_STABLE_HYBRID"
 
-    # V16.3 規則：DEGRADED 禁止 BUY（你原本的哲學）
-    # Kill-Switch：核心資料缺失超標 → 直接 SHELTER，強制 max_equity=0，regime=UNKNOWN
     active_alerts: List[str] = []
     audit_log: List[dict] = []
-    decisions: List[dict] = []  # 本版仍維持「只產 JSON，不自動下單」
+    decisions: List[dict] = []
 
     if integrity["kill"]:
         market_status = "SHELTER"
@@ -791,7 +862,8 @@ def build_arbiter_input(
                 "vix": vix_last,
                 "smr": metrics.get("SMR"),
                 "slope5": metrics.get("Slope5"),
-                "drawdown_pct": metrics.get("drawdown_pct"),
+                "drawdown_pct": metrics.get("drawdown_pct"),             # ✅ 當下回撤
+                "drawdown_max_pct": metrics.get("drawdown_max_pct"),     # ✅ 區間最大回撤
                 "ma14_monthly": ma14_monthly,
                 "close_below_ma_days": close_below_days,
                 "max_equity_allowed_pct": max_equity,
@@ -803,7 +875,7 @@ def build_arbiter_input(
             "total_equity": int(total_equity),
             "cash_balance": int(cash_balance),
             "current_exposure_pct": float(current_exposure_pct),
-            "cash_pct": float((1.0 - current_exposure_pct) * 100.0),  # 0~100
+            "cash_pct": float((1.0 - current_exposure_pct) * 100.0),
             "active_alerts": active_alerts,
         },
         "institutional_panel": panel.to_dict("records") if isinstance(panel, pd.DataFrame) else [],
@@ -820,7 +892,6 @@ def build_arbiter_input(
 # UI
 # =========================
 def main():
-    # ---- Sidebar ----
     st.sidebar.header("設定")
 
     session = st.sidebar.selectbox("會議", ["INTRADAY", "EOD"], index=1)
@@ -830,7 +901,7 @@ def main():
     allow_insecure_ssl = st.sidebar.checkbox("允許不安全 SSL (verify=False)", value=False)
 
     st.sidebar.subheader("FinMind")
-    finmind_token = st.sidebar.text_input("FinMind Token（選填）", value="", type="password")
+    finmind_token = st.sidebar.text_input("FinMind Token（建議填，用於價格/量 fallback）", value="", type="password")
     finmind_token = finmind_token.strip() or None
 
     st.sidebar.subheader("持倉（手動貼 JSON陣列）")
@@ -841,7 +912,6 @@ def main():
 
     run_btn = st.sidebar.button("跑步")
 
-    # ---- Parse positions ----
     positions: List[dict] = []
     try:
         positions = json.loads(positions_text) if positions_text.strip() else []
@@ -851,7 +921,6 @@ def main():
         st.sidebar.error(f"positions JSON 解析失敗：{e}")
         positions = []
 
-    # ---- Auto-run on first load or button ----
     if run_btn or "auto_ran" not in st.session_state:
         st.session_state["auto_ran"] = True
 
@@ -875,7 +944,6 @@ def main():
         integ = payload.get("macro", {}).get("integrity", {})
         alerts = payload.get("portfolio", {}).get("active_alerts", [])
 
-        # ---- Header KPI ----
         c1, c2, c3, c4, c5, c6 = st.columns(6)
         c1.metric("交易日", ov.get("trade_date", "-"))
         c2.metric("market_status", payload.get("meta", {}).get("market_status", "-"))
@@ -890,17 +958,14 @@ def main():
             f"core_missing_pct={_safe_float(integ.get('core_missing_pct'), 0):.2f}"
         )
 
-        # ---- Active Alerts ----
         if alerts:
             st.subheader("Active Alerts")
             for a in alerts:
                 st.error(a)
 
-        # ---- Market Amount ----
         st.subheader("市場成交金額（best-effort / 可稽核）")
         st.json(payload.get("macro", {}).get("market_amount", {}))
 
-        # ---- Indices snapshot ----
         st.subheader("指數快照（簡版）")
         idx_rows = [
             {"symbol": TWII_SYMBOL, "name": "TAIEX", "last": ov.get("twii_close"), "asof": ov.get("trade_date")},
@@ -908,7 +973,6 @@ def main():
         ]
         st.dataframe(pd.DataFrame(idx_rows), use_container_width=True)
 
-        # ---- Institutional panel (debug) ----
         st.subheader("法人面板（FinMind / Debug）")
         ip = payload.get("institutional_panel", [])
         if ip:
@@ -916,7 +980,6 @@ def main():
         else:
             st.info("法人面板目前為空（未提供 Token 或資料源不可用）。")
 
-        # ---- Stocks table ----
         st.subheader("今日分析清單（TopN + 持倉）— Hybrid Layer")
         s_df = pd.json_normalize(payload.get("stocks", []))
         if not s_df.empty:
@@ -926,7 +989,6 @@ def main():
         else:
             st.info("stocks 清單為空（資料源可能暫時不可用）。")
 
-        # ---- Audit Log ----
         st.subheader("Audit Log（Kill-Switch 稽核）")
         al = payload.get("audit_log", [])
         if al:
@@ -934,7 +996,6 @@ def main():
         else:
             st.caption("（目前沒有 audit log）")
 
-        # ---- Warnings ----
         st.subheader("Warnings（最新 50 條）")
         w_df = pd.DataFrame(warns)
         if not w_df.empty:
@@ -942,7 +1003,6 @@ def main():
         else:
             st.caption("（目前沒有 warnings）")
 
-        # ---- Arbiter Input JSON ----
         st.subheader("AI JSON（Arbiter Input）— 可回溯（SIM-FREE）")
         json_text = json.dumps(payload, ensure_ascii=False, indent=2)
         render_copy_button("一鍵複製 AI JSON", json_text)
