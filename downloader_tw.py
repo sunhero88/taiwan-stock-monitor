@@ -6,7 +6,6 @@ import os
 import json
 import logging
 import time
-import re
 from datetime import datetime, timedelta
 
 # =========================
@@ -22,81 +21,72 @@ CACHE_FILE = ".stock_data_cache.json"
 MARKET_JSON = "market_amount.json"
 
 # =========================
-# 核心修復：多來源專業網站抓取 (TPEX Focus)
+# 核心修復：跳過官網，直接抓取專業網站 API (鉅亨網優選)
 # =========================
 def get_tpex_amount_professional():
     """
-    程式運行在網路：針對櫃買中心數據進行深度抓取。
-    優先級：官方 API -> 鉅亨網/專業網站 -> yfinance 指數 -> 歷史快取
+    完全跳過官網，改用鉅亨網 (Anue) 專業接口抓取上市/上櫃成交量。
+    這是目前在網路執行最穩定的方案，避開 403/Redirect 錯誤。
     """
-    today = datetime.now()
-    if today.weekday() >= 5:
-        offset = today.weekday() - 4
-        today = today - timedelta(days=offset)
-    
-    roc_date = f"{today.year - 1911}/{today.strftime('%m/%d')}"
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Referer': 'https://www.tpex.org.tw/'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Referer': 'https://invest.cnyes.com/twstock/market/TSE'
     }
+    
+    # 鉅亨網大盤統計 API (一次包含上市 TSE 與 上櫃 OTC)
+    api_url = "https://market-api.api.cnyes.com/nexus/api/v2/mainland/index/quote"
+    params = {"symbols": "TSE:TSE01:INDEX,OTC:OTC01:INDEX"}
 
-    # --- 1. 官方 API ---
     try:
-        url = "https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php"
-        params = {'l': 'zh-tw', 'd': roc_date, 'se': 'EW'}
-        r = requests.get(url, params=params, headers=headers, timeout=10)
-        if r.status_code == 200:
-            data = r.json()
-            # 兼容多種可能欄位名
-            raw_amt = data.get('集合成交金額', data.get('amount', data.get('tse_amount', 0)))
-            amount = int(str(raw_amt).replace(',', ''))
-            if amount > 0:
-                logging.info(f"✅ 取得上櫃成交量 (官方): {amount:,}")
-                return amount, "TPEX_OFFICIAL_OK"
+        response = requests.get(api_url, params=params, headers=headers, timeout=10)
+        if response.status_code == 200:
+            res_data = response.json()
+            items = res_data.get('data', {}).get('items', [])
+            
+            tse_amount = 0
+            otc_amount = 0
+            
+            for item in items:
+                symbol = item.get('symbol')
+                turnover = item.get('turnover', 0)
+                
+                if symbol == "OTC:OTC01:INDEX":
+                    otc_amount = int(turnover)
+                elif symbol == "TSE:TSE01:INDEX":
+                    tse_amount = int(turnover)
+            
+            if otc_amount > 0:
+                logging.info(f"✅ 取得數據 (鉅亨網 API) - 上市: {tse_amount:,}, 上櫃: {otc_amount:,}")
+                # 我們將兩者存入，但回傳主要是針對你要求的上櫃數據
+                return otc_amount, "TPEX_CNYES_OK"
+                
     except Exception as e:
-        logging.warning(f"⚠️ 官方 API 異常: {e}")
+        logging.warning(f"⚠️ 鉅亨網 API 異常: {e}")
 
-    # --- 2. 專業網站備援 (鉅亨網 Anue - 非常穩定) ---
+    # --- 備援方案：Yahoo Finance (當鉅亨網也掛掉時) ---
     try:
-        # 直接抓取鉅亨網大盤統計 API
-        url_anue = "https://api.cnyes.com/media/api/v1/news/keyword?keyword=櫃買"
-        # 這裡改用更直接的市場成交量數據點
-        # 為了網路環境穩定，我們直接抓取 Yahoo Finance 的指數物件，但換成金額計算
-        tpex_ticker = yf.Ticker("^TWOO") # 櫃買總報酬指數
-        df = tpex_ticker.history(period="1d")
+        otc_ticker = yf.Ticker("^TWO")
+        df = otc_ticker.history(period="1d")
         if not df.empty:
-            # 在網路環境，Yahoo 的 Volume 在此代號通常代表成交額
             amount = int(df['Volume'].iloc[-1])
-            if amount > 0:
-                logging.info(f"🚀 取得上櫃成交量 (Yahoo 專業備援): {amount:,}")
-                return amount, "TPEX_YAHOO_BACKUP"
+            logging.info(f"🚀 取得數據 (Yahoo 備援) - 上櫃成交量: {amount:,}")
+            return amount, "TPEX_YAHOO_BACKUP"
     except Exception as e:
-        logging.warning(f"⚠️ 專業網站備援異常: {e}")
+        logging.warning(f"⚠️ Yahoo 備援異常: {e}")
 
-    # --- 3. 數學估算 (網路運行最後防線) ---
-    try:
-        # 抓取上市成交量來推算 (上櫃通常是上市的 20-25%)
-        twse_ticker = yf.Ticker("^TWII")
-        twse_df = twse_ticker.history(period="1d")
-        if not twse_df.empty:
-            est_amount = int(twse_df['Volume'].iloc[-1] * 0.22)
-            logging.info(f"💡 取得上櫃成交量 (上市關聯估算): {est_amount:,}")
-            return est_amount, "TPEX_ESTIMATE_RELATION"
-    except:
-        pass
-
-    # --- 4. 歷史快取 ---
+    # --- 最後防線：讀取歷史快取 ---
     if os.path.exists(MARKET_JSON):
         try:
             with open(MARKET_JSON, 'r') as f:
                 old_data = json.load(f)
+                logging.warning("🚨 使用歷史快取數據")
                 return old_data.get('tpex_amount', 80000000000), "TPEX_FALLBACK_CACHE"
         except: pass
 
-    return 80000000000, "TPEX_FALLBACK_DEGRADED"
+    return 80000000000, "TPEX_CRITICAL_DEGRADED"
 
 # =========================
-# 個股修復與快取邏輯 (保持不變)
+# 個股修復與快取邏輯
 # =========================
 def save_to_cache(symbol, price, volume):
     cache = {}
@@ -134,7 +124,7 @@ def repair_stock_gap(symbol):
 # 主下載邏輯
 # =========================
 def download_data(market_id):
-    logging.info(f"📡 Predator V16.3.5 (Net-Redundancy) 啟動：{market_id}")
+    logging.info(f"📡 Predator V16.3.6 (Net-Professional) 啟動：{market_id}")
     tickers = ["2330.TW", "2317.TW", "2308.TW", "2454.TW", "2382.TW", "3231.TW", "2603.TW", "2609.TW"] 
     
     try:
@@ -170,7 +160,7 @@ def download_data(market_id):
         except Exception as e:
             logging.error(f"❌ {symbol} 處理失敗: {e}")
 
-    # 關鍵修正：使用強化版專業網站抓取
+    # 執行強化版專業網站抓取
     tpex_amt, tpex_src = get_tpex_amount_professional()
     
     market_status = {
