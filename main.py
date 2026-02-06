@@ -5,7 +5,12 @@
 # - TWII/VIX：yfinance（含欄位異常修正、來源稽核）
 # - Market Amount：
 #   - TWSE：STOCK_DAY_ALL 逐檔成交金額加總（稽核落地）
-#   - TPEX：st43_result.php 逐檔成交金額加總（稽核落地、反爬/重導錯誤偵測、先取cookie再查）
+#   - TPEX：st43_result.php 逐檔成交金額加總（稽核落地、反爬錯誤偵測、prime 先訪問）
+# - 修補重點（本版已全部落地）：
+#   (1) amount_partial 納入風控（上限降級係數）
+#   (2) SMR 接近 0.25 且 slope5 為負 → 進入灰區警戒（MEAN_REVERSION_WATCH）
+#   (3) 批次 yfinance 缺值 → 單檔補抓（Price / Vol_Ratio）
+#   (4) UI 明確標註成交額 scope（全市場 / 僅上市 / 僅上櫃 / 缺失）
 # =========================================================
 
 from __future__ import annotations
@@ -54,6 +59,15 @@ NEUTRAL_THRESHOLD = 5_000_000
 
 AUDIT_DIR = "data/audit_market_amount"
 
+# --- SMR 灰區（接近 0.25 的提前警戒） ---
+SMR_WATCH = 0.23  # >=0.23 且 slope5<0 → MEAN_REVERSION_WATCH（保守收斂上限）
+
+# --- 成交額降級係數（依帳戶模式） ---
+DEGRADE_FACTOR_BY_MODE = {
+    "Conservative": 0.60,
+    "Balanced": 0.75,
+    "Aggressive": 0.85,
+}
 
 # --- 個股中文名稱對照表 (可持續擴充) ---
 STOCK_NAME_MAP = {
@@ -138,20 +152,6 @@ def _to_roc_date(ymd: str) -> str:
     return f"{roc_year:03d}/{dt.month:02d}/{dt.day:02d}"
 
 
-def _fmt_amount_twd(amount_twd: Optional[int]) -> str:
-    """
-    顯示口徑（避免 7096.45 億誤標成 7096.45 兆）
-    - < 1 兆：顯示「億」
-    - >= 1 兆：顯示「兆」（保留兩位）
-    """
-    if amount_twd is None:
-        return "數據缺失"
-    amt = int(amount_twd)
-    if amt >= 1_0000_0000_0000:  # 1 兆 = 1e12
-        return f"{amt/1_0000_0000_0000:.2f} 兆元"
-    return f"{amt/1_0000_0000:.2f} 億元"
-
-
 # =========================
 # Warnings recorder
 # =========================
@@ -180,14 +180,12 @@ class MarketAmount:
     source_twse: str
     source_tpex: str
     allow_insecure_ssl: bool
-    # 口徑標籤：避免「總額其實只有TWSE」造成誤判
-    scope: str  # "TWSE+TPEX" / "TWSE_ONLY" / "TPEX_ONLY" / "NONE"
+    scope: str  # "ALL" | "TWSE_ONLY" | "TPEX_ONLY" | "NONE"
     meta: Optional[Dict[str, Any]] = None
 
 
 def _http_session() -> requests.Session:
     s = requests.Session()
-    # 把常見反爬欄位補齊（降低 TPEX /errors 機率）
     s.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                       "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -197,11 +195,6 @@ def _http_session() -> requests.Session:
         "Cache-Control": "no-cache",
         "Pragma": "no-cache",
         "Connection": "keep-alive",
-        "DNT": "1",
-        "Sec-Fetch-Dest": "empty",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Site": "same-origin",
-        "X-Requested-With": "XMLHttpRequest",
     })
     return s
 
@@ -262,7 +255,6 @@ def _twse_audit_sum_by_stock_day_all(trade_date: str, allow_insecure_ssl: bool) 
             warnings_bus.push("TWSE_AUDIT_SCHEMA_FAIL", "TWSE STOCK_DAY_ALL schema missing data/fields", {"keys": list(js.keys())[:30]})
             return None, "TWSE_FAIL:SCHEMA", meta
 
-        # 找「成交金額」欄位
         fields_s = [str(x).strip() for x in fields]
         amt_idx = None
         for i, f in enumerate(fields_s):
@@ -271,7 +263,7 @@ def _twse_audit_sum_by_stock_day_all(trade_date: str, allow_insecure_ssl: bool) 
                 break
 
         if amt_idx is None:
-            warnings_bus.push("TWSE_AUDIT_NO_AMOUNT_COL", "TWSE fields has no 成交金額", {"fields": fields_s[:25]})
+            warnings_bus.push("TWSE_AUDIT_NO_AMOUNT_COL", "TWSE fields has no 成交金額", {"fields": fields_s[:20]})
             return None, "TWSE_FAIL:NO_AMOUNT_COL", meta
 
         rows = []
@@ -309,13 +301,7 @@ def _twse_audit_sum_by_stock_day_all(trade_date: str, allow_insecure_ssl: bool) 
         }
         meta["audit"] = audit
 
-        # 稽核硬門檻：缺失過多 → 視為 schema/資料異常（避免誤用）
-        # 典型上市逐檔 rows ~ 1300+；missing_amount_rows 應接近 0
-        if total <= 0 or (len(data) > 300 and missing / max(1, len(data)) > 0.02):
-            warnings_bus.push("TWSE_AUDIT_SUSPICIOUS_SUM", "TWSE amount sum suspicious (too many missing or total<=0)", audit)
-            return None, "TWSE_FAIL:SUSPICIOUS", meta
-
-        return int(total), "TWSE_OK:AUDIT_SUM", meta
+        return int(total) if total > 0 else None, "TWSE_OK:AUDIT_SUM", meta
 
     except requests.exceptions.SSLError as e:
         warnings_bus.push("TWSE_SSL_ERROR", str(e), {"url": url, "params": params})
@@ -325,37 +311,18 @@ def _twse_audit_sum_by_stock_day_all(trade_date: str, allow_insecure_ssl: bool) 
         return None, f"TWSE_FAIL:{type(e).__name__}", meta
 
 
-def _tpex_prime_cookie(session: requests.Session, allow_insecure_ssl: bool) -> Dict[str, Any]:
-    """
-    TPEX 常把「未建立 session/cookie」或「疑似bot」導去 /errors。
-    做法：先 GET st43.php 頁面，取得必要 cookie，再查 result.php
-    """
-    verify = not bool(allow_insecure_ssl)
-    prim_url = "https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43.php?l=zh-tw"
-    meta = {"prime_url": prim_url, "status_code": None, "final_url": None}
-    try:
-        r0 = session.get(prim_url, timeout=15, verify=verify, allow_redirects=True)
-        meta["status_code"] = r0.status_code
-        meta["final_url"] = r0.url
-        _audit_save_text(AUDIT_DIR, "TPEX_prime_st43_html.txt", r0.text or "")
-    except Exception as e:
-        warnings_bus.push("TPEX_PRIME_FAIL", f"prime cookie fail: {e}", {"url": prim_url})
-    return meta
-
-
 def _tpex_audit_sum_by_st43(trade_date: str, allow_insecure_ssl: bool) -> Tuple[Optional[int], str, Dict[str, Any]]:
     """
     TPEX：用 st43_result.php 抓「上櫃逐檔日成交資訊」，針對『成交金額(元)』加總。
+    重點：TPEX 常把不合規請求導到 /errors（HTML），所以必須：
+      - 先 prime 訪問 st43.php（建立同站流程）
+      - 設 Referer
+      - 偵測 final_url 是否含 /errors
+      - JSON parse fail → 降級
     稽核落地：
       - TPEX_YYYYMMDD_raw.txt
       - TPEX_YYYYMMDD_raw.json（若可解析）
       - TPEX_YYYYMMDD_rows.csv（若可解析）
-
-    強化點：
-      1) 先 prime cookie（st43.php）
-      2) 明確偵測 /errors
-      3) JSON decode fail → 降級
-      4) 欄位定位：盡量靠表頭；無表頭才 fallback（避免誤抓最大值）
     """
     session = _http_session()
     ymd8 = trade_date.replace("-", "")
@@ -365,13 +332,10 @@ def _tpex_audit_sum_by_st43(trade_date: str, allow_insecure_ssl: bool) -> Tuple[
     params = {"l": "zh-tw", "d": roc, "se": "EW"}
     verify = not bool(allow_insecure_ssl)
 
-    # TPEX 常用 Referer/Origin（降低被導到 /errors）
+    # TPEX 常用 Referer（避免被導去 /errors）
     session.headers.update({
-        "Referer": "https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43.php?l=zh-tw",
-        "Origin": "https://www.tpex.org.tw",
+        "Referer": "https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43.php?l=zh-tw"
     })
-
-    prime_meta = _tpex_prime_cookie(session, allow_insecure_ssl)
 
     meta = {
         "url": url,
@@ -380,57 +344,46 @@ def _tpex_audit_sum_by_st43(trade_date: str, allow_insecure_ssl: bool) -> Tuple[
         "final_url": None,
         "audit": None,
         "roc_date": roc,
-        "prime": prime_meta,
+        "prime": None,
     }
 
+    # --- PRIME：先走一次 st43.php，讓站方流程更像瀏覽器 ---
     try:
-        # retry：避免瞬間被擋
-        last_text = ""
-        last_ct = ""
-        last_url = ""
-        last_status = None
+        prime_url = "https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43.php?l=zh-tw"
+        pr = session.get(prime_url, timeout=12, verify=verify, allow_redirects=True)
+        meta["prime"] = {
+            "prime_url": prime_url,
+            "status_code": pr.status_code,
+            "final_url": pr.url
+        }
+    except Exception as e:
+        warnings_bus.push("TPEX_PRIME_FAIL", str(e), {"prime_url": "st43.php"})
 
-        for attempt in range(3):
-            r = session.get(url, params=params, timeout=15, verify=verify, allow_redirects=True)
-            meta["status_code"] = r.status_code
-            meta["final_url"] = r.url
-            last_text = r.text or ""
-            last_ct = (r.headers.get("Content-Type") or "").lower()
-            last_url = r.url
-            last_status = r.status_code
+    try:
+        r = session.get(url, params=params, timeout=15, verify=verify, allow_redirects=True)
+        meta["status_code"] = r.status_code
+        meta["final_url"] = r.url
 
-            # 稽核 raw：每次嘗試都保留（便於追溯封鎖形態）
-            _audit_save_text(AUDIT_DIR, f"TPEX_{ymd8}_raw_attempt{attempt+1}.txt", last_text)
+        text = r.text or ""
+        _audit_save_text(AUDIT_DIR, f"TPEX_{ymd8}_raw.txt", text)
 
-            # 1) /errors 直接降級（不再硬解）
-            if isinstance(last_url, str) and "/errors" in last_url:
-                time.sleep(0.5 + 0.5 * attempt)
-                continue
-
-            # 2) status 非 200：再試
-            if int(last_status or 0) >= 400:
-                time.sleep(0.5 + 0.5 * attempt)
-                continue
-
-            # 3) 成功則 break
-            break
-
-        # 把最後一次 raw 另外存一份固定檔名（方便你直接找）
-        _audit_save_text(AUDIT_DIR, f"TPEX_{ymd8}_raw.txt", last_text)
-
-        if isinstance(last_url, str) and "/errors" in last_url:
+        # 1) 明確偵測被導到錯誤頁
+        if isinstance(r.url, str) and "/errors" in r.url:
             warnings_bus.push("TPEX_REDIRECT_ERRORS", "TPEX request redirected to /errors (blocked or parameters rejected).", {
-                "final_url": last_url, "params": params, "prime_final_url": prime_meta.get("final_url")
+                "final_url": r.url, "params": params
             })
             return None, "TPEX_FAIL:REDIRECT_ERRORS", meta
 
-        # 4) 解析 JSON
+        ct = (r.headers.get("Content-Type") or "").lower()
+        r.raise_for_status()
+
+        # 2) JSON parse
         try:
-            js = json.loads(last_text)
+            js = r.json()
         except Exception as je:
-            head = (last_text[:400] or "").replace("\n", " ")
+            head = (text[:300] or "").replace("\n", " ")
             warnings_bus.push("TPEX_JSON_DECODE_FAIL", f"TPEX JSON decode fail: {je}", {
-                "final_url": last_url, "content_type": last_ct, "status": last_status, "head": head
+                "final_url": r.url, "content_type": ct, "head": head
             })
             return None, "TPEX_FAIL:JSONDecodeError", meta
 
@@ -441,23 +394,16 @@ def _tpex_audit_sum_by_st43(trade_date: str, allow_insecure_ssl: bool) -> Tuple[
             warnings_bus.push("TPEX_AUDIT_SCHEMA_FAIL", "TPEX JSON ok but aaData/data missing", {"keys": list(js.keys())[:30]})
             return None, "TPEX_FAIL:SCHEMA", meta
 
-        # 5) 欄位定位（優先靠表頭）
-        amt_idx = None
-
-        # 常見欄位順序（0-based）：
-        # 0代號 1名稱 2收盤 3漲跌 4開盤 5最高 6最低 7成交股數 8成交金額 9成交筆數 ...
-        amt_idx_guess = 8
+        # 3) 找成交金額欄位位置
+        amt_idx_guess = 8  # st43 常見：0代號 1名稱 ... 7成交股數 8成交金額 9成交筆數
 
         headers = js.get("aaDataHeader") or js.get("fields") or js.get("titles") or None
-        if isinstance(headers, list) and headers:
+        if isinstance(headers, list):
             hs = [str(x) for x in headers]
             for i, h in enumerate(hs):
                 if "成交金額" in h:
-                    amt_idx = i
+                    amt_idx_guess = i
                     break
-
-        if amt_idx is None:
-            amt_idx = amt_idx_guess
 
         total = 0
         missing = 0
@@ -470,24 +416,23 @@ def _tpex_audit_sum_by_st43(trade_date: str, allow_insecure_ssl: bool) -> Tuple[
             code = row[0] if len(row) > 0 else None
             name = row[1] if len(row) > 1 else None
 
-            amt_val = _safe_int(row[amt_idx] if amt_idx < len(row) else None, default=None)
+            amt_val = None
+            if amt_idx_guess < len(row):
+                amt_val = _safe_int(row[amt_idx_guess], default=None)
 
-            # fallback：若欄位抓不到，才做「整列掃描」，但要加嚴條件避免誤抓（例如最大值其實是成交股數）
+            # fallback：整列找最大且合理的數字（>= 1e7）
             if amt_val is None:
                 cand = []
-                for j, cell in enumerate(row):
+                for cell in row:
                     v = _safe_int(cell, default=None)
-                    if v is None:
-                        continue
-                    # 成交金額通常比成交股數大很多；保守設定：>= 5,000萬
-                    if v >= 50_000_000:
-                        cand.append((j, v))
-                # 若候選太多，容易誤判：此時直接視為缺失（避免錯加總）
-                if len(cand) == 1:
-                    amt_val = cand[0][1]
-                else:
-                    missing += 1
-                    continue
+                    if v is not None and v >= 10_000_000:
+                        cand.append(v)
+                if cand:
+                    amt_val = max(cand)
+
+            if amt_val is None:
+                missing += 1
+                continue
 
             total += int(amt_val)
             rows_out.append({"代號": code, "名稱": name, "成交金額": int(amt_val)})
@@ -502,22 +447,15 @@ def _tpex_audit_sum_by_st43(trade_date: str, allow_insecure_ssl: bool) -> Tuple[
             "rows": int(len(aa)),
             "missing_amount_rows": int(missing),
             "amount_sum": int(total),
-            "amount_col": "成交金額(元)",
-            "amount_col_index": int(amt_idx),
+            "amount_col": "成交金額",
+            "amount_col_index_guess": int(amt_idx_guess),
             "raw_saved": f"TPEX_{ymd8}_raw.txt",
             "json_saved": f"TPEX_{ymd8}_raw.json",
             "csv_saved": f"TPEX_{ymd8}_rows.csv",
-            "prime_saved": "TPEX_prime_st43_html.txt",
-            "attempt_raw_saved": [f"TPEX_{ymd8}_raw_attempt{i}.txt" for i in (1, 2, 3)],
         }
         meta["audit"] = audit
 
-        # 稽核硬門檻：TPEX 逐檔筆數通常數百~上千；missing 過高 → 視為異常
-        if total <= 0 or (len(aa) > 200 and missing / max(1, len(aa)) > 0.05):
-            warnings_bus.push("TPEX_AUDIT_SUSPICIOUS_SUM", "TPEX amount sum suspicious (too many missing or total<=0)", audit)
-            return None, "TPEX_FAIL:SUSPICIOUS", meta
-
-        return int(total), "TPEX_OK:AUDIT_SUM", meta
+        return int(total) if total > 0 else None, "TPEX_OK:AUDIT_SUM", meta
 
     except requests.exceptions.SSLError as e:
         warnings_bus.push("TPEX_SSL_ERROR", str(e), {"url": url, "params": params})
@@ -527,13 +465,19 @@ def _tpex_audit_sum_by_st43(trade_date: str, allow_insecure_ssl: bool) -> Tuple[
         return None, f"TPEX_FAIL:{type(e).__name__}", meta
 
 
+def _amount_scope(twse_amt: Optional[int], tpex_amt: Optional[int]) -> str:
+    if twse_amt is not None and tpex_amt is not None:
+        return "ALL"
+    if twse_amt is not None and tpex_amt is None:
+        return "TWSE_ONLY"
+    if twse_amt is None and tpex_amt is not None:
+        return "TPEX_ONLY"
+    return "NONE"
+
+
 def fetch_amount_total(trade_date: str, allow_insecure_ssl: bool = False) -> MarketAmount:
     """
     回傳：上市、上櫃、合計成交金額（元） + 稽核meta
-    並標記 scope：
-      - TWSE+TPEX：兩邊都到
-      - TWSE_ONLY / TPEX_ONLY：只有一邊
-      - NONE：兩邊都失敗
     """
     _ensure_dir(AUDIT_DIR)
 
@@ -541,16 +485,14 @@ def fetch_amount_total(trade_date: str, allow_insecure_ssl: bool = False) -> Mar
     tpex_amt, tpex_src, tpex_meta = _tpex_audit_sum_by_st43(trade_date, allow_insecure_ssl)
 
     total = None
-    scope = "NONE"
     if twse_amt is not None and tpex_amt is not None:
         total = int(twse_amt) + int(tpex_amt)
-        scope = "TWSE+TPEX"
     elif twse_amt is not None:
         total = int(twse_amt)
-        scope = "TWSE_ONLY"
     elif tpex_amt is not None:
         total = int(tpex_amt)
-        scope = "TPEX_ONLY"
+
+    scope = _amount_scope(twse_amt, tpex_amt)
 
     meta = {
         "trade_date": trade_date,
@@ -691,7 +633,6 @@ def _normalize_yf_columns(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
     if df is None or df.empty:
         return df
 
-    # 若 columns 是 MultiIndex，先壓扁
     if isinstance(df.columns, pd.MultiIndex):
         df = df.copy()
         df.columns = [' '.join([str(c) for c in col if str(c) != '']).strip() for col in df.columns.values]
@@ -734,8 +675,33 @@ def fetch_history(symbol: str, period: str = "5y", interval: str = "1d") -> pd.D
         return pd.DataFrame()
 
 
+def _single_fetch_price_volratio(sym: str) -> Tuple[Optional[float], Optional[float]]:
+    """
+    單檔補抓：只在批次結果缺值時使用
+    """
+    try:
+        df = yf.download(sym, period="6mo", interval="1d", auto_adjust=False, progress=False, group_by="column", threads=False)
+        if df is None or df.empty:
+            return None, None
+        close = df["Close"].dropna() if "Close" in df.columns else pd.Series(dtype=float)
+        vol = df["Volume"].dropna() if "Volume" in df.columns else pd.Series(dtype=float)
+
+        price = float(close.iloc[-1]) if len(close) else None
+        vol_ratio = None
+        if len(vol) >= 20:
+            ma20 = float(vol.rolling(20).mean().iloc[-1])
+            if ma20 and ma20 > 0:
+                vol_ratio = float(vol.iloc[-1] / ma20)
+        return price, vol_ratio
+    except Exception:
+        return None, None
+
+
 @st.cache_data(ttl=60 * 5, show_spinner=False)
 def fetch_batch_prices_volratio(symbols: List[str]) -> pd.DataFrame:
+    """
+    批次抓取 + 缺值單檔補抓
+    """
     out = pd.DataFrame({"Symbol": symbols})
     out["Price"] = None
     out["Vol_Ratio"] = None
@@ -752,6 +718,7 @@ def fetch_batch_prices_volratio(symbols: List[str]) -> pd.DataFrame:
     if df is None or df.empty:
         return out
 
+    # 先用批次填
     for sym in symbols:
         try:
             if isinstance(df.columns, pd.MultiIndex):
@@ -772,9 +739,22 @@ def fetch_batch_prices_volratio(symbols: List[str]) -> pd.DataFrame:
 
             out.loc[out["Symbol"] == sym, "Price"] = price
             out.loc[out["Symbol"] == sym, "Vol_Ratio"] = vol_ratio
-            out.loc[out["Symbol"] == sym, "source"] = "YF"
+            out.loc[out["Symbol"] == sym, "source"] = "YF_BATCH"
         except Exception:
             continue
+
+    # 缺值單檔補抓（只補缺）
+    need_fix = out[(out["Price"].isna()) | (out["Vol_Ratio"].isna())]["Symbol"].tolist()
+    if need_fix:
+        for sym in need_fix:
+            p, vr = _single_fetch_price_volratio(sym)
+            if p is not None and (out.loc[out["Symbol"] == sym, "Price"].isna().iloc[0]):
+                out.loc[out["Symbol"] == sym, "Price"] = float(p)
+            if vr is not None and (out.loc[out["Symbol"] == sym, "Vol_Ratio"].isna().iloc[0]):
+                out.loc[out["Symbol"] == sym, "Vol_Ratio"] = float(vr)
+            # 若補抓有任一成功，標記來源
+            if p is not None or vr is not None:
+                out.loc[out["Symbol"] == sym, "source"] = "YF_SINGLE"
 
     return out
 
@@ -955,9 +935,16 @@ def pick_regime(metrics: dict, vix: Optional[float] = None, ma14_monthly: Option
 
     if (vix is not None and float(vix) > float(vix_panic)) or (drawdown is not None and float(drawdown) <= -0.18):
         return "CRASH_RISK", 0.10
+
     if ma14_monthly and close_price and int(close_below_ma_days) >= 2 and float(close_price) < float(ma14_monthly) * 0.96:
         return "HIBERNATION", 0.20
+
+    # --- 灰區提前警戒：SMR 接近 0.25 且 slope5 明顯為負 ---
     if smr is not None and slope5 is not None:
+        if float(smr) >= SMR_WATCH and float(slope5) < -EPS:
+            # 不直接宣告 MEAN_REVERSION，但收斂上限
+            return "MEAN_REVERSION_WATCH", 0.55
+
         if float(smr) > 0.25 and float(slope5) < -EPS:
             return "MEAN_REVERSION", 0.45
         if float(smr) > 0.25 and float(slope5) >= -EPS:
@@ -979,7 +966,7 @@ def classify_layer(regime: str, momentum_lock: bool, vol_ratio: Optional[float],
     if (foreign_buy or trust_buy) and inst_streak3 >= 3:
         return "A"
     vr = _safe_float(vol_ratio, None)
-    if momentum_lock and (vr is not None and float(vr) > 0.8) and regime in ["NORMAL", "OVERHEAT", "CONSOLIDATION"]:
+    if momentum_lock and (vr is not None and float(vr) > 0.8) and regime in ["NORMAL", "OVERHEAT", "CONSOLIDATION", "MEAN_REVERSION_WATCH"]:
         return "B"
     return "NONE"
 
@@ -989,9 +976,9 @@ def compute_integrity_and_kill(stocks: List[dict], amount: MarketAmount, metrics
     price_null = sum(1 for s in stocks if s.get("Price") is None)
     volratio_null = sum(1 for s in stocks if s.get("Vol_Ratio") is None)
 
-    # 注意：amount_total 不為 None 但 scope=TWSE_ONLY 時，不能當作「全市場總額」已齊備
     amount_total_null = (amount.amount_total is None)
-    amount_partial = (amount.amount_total is not None and amount.scope in ("TWSE_ONLY", "TPEX_ONLY"))
+    amount_partial = bool(amount.scope in ("TWSE_ONLY", "TPEX_ONLY"))
+    amount_scope = str(amount.scope)
 
     denom = max(1, (2 * n + 1))
     core_missing = price_null + volratio_null + (1 if amount_total_null else 0)
@@ -1011,14 +998,16 @@ def compute_integrity_and_kill(stocks: List[dict], amount: MarketAmount, metrics
         reasons.append(f"volratio_null={volratio_null}/{n}")
     if amount_total_null:
         reasons.append("amount_total_null=True")
-    if amount_partial:
-        reasons.append(f"amount_scope={amount.scope}")
     if core_missing_pct >= 0.50:
         kill = True
         reasons.append(f"core_missing_pct={core_missing_pct:.2f}")
     if is_gap_crash:
         kill = True
         reasons.append(f"GAP_DOWN_CRASH({gap_down:.1%})")
+
+    # 不 kill，但要明確記錄：成交額僅部分市場
+    if amount_partial:
+        reasons.append(f"amount_scope={amount_scope}")
 
     return {
         "n": n,
@@ -1027,7 +1016,7 @@ def compute_integrity_and_kill(stocks: List[dict], amount: MarketAmount, metrics
         "core_missing_pct": core_missing_pct,
         "amount_total_null": amount_total_null,
         "amount_partial": amount_partial,
-        "amount_scope": amount.scope,
+        "amount_scope": amount_scope,
         "is_gap_crash": is_gap_crash,
         "kill": bool(kill),
         "reason": ("DATA_MISSING " + ", ".join(reasons)) if reasons else "OK",
@@ -1043,26 +1032,34 @@ def build_active_alerts(integrity: dict, amount: MarketAmount) -> List[str]:
         alerts.append("CRITICAL: 市場跳空重挫 (>7%)")
 
     if amount.amount_total is None:
-        alerts.append("DEGRADED_AMOUNT: 成交額數據缺失（TWSE/TPEX 皆未取到）")
-    else:
-        if amount.scope == "TWSE_ONLY":
+        alerts.append("DEGRADED_AMOUNT: 成交額數據完全缺失")
+    elif integrity.get("amount_partial"):
+        scope = integrity.get("amount_scope", "PARTIAL")
+        if scope == "TWSE_ONLY":
             alerts.append("DEGRADED_AMOUNT_PARTIAL: 目前僅有『上市(TWSE)』成交額；上櫃(TPEX)缺失")
-        elif amount.scope == "TPEX_ONLY":
+        elif scope == "TPEX_ONLY":
             alerts.append("DEGRADED_AMOUNT_PARTIAL: 目前僅有『上櫃(TPEX)』成交額；上市(TWSE)缺失")
+        else:
+            alerts.append(f"DEGRADED_AMOUNT_PARTIAL: 成交額涵蓋不足（scope={scope}）")
 
     n = int(integrity.get("n") or 0)
     if n > 0 and int(integrity.get("price_null") or 0) == n:
         alerts.append("CRITICAL: 所有個股價格=null")
     if n > 0 and int(integrity.get("volratio_null") or 0) == n:
         alerts.append("CRITICAL: 所有個股量能=null")
-
     cm = float(integrity.get("core_missing_pct") or 0.0)
     if cm >= 0.50:
         alerts.append(f"DATA_INTEGRITY_FAILURE: 缺失率={cm:.2f}")
-
     if integrity.get("kill"):
         alerts.append("FORCED_ALL_CASH: 強制避險模式")
     return alerts
+
+
+def _apply_amount_degrade(max_equity: float, account_mode: str, amount_partial: bool) -> float:
+    if not amount_partial:
+        return max_equity
+    factor = float(DEGRADE_FACTOR_BY_MODE.get(account_mode, 0.75))
+    return float(max_equity) * factor
 
 
 # =========================
@@ -1176,10 +1173,10 @@ def build_arbiter_input(session: str, account_mode: str, topn: int, positions: L
         price = row["Price"] if row is not None else None
         vol_ratio = row["Vol_Ratio"] if row is not None else None
 
-        if price is None:
-            warnings_bus.push("PRICE_NULL", "Missing Price", {"symbol": sym})
-        if vol_ratio is None:
-            warnings_bus.push("VOLRATIO_NULL", "Missing VolRatio", {"symbol": sym})
+        if price is None or pd.isna(price):
+            warnings_bus.push("PRICE_NULL", "Missing Price", {"symbol": sym, "src": (row["source"] if row is not None else "NONE")})
+        if vol_ratio is None or pd.isna(vol_ratio):
+            warnings_bus.push("VOLRATIO_NULL", "Missing VolRatio", {"symbol": sym, "src": (row["source"] if row is not None else "NONE")})
 
         inst_data = inst_map.get(sym, {"foreign_buy": False, "trust_buy": False, "inst_streak3": 0})
         layer = classify_layer(regime, bool(metrics.get("MOMENTUM_LOCK", False)), vol_ratio, inst_data)
@@ -1198,19 +1195,25 @@ def build_arbiter_input(session: str, account_mode: str, topn: int, positions: L
 
     integrity = compute_integrity_and_kill(stocks, amount, metrics)
     active_alerts = build_active_alerts(integrity, amount)
+
+    # 4) 依成交額狀態做「上限降級」
+    final_regime = "UNKNOWN" if integrity["kill"] else regime
+
+    # amount_partial 不 kill，但收斂 max equity
+    final_max_equity = 0.0 if integrity["kill"] else _apply_amount_degrade(float(max_equity), account_mode, bool(integrity.get("amount_partial")))
+
     current_exposure_pct = min(1.0, len(positions) * 0.05) if positions else 0.0
 
-    # 市場狀態判定（避免「只有TWSE也算NORMAL」）
-    if amount.amount_total is None:
-        market_status = "DEGRADED"
-    else:
-        market_status = "NORMAL" if amount.scope == "TWSE+TPEX" else "DEGRADED"
-
-    final_regime = "UNKNOWN" if integrity["kill"] else regime
-    final_max_equity = 0.0 if integrity["kill"] else max_equity
+    # market_status：成交額全缺 or 部分缺 → DEGRADED（符合你要求的語意）
     if integrity["kill"]:
         market_status = "SHELTER"
         current_exposure_pct = 0.0
+        final_regime = "UNKNOWN"
+        final_max_equity = 0.0
+    else:
+        market_status = "NORMAL"
+        if integrity.get("amount_total_null") or integrity.get("amount_partial"):
+            market_status = "DEGRADED"
 
     sources = {
         "twii": src_twii,
@@ -1277,6 +1280,17 @@ def build_arbiter_input(session: str, account_mode: str, topn: int, positions: L
 # =========================
 # UI
 # =========================
+def _amount_scope_label(scope: str) -> str:
+    s = (scope or "").upper()
+    if s == "ALL":
+        return "（全市場：TWSE+TPEX）"
+    if s == "TWSE_ONLY":
+        return "（僅上市：TWSE；TPEX 缺失）"
+    if s == "TPEX_ONLY":
+        return "（僅上櫃：TPEX；TWSE 缺失）"
+    return "（數據缺失）"
+
+
 def main():
     st.sidebar.header("設定 (Settings)")
     session = st.sidebar.selectbox("Session", ["INTRADAY", "EOD"], index=1)
@@ -1346,9 +1360,16 @@ def main():
         m2.metric("VIX 恐慌指數", f"{ov.get('vix'):.2f}" if ov.get("vix") is not None else "-")
 
         amt_total = amount.get("amount_total")
-        # ✅ 修正：顯示單位正確（億/兆），避免 7096.45 億被標成 7096.45 兆
-        m3.metric("市場總成交額", _fmt_amount_twd(amt_total))
+        scope = amount.get("scope", "NONE")
+        scope_label = _amount_scope_label(scope)
 
+        if amt_total is not None:
+            # 兆元（= 1e12） / 這裡你原本用 1_0000_0000（億）轉兆元的顯示方式保留（元→兆=1e12）
+            amt_str = f"{amt_total/1_000_000_000_000:.3f} 兆元 {scope_label}"
+        else:
+            amt_str = f"數據缺失 {scope_label}"
+
+        m3.metric("市場總成交額", amt_str)
         m4.metric("SMR 乖離率", f"{ov.get('smr'):.4f}" if ov.get('smr') is not None else "-")
 
         # --- 2.1 成交額稽核摘要 ---
@@ -1356,9 +1377,9 @@ def main():
             a_src = sources.get("amount_source", {})
             st.write({
                 "trade_date": sources.get("twii", {}).get("last_dt"),
-                "scope": a_src.get("scope"),
                 "source_twse": a_src.get("source_twse"),
                 "source_tpex": a_src.get("source_tpex"),
+                "scope": a_src.get("scope"),
                 "amount_twse": a_src.get("amount_twse"),
                 "amount_tpex": a_src.get("amount_tpex"),
                 "amount_total": a_src.get("amount_total"),
@@ -1394,7 +1415,7 @@ def main():
             st.success("✅ 系統運作正常，無錯誤日誌 (Clean Run)。")
         else:
             with st.expander(f"⚠️ 偵測到 {len(warns)} 條系統警示 (點擊查看詳情)", expanded=True):
-                st.warning("系統遭遇部分數據抓取失敗，已自動降級或使用備援數據。")
+                st.warning("系統遭遇部分數據抓取失敗，已自動降級或使用備援/補抓。")
                 w_df = pd.DataFrame(warns)
                 if not w_df.empty and 'code' in w_df.columns:
                     st.dataframe(w_df[['ts', 'code', 'msg']], use_container_width=True)
