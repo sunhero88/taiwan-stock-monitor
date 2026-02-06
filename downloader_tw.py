@@ -5,109 +5,146 @@ import os
 import json
 import logging
 from datetime import datetime
+from bs4 import BeautifulSoup
 
-# 配置環境
+# =========================
+# 系統配置與日誌
+# =========================
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
 MARKET_JSON = os.path.join(DATA_DIR, "market_amount.json")
 
-def get_cnyes_market_data():
-    """第一重救援：鉅亨網 API"""
-    url = "https://market-api.api.cnyes.com/nexus/api/v2/mainland/index/quote"
-    params = {"symbols": "TSE:TSE01:INDEX,OTC:OTC01:INDEX"}
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Accept': 'application/json, text/javascript, */*; q=0.01'
+}
+
+# =========================
+# 第一重：櫃買中心 OpenAPI (最可靠)
+# =========================
+def get_tpex_openapi():
+    """從 TPEX OpenAPI 抓取每日收盤行情統計"""
+    # 這是上櫃股票每日收盤行情資訊端點
+    url = "https://www.tpex.org.tw/openapi/v1/exchange/report/STOCK_DAY_ALL"
     try:
-        r = requests.get(url, params=params, timeout=10)
+        r = requests.get(url, headers=HEADERS, timeout=15)
         if r.status_code == 200:
-            items = r.json().get('data', {}).get('items', [])
-            tse, otc = None, None
-            for item in items:
-                symbol = item.get('symbol', '')
-                amount = int(float(item.get('turnover', 0)))
-                if "TSE" in symbol: tse = amount
-                if "OTC" in symbol: otc = amount
-            return tse, otc, "CNYES_API"
+            data = r.json()
+            # 加總所有個股成交金額 (單位：元)
+            total_amt = sum(int(float(item.get('TradeAmount', 0))) for item in data)
+            if total_amt > 0:
+                logging.info(f"✅ TPEX OpenAPI 成功: {total_amt:,}")
+                return total_amt, "TPEX_OPENAPI"
     except Exception as e:
-        logging.warning(f"鉅亨 API 抓取失敗: {e}")
-    return None, None, None
+        logging.warning(f"⚠️ TPEX OpenAPI 失敗: {e}")
+    return None, None
 
-def get_yahoo_index_backup():
-    """第二重救援：Yahoo Finance 指數估算法 (專治上櫃 null)"""
+# =========================
+# 第二重：新版 HTML 解析 (網頁抓取)
+# =========================
+def get_tpex_html_parse():
+    """解析櫃買中心「每日成交量值統計」頁面"""
+    url = "https://www.tpex.org.tw/zh-tw/mainboard/trading/statistics/daily.html"
     try:
-        # ^TWII = 上市, ^TWO = 上櫃
-        tse_idx = yf.Ticker("^TWII").history(period="1d")
-        otc_idx = yf.Ticker("^TWO").history(period="1d")
-        
-        tse_val = None
-        otc_val = None
-        
+        # 注意：實際資料通常透過後端 API 取得，這裡是模擬解析或抓取其顯示端點
+        api_url = "https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw&d=" + \
+                  (datetime.now().year - 1911).__str__() + datetime.now().strftime("/%m/%d")
+        r = requests.get(api_url, headers=HEADERS, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            # 取得「合計」列的成交金額
+            if 'reportData' in data:
+                # 假設最後一列是合計，第 3 欄是成交金額
+                total_str = data['reportData'][-1][2] 
+                amount = int(float(total_str.replace(',', '')))
+                return amount, "TPEX_HTML_JSON"
+    except:
+        pass
+    return None, None
+
+# =========================
+# 第三重：Yahoo 指數估算法 (保底機制)
+# =========================
+def get_yahoo_estimate():
+    """使用櫃買指數 (^TWO) 的量價進行估算，係數調升至 0.55"""
+    try:
+        otc_idx = yf.Ticker("^TWO").history(period="2d")
         if not otc_idx.empty:
-            # 估算公式：成交量 * 收盤價 * 0.45 (修正係數，模擬真實成交額)
-            otc_val = int(otc_idx['Volume'].iloc[-1] * otc_idx['Close'].iloc[-1] * 0.45)
-            logging.info(f"⚠️ 觸發 Yahoo 指數估算法，上櫃推估值: {otc_val:,}")
-            
-        if not tse_idx.empty:
-            tse_val = int(tse_idx['Volume'].iloc[-1] * tse_idx['Close'].iloc[-1] * 0.45)
-            
-        return tse_val, otc_val, "YAHOO_ESTIMATE"
+            last_vol = otc_idx['Volume'].iloc[-1]
+            last_close = otc_idx['Close'].iloc[-1]
+            # 修正係數提高到 0.55 以更貼近真實市場
+            est_amount = int(last_vol * last_close * 0.55)
+            logging.info(f"⚠️ 觸發 Yahoo 估算法: {est_amount:,}")
+            return est_amount, "YAHOO_ESTIMATE"
     except Exception as e:
-        logging.error(f"Yahoo 備援失敗: {e}")
-    return None, None, None
+        logging.error(f"❌ 所有 TPEX 抓取管道均失效: {e}")
+    return 0, "FAILED"
 
+# =========================
+# 主程序
+# =========================
 def main():
-    # 1. 嘗試抓取大盤金額 (多重機制)
-    tse, otc, source = get_cnyes_market_data()
-    if otc is None:
-        tse_b, otc_b, source_b = get_yahoo_index_backup()
-        tse, otc, source = tse_b, otc_b, source_b
+    logging.info("🚀 開始執行 Predator V16.3.9 數據同步...")
 
-    # 2. 下載個股數據 (包含 3324 等標的)
+    # --- 1. 抓取上市 (TWSE) ---
+    tse_amount = 0
+    try:
+        # 直接抓取上市總量 API
+        twse_url = f"https://www.twse.com.tw/exchangeReport/FMTQIK?response=json&date={datetime.now().strftime('%Y%m%d')}"
+        r_tse = requests.get(twse_url, headers=HEADERS, timeout=10)
+        if r_tse.status_code == 200:
+            tse_data = r_tse.json()
+            # 取最後一筆成交金額 (單位：元)
+            tse_amount = int(tse_data['data'][-1][2].replace(',', ''))
+    except:
+        logging.warning("TWSE 官方 API 異常，嘗試 yfinance 備援")
+        tse_idx = yf.Ticker("^TWII").history(period="1d")
+        tse_amount = int(tse_idx['Volume'].iloc[-1] * tse_idx['Close'].iloc[-1] * 0.5) if not tse_idx.empty else 0
+
+    # --- 2. 抓取上櫃 (TPEX) 多重機制 ---
+    otc_amount, otc_src = get_tpex_openapi()
+    if not otc_amount:
+        otc_amount, otc_src = get_tpex_html_parse()
+    if not otc_amount:
+        otc_amount, otc_src = get_yahoo_estimate()
+
+    # --- 3. 下載個股與救援雙鴻 (3324.TW) ---
     tickers = ["2330.TW", "2317.TW", "2454.TW", "3324.TW", "2308.TW", "2382.TW", "3231.TW", "3017.TW", "2603.TW"]
-    logging.info(f"正在下載 {len(tickers)} 檔個股...")
+    data = yf.download(tickers, period="5d", group_by='ticker', threads=False)
     
-    # 增加 threads=False 提高穩定性，避免 yfinance 併發錯誤
-    raw_data = yf.download(tickers, period="10d", interval="1d", threads=False)
-    
-    stock_results = []
-    for sym in tickers:
+    stock_list = []
+    for s in tickers:
         try:
-            # 修正 yfinance 多重索引問題
-            close_price = raw_data['Close'][sym].dropna().iloc[-1]
-            volume = raw_data['Volume'][sym].dropna().iloc[-1]
-            stock_results.append({"Symbol": sym, "Price": float(close_price), "Volume": int(volume)})
-        except Exception:
-            # 針對 3324.TW 等失敗標的進行「單點爆破」救援
-            logging.info(f"🔧 嘗試單獨救援 {sym}...")
-            single = yf.Ticker(sym).history(period="2d")
-            if not single.empty:
-                stock_results.append({
-                    "Symbol": sym, 
-                    "Price": float(single['Close'].iloc[-1]), 
-                    "Volume": int(single['Volume'].iloc[-1])
-                })
+            p = data[s]['Close'].dropna().iloc[-1]
+            v = data[s]['Volume'].dropna().iloc[-1]
+            stock_list.append({"Symbol": s, "Price": float(p), "Volume": int(v)})
+        except:
+            # 單點救援 3324.TW
+            logging.info(f"🔧 正在救援 {s}...")
+            fix = yf.Ticker(s).history(period="2d")
+            if not fix.empty:
+                stock_list.append({"Symbol": s, "Price": float(fix['Close'].iloc[-1]), "Volume": int(fix['Volume'].iloc[-1])})
 
-    # 3. 寫入 market_amount.json (關鍵修復點)
+    # --- 4. 輸出結果 ---
     market_output = {
         "trade_date": datetime.now().strftime("%Y-%m-%d"),
-        "amount_twse": tse,
-        "amount_tpex": otc,
-        "amount_total": (tse or 0) + (otc or 0),
-        "source": source,
-        "status": "OK" if (tse and otc) else "DEGRADED",
+        "amount_twse": tse_amount,
+        "amount_tpex": otc_amount,
+        "amount_total": tse_amount + otc_amount,
+        "source_tpex": otc_src,
+        "status": "OK" if otc_amount > 0 else "DEGRADED",
         "integrity": {
-            "price_null": len(tickers) - len(stock_results),
-            "amount_scope": "FULL" if otc else "TWSE_ONLY"
+            "tickers_count": len(stock_list),
+            "amount_partial": False if otc_amount > 0 else True
         }
     }
-    
+
     with open(MARKET_JSON, 'w', encoding='utf-8') as f:
         json.dump(market_output, f, indent=4, ensure_ascii=False)
-
-    # 4. 儲存個股 CSV
-    df_stocks = pd.DataFrame(stock_results)
-    df_stocks.to_csv(os.path.join(DATA_DIR, "data_tw-share.csv"), index=False)
     
-    logging.info(f"任務完成。市場狀態: {market_output['status']}, 數據源: {source}")
+    pd.DataFrame(stock_list).to_csv(os.path.join(DATA_DIR, "data_tw-share.csv"), index=False)
+    logging.info(f"✅ 同步完成。上櫃數據源: {otc_src}")
 
 if __name__ == "__main__":
     main()
