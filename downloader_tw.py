@@ -1,398 +1,376 @@
-TPEX 數據修復 - 完整解決方案問題診斷結果從你的資料看到：
-json"final_url": "https://www.tpex.org.tw/errors"
-"status_code": 200  // 但實際上是錯誤頁面這代表櫃買中心 API 已改版或參數錯誤。🔧 立即修復程式碼將以下完整程式碼替換你的檔案：pythonimport pandas as pd
-import yfinance as yf
-import requests
 import os
 import json
+import time
 import logging
-import traceback
+import re
 from datetime import datetime
-from bs4 import BeautifulSoup
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+from typing import Optional, Tuple, Dict, Any, List
 
-# ==================== 配置 ====================
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s'
-)
+import pandas as pd
+import requests
+import yfinance as yf
+
+# ===== (可選) Playwright：用真瀏覽器避開 /errors =====
+USE_PLAYWRIGHT_FALLBACK = True
+try:
+    from playwright.sync_api import sync_playwright
+except Exception:
+    sync_playwright = None
+    USE_PLAYWRIGHT_FALLBACK = False
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
 MARKET_JSON = os.path.join(DATA_DIR, "market_amount.json")
+STOCK_CSV = os.path.join(DATA_DIR, "data_tw-share.csv")
 
-HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-    'Accept': 'application/json, text/javascript, */*; q=0.01',
-    'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7',
-    'Referer': 'https://www.tpex.org.tw/',
-    'Connection': 'keep-alive'
-}
+TIMEOUT = 20
+RETRY = 3
+SLEEP_BETWEEN = 1.2
 
-session = requests.Session()
-retry = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
-adapter = HTTPAdapter(max_retries=retry)
-session.mount('http://', adapter)
-session.mount('https://', adapter)
-
-# ==================== ROC 日期轉換 ====================
-def roc_date(dt):
-    """ROC 年/月/日格式 (民國年)，確保兩位數"""
-    roc_year = dt.year - 1911
-    return f"{roc_year}/{dt.month:02d}/{dt.day:02d}"
-
-def roc_date_compact(dt):
-    """ROC 緊湊格式 YYYMMDD"""
-    roc_year = dt.year - 1911
-    return f"{roc_year:03d}{dt.month:02d}{dt.day:02d}"
-
-# ==================== TPEX Session 初始化 ====================
-def init_tpex_session():
-    """訪問主頁建立有效 session，避免被反爬"""
+def _to_int_from_commas(s: str) -> Optional[int]:
+    if s is None:
+        return None
+    s = str(s).strip().replace(",", "")
+    if not s or s.lower() in ("--", "null", "none"):
+        return None
     try:
-        # Step 1: 訪問首頁
-        r1 = session.get("https://www.tpex.org.tw/", headers=HEADERS, timeout=10)
-        logging.info(f"✅ TPEX 首頁訪問成功: {r1.status_code}")
-        
-        # Step 2: 訪問統計頁面
-        r2 = session.get(
-            "https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43.php?l=zh-tw",
-            headers=HEADERS,
-            timeout=10
-        )
-        logging.info(f"✅ TPEX 統計頁訪問成功: {r2.status_code}")
-        
-        return True
-    except Exception as e:
-        logging.error(f"❌ TPEX session 初始化失敗: {e}")
-        return False
+        return int(float(s))
+    except Exception:
+        return None
 
-# ==================== TWSE 上市成交額 ====================
-def get_twse_daily_amount():
-    """TWSE 日總成交金額 (優先 STOCK_DAY_ALL)"""
-    dt_str = datetime.now().strftime("%Y%m%d")
-    
-    # 主方法: STOCK_DAY_ALL
-    url = f"https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL?response=json&date={dt_str}"
-    try:
-        r = session.get(url, headers=HEADERS, timeout=10)
-        if r.status_code == 200:
-            data = r.json()
-            if 'data' in data and isinstance(data['data'], list):
-                total = sum(
-                    int(float(str(item[3]).replace(',', ''))) 
-                    for item in data['data'] 
-                    if len(item) > 3 and item[3]
-                )
-                if total > 0:
-                    logging.info(f"✅ TWSE STOCK_DAY_ALL: {total:,}")
-                    return total, "TWSE_STOCK_DAY_ALL"
-    except Exception as e:
-        logging.warning(f"TWSE STOCK_DAY_ALL 失敗: {e}")
-    
-    # 備援: MI_INDEX
-    url_mi = f"https://www.twse.com.tw/exchangeReport/MI_INDEX?response=json&date={dt_str}&type=ALLBUT0999"
-    try:
-        r = session.get(url_mi, headers=HEADERS, timeout=10)
-        if r.status_code == 200:
-            data = r.json()
-            if 'data9' in data and len(data['data9']) > 0:
-                total_str = data['data9'][0][2]
-                total = int(float(total_str.replace(',', '')))
-                logging.info(f"✅ TWSE MI_INDEX: {total:,}")
-                return total, "TWSE_MI_INDEX"
-    except Exception as e:
-        logging.warning(f"TWSE MI_INDEX 失敗: {e}")
-    
-    return 0, "TWSE_FAILED"
+def _is_tpex_errors_url(url: str) -> bool:
+    return bool(url) and ("tpex.org.tw/errors" in url)
 
-# ==================== TPEX 上櫃成交額 (多重方案) ====================
+def _parse_tpex_amount_from_html(html: str) -> Optional[int]:
+    """
+    保守解析：
+    1) 找 '成交金額' 附近的第一個千分位數字
+    2) 找不到就取頁面中「最大」的大數字（通常成交金額量級最大）
+    """
+    if not html:
+        return None
 
-# 方案 1: 新版 API (stk_wn1430)
-def get_tpex_stk_wn1430():
-    """TPEX 個股行情彙總 (最穩定)"""
-    roc_d = roc_date(datetime.now())
-    url = "https://www.tpex.org.tw/web/stock/aftertrading/otc_quotes_no1430/stk_wn1430_result.php"
-    params = {'l': 'zh-tw', 'd': roc_d, 'se': 'AL'}
-    
-    try:
-        r = session.get(url, params=params, headers=HEADERS, timeout=15)
-        logging.info(f"🔍 stk_wn1430 Status: {r.status_code}, URL: {r.url}")
-        
-        if r.status_code == 200 and 'error' not in r.url.lower():
-            data = r.json()
-            
-            # 檢查 aaData 欄位
-            if 'aaData' in data and data['aaData']:
-                total = 0
-                for row in data['aaData']:
-                    try:
-                        # 欄位: [代碼, 名稱, 收盤, 漲跌, ..., 成交金額(千元)]
-                        # 成交金額通常在索引 7 或 8
-                        amt_str = row[7].replace(',', '') if len(row) > 7 else '0'
-                        total += int(float(amt_str)) * 1000  # 千元轉元
-                    except (IndexError, ValueError):
-                        continue
-                
-                if total > 0:
-                    logging.info(f"✅ TPEX stk_wn1430 成功: {total:,}")
-                    return total, "TPEX_STK_WN1430"
-    
-    except Exception as e:
-        logging.warning(f"TPEX stk_wn1430 失敗: {e}")
-        logging.debug(traceback.format_exc())
-    
-    return None, None
+    m = re.search(r"成交金額[^0-9]{0,80}([0-9][0-9,]{3,})", html)
+    if m:
+        v = _to_int_from_commas(m.group(1))
+        if v and v > 0:
+            return v
 
-# 方案 2: 原版 st43 (加強 Debug)
-def get_tpex_st43_v2():
-    """TPEX st43 加強版 (修正參數格式)"""
-    roc_d = roc_date(datetime.now())
-    
-    # 嘗試多種參數組合
-    url_configs = [
-        {
-            'url': 'https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php',
-            'params': {'l': 'zh-tw', 'd': roc_d, 'se': 'EW'},
-            'name': 'st43_EW'
-        },
-        {
-            'url': 'https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php',
-            'params': {'l': 'zh-tw', 'd': roc_d, 'se': 'AL'},
-            'name': 'st43_AL'
-        },
-        {
-            'url': 'https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php',
-            'params': {'l': 'zh-tw', 'd': roc_d},
-            'name': 'st43_no_se'
-        }
-    ]
-    
-    for config in url_configs:
+    nums = re.findall(r"\b[0-9][0-9,]{6,}\b", html)
+    if not nums:
+        return None
+    cand = max((_to_int_from_commas(x) or 0) for x in nums)
+    return cand if cand > 0 else None
+
+# =========================
+# TWSE：官方 STOCK_DAY_ALL 加總
+# =========================
+def fetch_twse_amount(trade_date_yyyymmdd: str) -> Tuple[Optional[int], Dict[str, Any]]:
+    url = "https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL"
+    params = {"response": "json", "date": trade_date_yyyymmdd}
+
+    audit = {
+        "market": "TWSE",
+        "trade_date": f"{trade_date_yyyymmdd[:4]}-{trade_date_yyyymmdd[4:6]}-{trade_date_yyyymmdd[6:8]}",
+        "url": url,
+        "params": params,
+        "status_code": None,
+        "final_url": None,
+        "rows": None,
+        "missing_amount_rows": None,
+        "amount_sum": None,
+        "amount_col": "成交金額",
+    }
+
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json,text/plain,*/*",
+        "Referer": "https://www.twse.com.tw/",
+    }
+
+    for k in range(1, RETRY + 1):
         try:
-            r = session.get(
-                config['url'],
-                params=config['params'],
-                headers=HEADERS,
-                timeout=15,
-                allow_redirects=True
-            )
-            
-            logging.info(f"🔍 {config['name']} - Status: {r.status_code}, Final: {r.url}")
-            
-            # 檢查是否重導向到錯誤頁
-            if 'error' in r.url.lower() or r.status_code != 200:
-                continue
-            
-            # 檢查 Content-Type
-            content_type = r.headers.get('Content-Type', '')
-            if 'json' not in content_type.lower():
-                logging.warning(f"⚠️ {config['name']} 非 JSON: {content_type}")
-                continue
-            
-            data = r.json()
-            logging.info(f"📊 {config['name']} JSON Keys: {list(data.keys())}")
-            
-            # 解析 reportData
-            if 'reportData' in data and data['reportData']:
-                # 合計通常在最後一列
-                last_row = data['reportData'][-1]
-                
-                # 成交金額可能在索引 2 或 3
-                for idx in [2, 3]:
-                    try:
-                        amt_str = last_row[idx].replace(',', '').replace('億', '')
-                        amount = int(float(amt_str) * 100000000)  # 億元轉元
-                        
-                        if amount > 1000000000:  # 合理性檢查: > 10億
-                            logging.info(f"✅ {config['name']} 成功: {amount:,}")
-                            return amount, f"TPEX_{config['name'].upper()}"
-                    except (IndexError, ValueError):
-                        continue
-        
-        except Exception as e:
-            logging.warning(f"{config['name']} 失敗: {e}")
-            continue
-    
-    return None, None
+            r = requests.get(url, params=params, headers=headers, timeout=TIMEOUT)
+            audit["status_code"] = r.status_code
+            audit["final_url"] = r.url
+            r.raise_for_status()
 
-# 方案 3: HTML 解析
-def get_tpex_html_parse():
-    """從 TPEX 網頁直接解析"""
-    url = "https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43.php?l=zh-tw"
-    
-    try:
-        r = session.get(url, headers=HEADERS, timeout=10)
-        soup = BeautifulSoup(r.text, 'html.parser')
-        
-        # 方法 1: 尋找包含「總成交金額」的元素
-        for elem in soup.find_all(string=lambda t: '總成交金額' in str(t) if t else False):
-            next_td = elem.find_next('td')
-            if next_td:
-                amt_text = next_td.text.strip().replace(',', '').replace('億元', '')
-                try:
-                    amount = int(float(amt_text) * 100000000)
-                    if amount > 1000000000:
-                        logging.info(f"✅ TPEX HTML (總額): {amount:,}")
-                        return amount, "TPEX_HTML_TOTAL"
-                except:
+            js = r.json()
+            data = js.get("data", [])
+            fields = js.get("fields", [])
+
+            if not isinstance(data, list) or not fields:
+                raise ValueError("TWSE JSON 結構異常：缺少 data/fields")
+
+            idx_amount = fields.index("成交金額")
+
+            amount_sum = 0
+            missing = 0
+            for row in data:
+                v = row[idx_amount] if idx_amount < len(row) else None
+                vi = _to_int_from_commas(v)
+                if vi is None:
+                    missing += 1
                     continue
-        
-        # 方法 2: 尋找表格最後合計列
-        tables = soup.find_all('table', class_='table')
-        for table in tables:
-            rows = table.find_all('tr')
-            if rows:
-                last_row = rows[-1].find_all('td')
-                if len(last_row) >= 3:
-                    for idx in [2, 3]:
-                        try:
-                            amt_str = last_row[idx].text.strip().replace(',', '')
-                            amount = int(float(amt_str) * 100000000)
-                            if amount > 1000000000:
-                                logging.info(f"✅ TPEX HTML (表格): {amount:,}")
-                                return amount, "TPEX_HTML_TABLE"
-                        except:
-                            continue
-    
-    except Exception as e:
-        logging.warning(f"TPEX HTML 解析失敗: {e}")
-    
-    return None, None
+                amount_sum += vi
 
-# 方案 4: Yahoo 估算
-def get_yahoo_estimate():
-    """使用 Yahoo Finance 估算上櫃成交額"""
-    try:
-        otc = yf.Ticker("^TWO").history(period="2d", prepost=False)
-        if not otc.empty:
-            vol = otc['Volume'].iloc[-1]
-            close = otc['Close'].iloc[-1]
-            # 調整係數至 0.60 (根據歷史回測)
-            est = int(vol * close * 0.60)
-            logging.info(f"⚠️ Yahoo 估算 TPEX: {est:,} (係數 0.60)")
-            return est, "YAHOO_ESTIMATE_0.60"
-    except Exception as e:
-        logging.error(f"Yahoo 估算失敗: {e}")
-    
-    return 0, "FAILED"
+            audit["rows"] = len(data)
+            audit["missing_amount_rows"] = missing
+            audit["amount_sum"] = amount_sum
+            return amount_sum, audit
 
-# ==================== 主程序 ====================
-def main():
-    logging.info("=" * 60)
-    logging.info("🚀 Predator V16.3.11 - TPEX 終極修復版")
-    logging.info("=" * 60)
-    
-    # 1. 初始化 TPEX Session
-    init_tpex_session()
-    
-    # 2. TWSE 上市
-    tse_amount, tse_src = get_twse_daily_amount()
-    logging.info(f"📈 TWSE: {tse_amount:,} ({tse_src})")
-    
-    # 3. TPEX 上櫃 (四層 Fallback)
-    otc_amount, otc_src = get_tpex_stk_wn1430()  # 方案1: 新API
-    
-    if otc_amount is None:
-        logging.warning("⚠️ 方案1失敗，嘗試方案2...")
-        otc_amount, otc_src = get_tpex_st43_v2()  # 方案2: 原API改良
-    
-    if otc_amount is None:
-        logging.warning("⚠️ 方案2失敗，嘗試方案3...")
-        otc_amount, otc_src = get_tpex_html_parse()  # 方案3: HTML解析
-    
-    if otc_amount is None or otc_amount == 0:
-        logging.warning("⚠️ 方案3失敗，使用方案4...")
-        otc_amount, otc_src = get_yahoo_estimate()  # 方案4: Yahoo估算
-    
-    logging.info(f"📊 TPEX: {otc_amount:,} ({otc_src})")
-    
-    # 4. 失敗處理
-    if otc_amount == 0:
-        logging.error("🚨 所有 TPEX 抓取方法均失敗！")
-        logging.error("建議：")
-        logging.error("  1. 檢查網路連線/VPN")
-        logging.error("  2. 手動訪問 https://www.tpex.org.tw/ 確認網站正常")
-        logging.error("  3. 聯絡櫃買中心技術支援: (02)2369-9555")
-    
-    # 5. 個股數據 (包含雙鴻救援)
-    tickers = [
-        "2330.TW", "2317.TW", "2454.TW", "3324.TW", "2308.TW",
-        "2382.TW", "3231.TW", "3017.TW", "2603.TW", "2002.TW"
-    ]
-    
-    logging.info(f"📥 抓取個股數據: {len(tickers)} 檔")
-    data = yf.download(
-        tickers,
-        period="5d",
-        group_by='ticker',
-        threads=False,
-        prepost=False,
-        progress=False
-    )
-    
-    stock_list = []
-    for s in tickers:
-        try:
-            df = data[s] if s in data else pd.DataFrame()
-            if not df.empty:
-                p = df['Close'].dropna().iloc[-1]
-                v = df['Volume'].dropna().iloc[-1]
-                stock_list.append({
-                    "Symbol": s,
-                    "Price": float(p),
-                    "Volume": int(v)
-                })
-                continue
-        except:
-            pass
-        
-        # 單檔救援
-        logging.info(f"🔧 救援 {s}...")
-        try:
-            fix = yf.Ticker(s).history(period="3d", prepost=False)
-            if not fix.empty:
-                stock_list.append({
-                    "Symbol": s,
-                    "Price": float(fix['Close'].iloc[-1]),
-                    "Volume": int(fix['Volume'].iloc[-1])
-                })
         except Exception as e:
-            logging.error(f"❌ {s} 救援失敗: {e}")
-    
-    logging.info(f"✅ 個股數據完成: {len(stock_list)}/{len(tickers)} 檔")
-    
-    # 6. 輸出結果
+            logging.warning(f"TWSE 抓取失敗 (try {k}/{RETRY}): {e}")
+            time.sleep(SLEEP_BETWEEN * k)
+
+    return None, audit
+
+# =========================
+# TPEX：requests 嘗試（可能被導 /errors）
+# =========================
+def fetch_tpex_amount_requests(roc_date: str) -> Tuple[Optional[int], Dict[str, Any]]:
+    """
+    roc_date 例：115/02/06
+    """
+    stock_pricing_url = "https://www.tpex.org.tw/zh-tw/mainboard/trading/info/stock-pricing.html"
+    prime_url = "https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43.php"
+    result_url = "https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php"
+    se_candidates = ["EW", "AL", "ES"]
+
+    # 更像瀏覽器的 header（有時會差這些）
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.6",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Dest": "document",
+    }
+
+    audit: Dict[str, Any] = {
+        "market": "TPEX",
+        "roc_date": roc_date,
+        "phase": [],
+        "tries": [],
+        "chosen": None,
+        "status": "FAIL",
+        "reason": None,
+    }
+
+    sess = requests.Session()
+    sess.headers.update(headers)
+
+    # Phase 1：先進入 stock-pricing.html（更符合實際使用流程）
+    try:
+        r1 = sess.get(stock_pricing_url, params={"code": ""}, timeout=TIMEOUT, allow_redirects=True)
+        audit["phase"].append({"step": "stock_pricing", "status_code": r1.status_code, "final_url": r1.url})
+    except Exception as e:
+        audit["reason"] = f"STOCK_PRICING_FAIL: {e}"
+        return None, audit
+
+    # Phase 2：再 prime st43.php（拿可能需要的 cookie）
+    try:
+        r2 = sess.get(prime_url, params={"l": "zh-tw"}, timeout=TIMEOUT, allow_redirects=True)
+        audit["phase"].append({"step": "st43_prime", "status_code": r2.status_code, "final_url": r2.url})
+    except Exception as e:
+        audit["reason"] = f"PRIME_FAIL: {e}"
+        return None, audit
+
+    # Phase 3：打 result
+    for se in se_candidates:
+        params = {"l": "zh-tw", "d": roc_date, "se": se}
+
+        for k in range(1, RETRY + 1):
+            one = {"se": se, "try": k, "status_code": None, "final_url": None, "hit_errors": None, "amount": None}
+            try:
+                rr = sess.get(result_url, params=params, timeout=TIMEOUT, allow_redirects=True)
+                one["status_code"] = rr.status_code
+                one["final_url"] = rr.url
+                one["hit_errors"] = _is_tpex_errors_url(rr.url)
+
+                if one["hit_errors"]:
+                    audit["tries"].append(one)
+                    raise RuntimeError("redirected_to_/errors")
+
+                amount = _parse_tpex_amount_from_html(rr.text)
+                if not amount:
+                    audit["tries"].append(one)
+                    raise ValueError("parse_failed")
+
+                one["amount"] = amount
+                audit["tries"].append(one)
+                audit["chosen"] = {"se": se, "amount": amount}
+                audit["status"] = "OK"
+                audit["reason"] = "OK"
+                return amount, audit
+
+            except Exception as e:
+                audit["tries"].append(one)
+                logging.warning(f"TPEX(requests) se={se} (try {k}/{RETRY}) 失敗: {e}")
+                time.sleep(SLEEP_BETWEEN * k)
+
+    audit["reason"] = "ALL_SE_FAILED_or_WAF"
+    return None, audit
+
+# =========================
+# TPEX：Playwright 真瀏覽器救援（可跑 JS）
+# =========================
+def fetch_tpex_amount_playwright(roc_date: str) -> Tuple[Optional[int], Dict[str, Any]]:
+    """
+    用 headless chromium 走一遍真正瀏覽器流程，拿到 result HTML 再解析。
+    """
+    audit: Dict[str, Any] = {
+        "market": "TPEX",
+        "roc_date": roc_date,
+        "engine": "playwright",
+        "status": "FAIL",
+        "reason": None,
+        "steps": [],
+        "chosen": None,
+    }
+
+    if sync_playwright is None:
+        audit["reason"] = "PLAYWRIGHT_NOT_INSTALLED"
+        return None, audit
+
+    stock_pricing_url = "https://www.tpex.org.tw/zh-tw/mainboard/trading/info/stock-pricing.html?code="
+    result_url = "https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php"
+    se_candidates = ["EW", "AL", "ES"]
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(locale="zh-TW")
+        page = context.new_page()
+
+        # Step 1：先開主頁（讓站方把 cookie / session 建好）
+        page.goto(stock_pricing_url, wait_until="domcontentloaded", timeout=TIMEOUT * 1000)
+        audit["steps"].append({"step": "open_stock_pricing", "url": stock_pricing_url})
+
+        for se in se_candidates:
+            url = f"{result_url}?l=zh-tw&d={roc_date}&se={se}"
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=TIMEOUT * 1000)
+                final_url = page.url
+                audit["steps"].append({"step": "open_result", "se": se, "final_url": final_url})
+
+                if _is_tpex_errors_url(final_url):
+                    continue
+
+                html = page.content()
+                amount = _parse_tpex_amount_from_html(html)
+                if amount and amount > 0:
+                    audit["status"] = "OK"
+                    audit["reason"] = "OK"
+                    audit["chosen"] = {"se": se, "amount": amount}
+                    browser.close()
+                    return amount, audit
+
+            except Exception as e:
+                audit["steps"].append({"step": "error", "se": se, "err": str(e)})
+
+        browser.close()
+
+    audit["reason"] = "PLAYWRIGHT_FAILED_or_WAF"
+    return None, audit
+
+# =========================
+# 個股下載
+# =========================
+def download_stocks(tickers: List[str]) -> List[Dict[str, Any]]:
+    logging.info(f"正在下載 {len(tickers)} 檔個股（yfinance, threads=False）...")
+    raw = yf.download(tickers, period="10d", interval="1d", threads=False, progress=False)
+
+    out: List[Dict[str, Any]] = []
+    for sym in tickers:
+        try:
+            close_price = raw["Close"][sym].dropna().iloc[-1]
+            volume = raw["Volume"][sym].dropna().iloc[-1]
+            out.append({"Symbol": sym, "Price": float(close_price), "Volume": int(volume)})
+        except Exception:
+            logging.info(f"🔧 單獨救援 {sym} ...")
+            single = yf.Ticker(sym).history(period="5d")
+            if not single.empty and "Close" in single and "Volume" in single:
+                out.append({"Symbol": sym, "Price": float(single["Close"].iloc[-1]), "Volume": int(single["Volume"].iloc[-1])})
+            else:
+                out.append({"Symbol": sym, "Price": None, "Volume": None})
+    return out
+
+# =========================
+# 主程式
+# =========================
+def main():
+    trade_date = datetime.now().strftime("%Y-%m-%d")
+    yyyymmdd = trade_date.replace("-", "")
+    roc_year = int(trade_date[:4]) - 1911
+    roc_date = f"{roc_year}/{trade_date[5:7]}/{trade_date[8:10]}"
+
+    # 1) TWSE
+    twse_amount, twse_audit = fetch_twse_amount(yyyymmdd)
+    if twse_amount is not None:
+        logging.info(f"TWSE 成交額: {twse_amount:,}（約 {twse_amount/1e8:.1f} 億）")
+
+    # 2) TPEX（requests → playwright）
+    tpex_amount, tpex_audit = fetch_tpex_amount_requests(roc_date)
+
+    # 若仍被導 /errors：啟動 playwright
+    if (tpex_amount is None) and USE_PLAYWRIGHT_FALLBACK:
+        logging.warning("TPEX requests 仍失敗，啟動 Playwright 真瀏覽器救援...")
+        tpex_amount2, tpex_audit2 = fetch_tpex_amount_playwright(roc_date)
+        if tpex_amount2 is not None:
+            tpex_amount, tpex_audit = tpex_amount2, {"requests": tpex_audit, "playwright": tpex_audit2}
+        else:
+            tpex_audit = {"requests": tpex_audit, "playwright": tpex_audit2}
+
+    if tpex_amount is not None:
+        logging.info(f"TPEX 成交額: {tpex_amount:,}（約 {tpex_amount/1e8:.1f} 億）")
+    else:
+        logging.warning("TPEX 成交額仍為 null（WAF/導流未突破），維持降級。")
+
+    # 3) 個股
+    tickers = [
+        "2330.TW","2317.TW","2454.TW","2308.TW","2382.TW","3231.TW","2376.TW","3017.TW","3324.TW","3661.TW",
+        "2881.TW","2882.TW","2891.TW","2886.TW","2603.TW","2609.TW","1605.TW","1513.TW","1519.TW","2002.TW"
+    ]
+    stock_results = download_stocks(tickers)
+
+    # 4) Integrity
+    price_null = sum(1 for x in stock_results if x.get("Price") is None)
+    vol_null = sum(1 for x in stock_results if x.get("Volume") is None)
+
+    amount_total = (twse_amount or 0) + (tpex_amount or 0)
+    status = "OK" if (twse_amount is not None and tpex_amount is not None) else "DEGRADED"
+    amount_scope = "FULL" if (twse_amount is not None and tpex_amount is not None) else ("TWSE_ONLY" if twse_amount is not None else "NONE")
+
     market_output = {
-        "trade_date": datetime.now().strftime("%Y-%m-%d"),
-        "amount_twse": tse_amount,
-        "amount_tpex": otc_amount,
-        "amount_total": tse_amount + otc_amount,
-        "source_twse": tse_src,
-        "source_tpex": otc_src,
-        "status": "OK" if otc_amount > 0 else "DEGRADED",
+        "trade_date": trade_date,
+        "amount_twse": twse_amount,
+        "amount_tpex": tpex_amount,
+        "amount_total": amount_total if amount_total > 0 else None,
+        "status": status,
+        "amount_scope": amount_scope,
         "integrity": {
-            "tickers_count": len(stock_list),
-            "tickers_requested": len(tickers),
-            "amount_partial": otc_amount == 0,
-            "tpex_method_used": otc_src
+            "price_null": price_null,
+            "volume_null": vol_null,
+            "amount_partial": (amount_scope != "FULL"),
+            "note": "TPEX 若為 null：代表 /errors 導流（反爬/WAF）。本程式不推估，維持降級。",
+        },
+        "audit": {
+            "twse": twse_audit,
+            "tpex": tpex_audit,
         }
     }
-    
-    with open(MARKET_JSON, 'w', encoding='utf-8') as f:
-        json.dump(market_output, f, indent=4, ensure_ascii=False)
-    
-    pd.DataFrame(stock_list).to_csv(
-        os.path.join(DATA_DIR, "data_tw-share.csv"),
-        index=False
-    )
-    
-    logging.info("=" * 60)
-    logging.info(f"✅ 完成 | 上市: {tse_amount:,} | 上櫃: {otc_amount:,}")
-    logging.info(f"📦 總額: {market_output['amount_total']:,}")
-    logging.info(f"🔖 狀態: {market_output['status']}")
-    logging.info("=" * 60)
+
+    with open(MARKET_JSON, "w", encoding="utf-8") as f:
+        json.dump(market_output, f, indent=2, ensure_ascii=False)
+
+    pd.DataFrame(stock_results).to_csv(STOCK_CSV, index=False, encoding="utf-8-sig")
+
+    logging.info(f"輸出完成：{MARKET_JSON}, {STOCK_CSV}")
+    logging.info(f"市場狀態={status} / amount_scope={amount_scope} / amount_total={(market_output['amount_total'] or 0):,}")
 
 if __name__ == "__main__":
     main()
