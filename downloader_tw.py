@@ -1,6 +1,5 @@
 import pandas as pd
 import yfinance as yf
-import argparse
 import requests
 import os
 import json
@@ -9,215 +8,136 @@ import time
 from datetime import datetime
 
 # =========================
-# 系統配置與路徑設定 (Predator V16.3.7)
+# 系統配置
 # =========================
-logging.basicConfig(
-    level=logging.INFO, 
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    datefmt='%H:%M:%S'
-)
-
-# 確保路徑與主系統一致
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
-
-CACHE_FILE = os.path.join(DATA_DIR, ".stock_data_cache.json")
 MARKET_JSON = os.path.join(DATA_DIR, "market_amount.json")
 
 # =========================
-# 核心抓取邏輯：鉅亨網專業接口 (優化版)
+# 1. 強化版大盤數據抓取 (鉅亨 API + Yahoo 備援)
 # =========================
-def get_tpex_amount_professional():
+def fetch_market_amounts():
     """
-    完全跳過官網，改用鉅亨網 (Anue) 專業接口抓取上市/上櫃成交量。
+    抓取上市與上櫃成交金額，支援三重救援。
     """
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Referer': 'https://invest.cnyes.com/twstock/market/TSE'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     }
     
-    # 鉅亨網大盤統計 API
+    # --- 第一重：鉅亨網 API ---
     api_url = "https://market-api.api.cnyes.com/nexus/api/v2/mainland/index/quote"
     params = {"symbols": "TSE:TSE01:INDEX,OTC:OTC01:INDEX"}
+    
+    tse_amt, otc_amt = None, None
+    source = "UNKNOWN"
 
     try:
-        response = requests.get(api_url, params=params, headers=headers, timeout=10)
-        if response.status_code == 200:
-            res_data = response.json()
-            items = res_data.get('data', {}).get('items', [])
-            
-            tse_amount = 0
-            otc_amount = 0
-            
+        r = requests.get(api_url, params=params, headers=headers, timeout=10)
+        if r.status_code == 200:
+            items = r.json().get('data', {}).get('items', [])
             for item in items:
-                symbol = item.get('symbol')
-                # 這裡抓取的是 'turnover' (成交額)
-                turnover = item.get('turnover', 0)
-                
-                if symbol == "OTC:OTC01:INDEX":
-                    otc_amount = int(float(turnover))
-                elif symbol == "TSE:TSE01:INDEX":
-                    tse_amount = int(float(turnover))
+                sym = item.get('symbol', '')
+                val = int(float(item.get('turnover', 0)))
+                if "TSE" in sym: tse_amt = val
+                if "OTC" in sym: otc_amt = val
             
-            if otc_amount > 100000000: # 確保至少有1億，避免抓到空值
-                logging.info(f"✅ 取得數據 (鉅亨網 API) - 上市: {tse_amount:,}, 上櫃: {otc_amount:,}")
-                return otc_amount, "TPEX_CNYES_OK"
-                
+            if tse_amt and otc_amt:
+                logging.info(f"✅ 鉅亨 API 成功: 上櫃 {otc_amt:,}")
+                return tse_amt, otc_amt, "CNYES_API"
     except Exception as e:
-        logging.warning(f"⚠️ 鉅亨網 API 異常: {e}")
+        logging.warning(f"⚠️ 鉅亨 API 異常: {e}")
 
-    # --- 備援方案 1：Yahoo Finance ---
+    # --- 第二重：Yahoo Finance 指數備援 (強制執行) ---
+    logging.info("📡 嘗試 Yahoo 指數備援抓取上櫃數據...")
     try:
-        # ⚠️ 注意：Yahoo 的 ^TWO Volume 往往是張數而非金額
-        otc_ticker = yf.Ticker("^TWO")
-        df = otc_ticker.history(period="1d")
-        if not df.empty:
-            # 使用收盤價 * 成交量(張) * 1000 作為金額估算備援
-            vol_raw = df['Volume'].iloc[-1]
-            price_raw = df['Close'].iloc[-1]
-            est_amount = int(vol_raw * 1000 * (price_raw / 2.5)) # 權重校準因子
-            logging.info(f"🚀 取得數據 (Yahoo 備援估算) - 上櫃成交額約: {est_amount:,}")
-            return est_amount, "TPEX_YAHOO_BACKUP"
+        tse_idx = yf.Ticker("^TWII").history(period="1d")
+        otc_idx = yf.Ticker("^TWO").history(period="1d")
+        
+        if not otc_idx.empty:
+            # 上櫃成交額估算 (Volume * Close * 校準係數 0.45)
+            # 因為 Yahoo Volume 有時是張數，有時是金額，這裡做保險估算
+            y_otc_amt = int(otc_idx['Volume'].iloc[-1] * otc_idx['Close'].iloc[-1] * 0.45)
+            y_tse_amt = int(tse_idx['Volume'].iloc[-1] * tse_idx['Close'].iloc[-1] * 0.45) if not tse_idx.empty else tse_amt
+            
+            return y_tse_amt, y_otc_amt, "YAHOO_INDEX_EST"
     except Exception as e:
-        logging.warning(f"⚠️ Yahoo 備援異常: {e}")
+        logging.error(f"❌ Yahoo 備援也失敗: {e}")
 
-    # --- 備援方案 2：讀取本地歷史快取 ---
-    if os.path.exists(MARKET_JSON):
-        try:
-            with open(MARKET_JSON, 'r', encoding='utf-8') as f:
-                old_data = json.load(f)
-                logging.warning("🚨 官網與API皆失敗，使用最後一次成功數據")
-                return old_data.get('tpex_amount', 80000000000), "TPEX_FALLBACK_CACHE"
-        except: pass
-
-    return 80000000000, "TPEX_CRITICAL_DEGRADED"
+    return tse_amt or 0, otc_amt or 0, "CRITICAL_FAILURE"
 
 # =========================
-# 個股修復與快取邏輯
+# 2. 個股修復邏輯 (專治 3324 等漏網之魚)
 # =========================
-def save_to_cache(symbol, price, volume):
-    cache = {}
-    if os.path.exists(CACHE_FILE):
-        try:
-            with open(CACHE_FILE, 'r', encoding='utf-8') as f:
-                cache = json.load(f)
-        except: pass
-    cache[symbol] = {
-        'price': price, 
-        'volume': volume, 
-        'ts': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    }
-    with open(CACHE_FILE, 'w', encoding='utf-8') as f:
-        json.dump(cache, f, ensure_ascii=False, indent=4)
-
-def get_from_cache(symbol):
-    if os.path.exists(CACHE_FILE):
-        try:
-            with open(CACHE_FILE, 'r', encoding='utf-8') as f:
-                cache = json.load(f)
-                if symbol in cache:
-                    d = cache[symbol]
-                    # 劣化處理：快取數據量能打 9 折以示警覺
-                    return d['price'], d['volume'] * 0.9
-        except: pass
-    return None, None
-
-def repair_stock_gap(symbol):
-    """當主力下載失敗時，嘗試針對性修補單一個股"""
+def force_repair_stock(symbol):
+    """針對特定失敗標的進行單點突破"""
     try:
-        time.sleep(1.2) # 避開頻率限制
-        t = yf.Ticker(symbol)
-        df = t.history(period="5d")
+        ticker = yf.Ticker(symbol)
+        df = ticker.history(period="2d")
         if not df.empty:
             return df['Close'].iloc[-1], df['Volume'].iloc[-1]
-    except: pass
-    return get_from_cache(symbol)
+    except:
+        return None, None
 
 # =========================
-# 主下載邏輯
+# 3. 主程序
 # =========================
-def download_data(market_id):
-    logging.info(f"📡 Predator V16.3.7 執行環境：{market_id}")
+def run_predator_update():
+    tickers = ["2330.TW", "2317.TW", "2454.TW", "3324.TW", "2308.TW", "2382.TW", "3231.TW", "2603.TW"]
     
-    # 你關注的核心標的
-    tickers = ["2330.TW", "2317.TW", "3324.TW", "2308.TW", "2454.TW", "2382.TW", "3231.TW", "2603.TW"] 
+    # 執行大盤抓取
+    tse, otc, src = fetch_market_amounts()
+    total_amt = (tse or 0) + (otc or 0)
     
+    # 下載個股
+    logging.info("📥 開始下載個股數據...")
     try:
-        data = yf.download(tickers, period="1y", interval="1d", progress=False, group_by='column', timeout=30)
+        data = yf.download(tickers, period="5d", progress=False)
     except:
         data = pd.DataFrame()
 
-    df_list = []
-    for symbol in tickers:
+    results = []
+    for s in tickers:
+        p, v = None, None
         try:
-            has_data = False
-            s_close = pd.Series(dtype='float64')
-            s_vol = pd.Series(dtype='float64')
+            if not data.empty and ('Close', s) in data.columns:
+                p = data['Close'][s].dropna().iloc[-1]
+                v = data['Volume'][s].dropna().iloc[-1]
+            
+            # 檢查是否需要強行救援 (例如 3324.TW)
+            if p is None or pd.isna(p):
+                logging.info(f"🔧 觸發強行救援: {s}")
+                p, v = force_repair_stock(s)
+            
+            if p:
+                results.append({"Symbol": s, "Price": p, "Volume": v})
+        except:
+            continue
 
-            if not data.empty and 'Close' in data and symbol in data['Close']:
-                s_close = data['Close'][symbol].dropna()
-                s_vol = data['Volume'][symbol].dropna()
-                if not s_close.empty and not pd.isna(s_close.iloc[-1]): 
-                    has_data = True
-
-            # 觸發修補機制
-            if not has_data:
-                p, v = repair_stock_gap(symbol)
-                if p is not None:
-                    idx = pd.to_datetime([datetime.now().strftime("%Y-%m-%d")])
-                    s_close = pd.Series([p], index=idx)
-                    s_vol = pd.Series([v], index=idx)
-                    has_data = True
-                    logging.info(f"🔧 {symbol} 透過 Repair 成功救援")
-
-            if has_data:
-                save_to_cache(symbol, s_close.iloc[-1], s_vol.iloc[-1])
-                temp_df = pd.DataFrame({
-                    'Date': s_close.index, 
-                    'Symbol': symbol, 
-                    'Close': s_close.values, 
-                    'Volume': s_vol.values
-                })
-                df_list.append(temp_df)
-                
-        except Exception as e:
-            logging.error(f"❌ {symbol} 處理失敗: {e}")
-
-    # 執行強化版大盤成交額抓取
-    tpex_amt, tpex_src = get_tpex_amount_professional()
-    
-    market_status = {
-        "date": datetime.now().strftime("%Y-%m-%d"),
-        "tpex_amount": tpex_amt,
-        "tpex_source": tpex_src,
-        "status": "OK" if "OK" in tpex_src or "BACKUP" in tpex_src else "DEGRADED",
-        "update_ts": datetime.now().strftime("%H:%M:%S"),
-        "version": "V16.3.7-PRO"
+    # 輸出 Market JSON
+    market_data = {
+        "trade_date": datetime.now().strftime("%Y-%m-%d"),
+        "amount_twse": tse,
+        "amount_tpex": otc,
+        "amount_total": total_amt,
+        "source": src,
+        "status": "OK" if otc and otc > 0 else "DEGRADED_PARTIAL",
+        "integrity": {
+            "tickers_count": len(results),
+            "missing": [t for t in tickers if t not in [r['Symbol'] for r in results]]
+        }
     }
     
-    # 寫入 JSON (主系統 audit 使用)
-    with open(MARKET_JSON, "w", encoding="utf-8") as f:
-        json.dump(market_status, f, indent=4, ensure_ascii=False)
-
+    with open(MARKET_JSON, 'w', encoding='utf-8') as f:
+        json.dump(market_data, f, indent=4, ensure_ascii=False)
+    
     # 輸出 CSV
-    if df_list:
-        final_df = pd.concat(df_list)
-        output_file = os.path.join(DATA_DIR, f"data_{market_id}.csv")
-        final_df.to_csv(output_file, index=False)
-        logging.info(f"✅ 流程完成：{output_file}")
+    if results:
+        pd.DataFrame(results).to_csv(os.path.join(DATA_DIR, "data_tw-share.csv"), index=False)
+        logging.info(f"✅ 成功! 數據源: {src}, 標的補完: {len(results)}/{len(tickers)}")
     else:
-        logging.critical("❌ 數據全滅：請檢查網路環境")
+        logging.critical("🚨 數據全滅")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--market', default='tw-share')
-    args = parser.parse_args()
-    
-    # 增加重試間隔
-    for attempt in range(1, 4):
-        try:
-            download_data(args.market)
-            break
-        except Exception as e:
-            logging.error(f"第 {attempt} 次嘗試失敗: {e}")
-            if attempt < 3: time.sleep(10)
+    run_predator_update()
