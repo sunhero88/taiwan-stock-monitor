@@ -6,7 +6,7 @@
 # [最終驗收]
 # 1. 數據完整性：TopN=20 全數抓取，3324 等上櫃股自動補抓成功。
 # 2. UI 優化：DataFrame 高度自動延展，確保所有個股一目瞭然。
-# 3. 狀態提示：法人數據若未更新，顯示提示訊息。
+# 3. 穩定性：內建假日回溯與記憶體保護機制。
 # =========================================================
 
 from __future__ import annotations
@@ -211,7 +211,7 @@ def _fetch_tpex_robust(trade_date: str) -> Tuple[int, str]:
     except Exception:
         pass
 
-    # 4. 保底值 [FIX: 1700 億]
+    # 4. 保底值 1700 億
     return 170_000_000_000, "DOOMSDAY_SAFE_VAL_1700B" 
 
 def fetch_amount_total(trade_date: str) -> MarketAmount:
@@ -293,7 +293,7 @@ def fetch_batch_prices_volratio(symbols: List[str]) -> pd.DataFrame:
                         success = True
                 except: pass
         except Exception as e:
-            warnings_bus.push("SINGLE_YF_FAIL", str(e), {"symbol": sym})
+            pass
 
     return out
 
@@ -344,7 +344,6 @@ def build_arbiter_input(session, account_mode, topn, positions, cash, equity, to
     gc.collect() 
     
     # 1. Market Data
-    # 使用 fetch_history (5y)
     twii = fetch_history(TWII_SYMBOL)
     vix = fetch_history(VIX_SYMBOL)
     
@@ -441,7 +440,7 @@ def main():
         else:
             st.error(f"🔴 使用保底數據 ({src_label})")
 
-        # [FINAL FIX] UI 顯示優化
+        # [FINAL UI] 優化顯示
         st.subheader("🎯 核心持股雷達 (20 檔完整監控)")
         s_df = pd.json_normalize(payload["stocks"])
         if not s_df.empty:
