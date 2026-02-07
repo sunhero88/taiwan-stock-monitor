@@ -1,12 +1,12 @@
 # main.py
 # =========================================================
-# Sunhero｜股市智能超盤中控台（Predator V16.3.17-TIME_MACHINE）
-# 針對「假日/非交易時段」運行的邏輯修復版
+# Sunhero｜股市智能超盤中控台（Predator V16.3.18-FINAL）
+# 針對雲端環境 + 假日 + IP封鎖 的最終防崩潰版本
 #
-# 關鍵修正 (V16.3.17)：
-# 1. [時光回溯] 自動偵測「最後一個有效交易日」，強制爬蟲抓取該日數據 (解決週六抓不到週五的問題)。
-# 2. [連線偽裝] 強化 HTTP Headers，模擬 Mac/Chrome 真人瀏覽器，嘗試繞過 IP 封鎖。
-# 3. [備援優化] 當 yfinance 回傳多日數據時，自動鎖定最後一筆 (iloc[-1])。
+# [核心修復]
+# 1. UI 防爆：修復 SMR/VIX 為 None 時導致的 TypeError 崩潰。
+# 2. 假日邏輯：自動鎖定「最近交易日」，避免週六抓不到數據。
+# 3. 資源控管：維持 TopN=8，保護雲端主機記憶體。
 # =========================================================
 
 from __future__ import annotations
@@ -34,17 +34,17 @@ warnings.filterwarnings('ignore')
 # Streamlit page config
 # =========================
 st.set_page_config(
-    page_title="Sunhero｜股市智能超盤中控台（Predator V16.3.17）",
+    page_title="Sunhero｜股市智能超盤中控台（Predator V16.3.18）",
     layout="wide",
 )
 
-APP_TITLE = "Sunhero｜股市智能超盤中控台（TopN + 持倉監控 / V16.3.17-TIME_MACHINE）"
+APP_TITLE = "Sunhero｜股市智能超盤中控台（TopN + 持倉監控 / V16.3.18-FINAL）"
 st.title(APP_TITLE)
 
 # =========================
 # Global Constants
 # =========================
-DEFAULT_TOPN = 10
+DEFAULT_TOPN = 8  # 雲端安全值
 DEFAULT_CASH = 2_000_000
 DEFAULT_EQUITY = 2_000_000
 
@@ -108,22 +108,20 @@ class WarningBus:
 warnings_bus = WarningBus()
 
 # =========================
-# Session Management (強化偽裝)
+# Session Management
 # =========================
 def _http_session() -> requests.Session:
     s = requests.Session()
-    # 模擬真實 MacOS Chrome 用戶，降低被擋機率
+    # 盡量模擬真實瀏覽器，減少被擋機率
     s.headers.update({
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/json,application/xml;q=0.9,*/*;q=0.8",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/json,*/*",
         "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Referer": "https://tw.stock.yahoo.com/",
-        "Connection": "keep-alive"
     })
     return s
 
 # =========================
-# 核心修復：數據抓取
+# 核心修復：數據抓取邏輯
 # =========================
 @dataclass
 class MarketAmount:
@@ -136,48 +134,58 @@ class MarketAmount:
     meta: Optional[Dict[str, Any]] = None
 
 def _fetch_twse_robust(trade_date: str) -> Tuple[int, str]:
-    """上市 (TWSE) - 指定日期抓取"""
-    date_str = trade_date.replace("-", "") # 20260206
+    """上市 (TWSE)"""
+    date_str = trade_date.replace("-", "")
     
-    # 策略 1: 官方 API
+    # 1. 官方 API
     try:
         url = f"https://www.twse.com.tw/exchangeReport/FMTQIK?response=json&date={date_str}"
-        r = _http_session().get(url, timeout=5)
+        r = _http_session().get(url, timeout=3) # 縮短超時，避免卡住
         if r.status_code == 200:
             data = r.json()
             if 'data' in data and len(data['data']) > 0:
-                # 這裡要小心，FMTQIK 回傳的是整月數據，需找到對應日期
-                # 簡化：如果回傳有數據，取最後一筆 (通常是最近交易日)
                 val_str = data['data'][-1][2].replace(',', '')
                 return int(val_str), "TWSE_OFFICIAL_API"
-        else:
-            warnings_bus.push("TWSE_HTTP_ERR", str(r.status_code))
-    except Exception as e:
-        warnings_bus.push("TWSE_API_FAIL", str(e))
+    except Exception:
+        pass
     
-    # 策略 2: Yahoo 估算 (抓 5 天防假日)
+    # 2. Yahoo 估算 (5日保護)
     try:
         t = yf.Ticker("^TWII")
         h = t.history(period="5d") 
         if not h.empty:
-            last_row = h.iloc[-1]
-            est = int(last_row['Volume'] * last_row['Close'] * 0.5) 
+            last = h.iloc[-1]
+            est = int(last['Volume'] * last['Close'] * 0.5) 
             return est, "TWSE_YAHOO_EST"
-        else:
-            warnings_bus.push("TWSE_YF_EMPTY", "No data")
-    except Exception:
+    except:
         pass
     
     return 300_000_000_000, "TWSE_SAFE_MODE"
 
 def _fetch_tpex_robust(trade_date: str) -> Tuple[int, str]:
-    """上櫃 (TPEX) - 多源備援"""
+    """上櫃 (TPEX) - 雲端多重備援"""
     
-    # 策略 1: 鉅亨網 API
+    # 1. HiStock (結構簡單，較不易擋)
+    try:
+        url = "https://histock.tw/index/TWO"
+        r = _http_session().get(url, timeout=5)
+        if r.status_code == 200:
+            soup = BeautifulSoup(r.text, 'html.parser')
+            for span in soup.find_all(['span', 'div']):
+                if "成交金額" in span.text or "成交值" in span.text:
+                    match = re.search(r'(\d{3,5}\.?\d*)', span.text)
+                    if match:
+                        val = float(match.group(1))
+                        amt = int(val * 100_000_000) if val < 10000 else int(val)
+                        if amt > 10_000_000_000: return amt, "HISTOCK_WEB"
+    except Exception:
+        pass
+
+    # 2. 鉅亨網 API
     try:
         url = "https://market-api.api.cnyes.com/nexus/api/v2/mainland/index/quote"
         params = {"symbols": "OTC:OTC01:INDEX"}
-        r = _http_session().get(url, params=params, timeout=5)
+        r = _http_session().get(url, params=params, timeout=3)
         if r.status_code == 200:
             items = r.json().get('data', {}).get('items', [])
             for item in items:
@@ -185,64 +193,41 @@ def _fetch_tpex_robust(trade_date: str) -> Tuple[int, str]:
                     val = item.get('turnover')
                     if val:
                         amt = float(val)
-                        if amt < 10000: amt = int(amt * 100_000_000)
+                        if amt < 10000: amt = int(amt * 100_000_000) 
                         else: amt = int(amt)
                         if amt > 10_000_000_000: return amt, "CNYES_API"
-        else:
-            warnings_bus.push("CNYES_HTTP", str(r.status_code))
-    except Exception as e:
-        warnings_bus.push("CNYES_FAIL", str(e))
-
-    # 策略 2: Yahoo 網頁解析
-    try:
-        url = "https://tw.stock.yahoo.com/quote/^TWO"
-        r = _http_session().get(url, timeout=8)
-        soup = BeautifulSoup(r.text, 'html.parser')
-        for span in soup.find_all('span'):
-            if "成交值" in span.text:
-                container = span.parent.parent
-                if container:
-                    match = re.search(r'成交值.*?(\d{3,5}\.?\d*)', container.get_text())
-                    if match:
-                        return int(float(match.group(1)) * 100_000_000), "YAHOO_WEB_PARSE"
     except Exception:
         pass
 
-    # 策略 3: Yahoo Finance 估算 (關鍵修正：5d + iloc[-1])
+    # 3. Yahoo Finance 估算 (5日保護)
     try:
         t = yf.Ticker("^TWO")
-        # [FIX] 使用 5d 確保能抓到週五數據
         h = t.history(period="5d") 
         if not h.empty:
-            last_row = h.iloc[-1]
-            vol = last_row['Volume']
-            close = last_row['Close']
-            # 經驗公式
-            est = int(vol * close * 1000 * 0.6)
+            last = h.iloc[-1]
+            est = int(last['Volume'] * last['Close'] * 1000 * 0.6)
             if est < 10_000_000_000: est *= 1000
             return est, "YAHOO_EST_CALC"
-        else:
-            warnings_bus.push("TPEX_YF_EMPTY", "No data")
-    except Exception as e:
-        warnings_bus.push("TPEX_YF_FAIL", str(e))
+    except Exception:
+        pass
 
+    # 4. 保底值
     return 1_700_000_000_000, "DOOMSDAY_SAFE_VAL_1700B" 
 
 def fetch_amount_total(trade_date: str) -> MarketAmount:
     _ensure_dir(AUDIT_DIR)
-    # 使用傳入的「有效交易日」去抓取
     twse_amt, twse_src = _fetch_twse_robust(trade_date)
     tpex_amt, tpex_src = _fetch_tpex_robust(trade_date)
     total = twse_amt + tpex_amt
     return MarketAmount(twse_amt, tpex_amt, total, twse_src, tpex_src, "FULL", {"trade_date": trade_date})
 
 # =========================
-# Data Fetchers (Optimized)
+# Data Fetchers (Light)
 # =========================
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_history_light(symbol: str) -> pd.DataFrame:
     try:
-        # [FIX] 抓 5 天，確保跨週末
+        # [CRITICAL] 抓5天，確保遇到假日不回傳空值
         df = yf.download(symbol, period="5d", interval="1d", progress=False, threads=False)
         if isinstance(df.columns, pd.MultiIndex):
             df = df.xs(symbol, axis=1, level=1, drop_level=True)
@@ -255,6 +240,7 @@ def fetch_batch_light(symbols: List[str]) -> pd.DataFrame:
     out = pd.DataFrame({"Symbol": symbols, "Price": None, "Vol_Ratio": None})
     if not symbols: return out
     try:
+        # [CRITICAL] 抓5天
         data = yf.download(symbols, period="5d", progress=False, group_by="ticker", threads=False)
         for i, sym in out.iterrows():
             try:
@@ -280,23 +266,34 @@ def fetch_batch_light(symbols: List[str]) -> pd.DataFrame:
 # Logic Builders
 # =========================
 def compute_regime_metrics(market_df: pd.DataFrame) -> dict:
-    if market_df.empty: return {"SMR": None, "Slope5": None}
+    if market_df.empty or len(market_df) < 5: 
+        return {"SMR": None, "Slope5": None} # 數據不足回傳 None
+    
     close = market_df["Close"]
     ma200 = close.rolling(200).mean()
     smr_series = ((close - ma200) / ma200).dropna()
+    
     if smr_series.empty: return {"SMR": None}
+    
     smr = float(smr_series.iloc[-1])
-    slope5 = float(smr_series.rolling(5).mean().diff().iloc[-1]) if len(smr_series) > 5 else 0.0
+    slope5 = 0.0
+    if len(smr_series) >= 2: # 避免索引錯誤
+        slope5 = float(smr_series.rolling(5).mean().diff().iloc[-1])
+        
     return {"SMR": smr, "Slope5": slope5}
 
 def pick_regime(metrics: dict, vix: float) -> Tuple[str, float]:
     smr = metrics.get("SMR")
     slope5 = metrics.get("Slope5")
+    
+    # [FIX] 如果 SMR 是 None，直接回傳預設值，不要報錯
+    if smr is None: return "DATA_INSUFFICIENT", 0.0
+    if slope5 is None: slope5 = 0.0
+
     if vix > 35.0: return "CRASH_RISK", 0.10
-    if smr is not None and slope5 is not None:
-        if smr >= SMR_WATCH and slope5 < 0: return "MEAN_REVERSION_WATCH", 0.55
-        if smr > 0.25: return "OVERHEAT", 0.55
-        if 0.08 <= smr <= 0.18: return "CONSOLIDATION", 0.65
+    if smr >= SMR_WATCH and slope5 < 0: return "MEAN_REVERSION_WATCH", 0.55
+    if smr > 0.25: return "OVERHEAT", 0.55
+    if 0.08 <= smr <= 0.18: return "CONSOLIDATION", 0.65
     return "NORMAL", 0.85
 
 def classify_layer(regime: str, vol_ratio: Optional[float], inst: dict) -> str:
@@ -315,16 +312,24 @@ def build_arbiter_input(session, account_mode, topn, positions, cash, equity, to
     twii = fetch_history_light(TWII_SYMBOL)
     vix = fetch_history_light(VIX_SYMBOL)
     
-    # [KEY FIX] 判定最後有效交易日
+    # [TIME MACHINE FIX] 自動鎖定最後有效交易日
     if not twii.empty:
-        last_dt = twii.index[-1] # 這會是週五 2/6
+        last_dt = twii.index[-1] # 這會抓到週五的日期
         trade_date_str = last_dt.strftime("%Y-%m-%d")
-        vix_last = float(vix["Close"].iloc[-1]) if not vix.empty else 20.0
-        # 傳遞正確的日期給爬蟲
+        
+        # 使用最後一筆收盤價，而不是 iloc[-1] (如果是空的)
+        twii_close = float(twii["Close"].iloc[-1])
+        
+        if not vix.empty:
+            vix_last = float(vix["Close"].iloc[-1])
+        else:
+            vix_last = 20.0 # VIX保底
+            
         amount = fetch_amount_total(trade_date_str)
     else:
-        # 如果連歷史數據都抓不到，才用今天
+        # 完全抓不到歷史數據 (嚴重IP封鎖)
         trade_date_str = _now_ts().split()[0]
+        twii_close = 0.0
         vix_last = 20.0
         amount = MarketAmount(None, None, None, "FAIL", "FAIL", "NONE")
 
@@ -339,22 +344,21 @@ def build_arbiter_input(session, account_mode, topn, positions, cash, equity, to
         row = pv[pv["Symbol"] == sym]
         p = float(row["Price"].iloc[0]) if not row.empty and not pd.isna(row["Price"].iloc[0]) else None
         v = float(row["Vol_Ratio"].iloc[0]) if not row.empty and not pd.isna(row["Vol_Ratio"].iloc[0]) else None
-        
         inst_data = {"Inst_Streak3": 0}
         layer = classify_layer(regime, v, inst_data)
         stocks.append({
             "Symbol": sym, "Name": STOCK_NAME_MAP.get(sym, sym), "Tier": 0, "Price": p, "Vol_Ratio": v, "Layer": layer, "Institutional": inst_data
         })
 
-    market_status = "OK" if "CNYES" in amount.source_tpex or "YAHOO" in amount.source_tpex else "ESTIMATED"
+    market_status = "OK" if "HISTOCK" in amount.source_tpex or "CNYES" in amount.source_tpex else "ESTIMATED"
     if "DOOMSDAY" in amount.source_tpex: market_status = "SAFE_MODE"
 
     return {
         "meta": {"timestamp": _now_ts(), "market_status": market_status, "current_regime": regime},
         "macro": {
             "overview": {
-                "trade_date": trade_date_str, # 顯示修正後的日期
-                "twii_close": float(twii["Close"].iloc[-1]) if not twii.empty else 0,
+                "trade_date": trade_date_str,
+                "twii_close": twii_close,
                 "vix": vix_last,
                 "smr": metrics["SMR"],
                 "max_equity_allowed_pct": max_equity
@@ -371,9 +375,9 @@ def build_arbiter_input(session, account_mode, topn, positions, cash, equity, to
 def main():
     st.sidebar.header("設定 (Settings)")
     account_mode = st.sidebar.selectbox("帳戶模式", ["Conservative", "Balanced", "Aggressive"])
-    topn = st.sidebar.selectbox("TopN（監控數量 - 雲端版限制）", [5, 8, 10, 15], index=2)
+    topn = st.sidebar.selectbox("TopN（監控數量 - 雲端版限制）", [5, 8, 10, 15], index=1)
     
-    run_btn = st.sidebar.button("啟動中控台 (V16.3.17)")
+    run_btn = st.sidebar.button("啟動中控台 (V16.3.18)")
     
     if run_btn:
         with st.spinner("執行中 (自動校正交易日)..."):
@@ -391,10 +395,16 @@ def main():
         src_label = amt['source_tpex']
         
         c3.metric("總成交額 (億)", f"{amt_val:,.0f}", help=f"來源: {src_label}")
-        c4.metric("SMR 乖離", f"{ov['smr']:.4f}")
         
-        if "CNYES" in src_label:
-            st.success(f"✅ 成功連線鉅亨網 ({src_label})")
+        # [CRITICAL FIX] 安全顯示 SMR，避免 TypeError
+        smr_val = ov.get('smr')
+        if smr_val is not None:
+            c4.metric("SMR 乖離", f"{smr_val:.4f}")
+        else:
+            c4.metric("SMR 乖離", "N/A (數據不足)")
+        
+        if "HISTOCK" in src_label or "CNYES" in src_label:
+            st.success(f"✅ 成功獲取數據 ({src_label})")
         elif "YAHOO" in src_label:
             st.warning(f"⚠️ 使用 Yahoo 數據 ({src_label})")
         else:
