@@ -1,12 +1,12 @@
 # main.py
 # =========================================================
-# Sunhero｜股市智能超盤中控台（Predator V16.3.19-PATCHED）
-# 針對數據精確度的最終修正版
+# Sunhero｜股市智能超盤中控台（Predator V16.3.20-FINAL_PATCH）
+# 針對「雲端環境」的最終完美版
 #
-# [核心修正]
-# 1. 指數抓取：fetch_history 改為 "5y"，確保 MA200/SMR 能算出數值。
-# 2. 數據保底：Doomsday 改為 1700 億 (170B)，符合真實行情量級。
-# 3. 個股補抓：增加單檔補抓機制，解決 Price NULL 問題。
+# [本次修正]
+# 1. 個股補抓：針對 3324 等上櫃股，增加 .TW -> .TWO 自動切換嘗試，解決 NULL 問題。
+# 2. 數據保底：確認 TPEX 保底值為 1700 億 (符合近期行情)。
+# 3. 假日邏輯：全線採用 period="5d" + iloc[-1]，週六日也能正常顯示週五數據。
 # =========================================================
 
 from __future__ import annotations
@@ -34,11 +34,11 @@ warnings.filterwarnings('ignore')
 # Streamlit page config
 # =========================
 st.set_page_config(
-    page_title="Sunhero｜股市智能超盤中控台（Predator V16.3.19）",
+    page_title="Sunhero｜股市智能超盤中控台（Predator V16.3.20）",
     layout="wide",
 )
 
-APP_TITLE = "Sunhero｜股市智能超盤中控台（TopN + 持倉監控 / V16.3.19-PATCHED）"
+APP_TITLE = "Sunhero｜股市智能超盤中控台（TopN + 持倉監控 / V16.3.20-FINAL）"
 st.title(APP_TITLE)
 
 # =========================
@@ -117,7 +117,6 @@ def _http_session() -> requests.Session:
         "Accept": "text/html,application/xhtml+xml,application/json,*/*",
         "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
     })
-    # 若需 Proxy 可在此處加入: s.proxies = ...
     return s
 
 # =========================
@@ -212,7 +211,7 @@ def _fetch_tpex_robust(trade_date: str) -> Tuple[int, str]:
     except Exception:
         pass
 
-    # 4. 保底值 [FIX: 修正為 1700 億]
+    # 4. 保底值 [FIX: 1700 億]
     return 170_000_000_000, "DOOMSDAY_SAFE_VAL_1700B" 
 
 def fetch_amount_total(trade_date: str) -> MarketAmount:
@@ -227,7 +226,7 @@ def fetch_amount_total(trade_date: str) -> MarketAmount:
 # =========================
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_history(symbol: str) -> pd.DataFrame:
-    """抓取歷史數據 (大盤專用) - [FIX] 改為 5y 以計算 SMR"""
+    """抓取歷史數據 (大盤專用) - [FIX] 5y 以計算 SMR"""
     try:
         df = yf.download(symbol, period="5y", interval="1d", progress=False, threads=False)
         if isinstance(df.columns, pd.MultiIndex):
@@ -242,7 +241,7 @@ def fetch_batch_prices_volratio(symbols: List[str]) -> pd.DataFrame:
     out = pd.DataFrame({"Symbol": symbols, "Price": None, "Vol_Ratio": None})
     if not symbols: return out
     
-    # 1. 批量嘗試
+    # 1. 批量嘗試 (標準)
     try:
         data = yf.download(symbols, period="5d", progress=False, group_by="ticker", threads=False)
         for i, sym in out.iterrows():
@@ -255,9 +254,8 @@ def fetch_batch_prices_volratio(symbols: List[str]) -> pd.DataFrame:
                     else: continue
 
                 if isinstance(df, pd.DataFrame) and not df.empty:
-                    close = df["Close"].dropna() if "Close" in df.columns else pd.Series()
-                    vol = df["Volume"].dropna() if "Volume" in df.columns else pd.Series()
-                    
+                    close = df["Close"].dropna()
+                    vol = df["Volume"].dropna()
                     if not close.empty: out.at[i, "Price"] = float(close.iloc[-1])
                     if len(vol) >= 20:
                         ma20 = vol.rolling(20).mean().iloc[-1]
@@ -265,21 +263,37 @@ def fetch_batch_prices_volratio(symbols: List[str]) -> pd.DataFrame:
             except: pass
     except: pass
 
-    # 2. [FIX] 強制個股單檔補抓 (解決 Price NULL)
+    # 2. [FIX] 強力單檔補抓 (解決 3324.TW NULL 問題)
     missing = out[out["Price"].isna()]["Symbol"].tolist()
     for sym in missing:
         try:
-            t = yf.Ticker(sym)
-            h = t.history(period="5d")
-            if not h.empty:
-                out.loc[out["Symbol"] == sym, "Price"] = float(h["Close"].iloc[-1])
-                # 簡易補一個 VolRatio
-                vol = h["Volume"].iloc[-1]
-                avg = h["Volume"].mean()
-                if avg > 0:
-                    out.loc[out["Symbol"] == sym, "Vol_Ratio"] = float(vol / avg)
-        except:
-            pass
+            # 嘗試策略：原 Symbol -> 切換成 .TWO (上櫃後綴)
+            candidates = [sym]
+            if sym.endswith(".TW"):
+                candidates.append(sym.replace(".TW", ".TWO"))
+            
+            success = False
+            for try_sym in candidates:
+                if success: break
+                try:
+                    t = yf.Ticker(try_sym)
+                    h = t.history(period="5d") # 改 5d 防抓不到
+                    if not h.empty:
+                        # 抓到了！填回原始 Symbol 的位置
+                        idx = out[out["Symbol"] == sym].index
+                        out.loc[idx, "Price"] = float(h["Close"].iloc[-1])
+                        
+                        # 補量能比
+                        vol = h["Volume"].iloc[-1]
+                        avg_vol = h["Volume"].mean()
+                        if avg_vol > 0:
+                            out.loc[idx, "Vol_Ratio"] = float(vol / avg_vol)
+                        else:
+                            out.loc[idx, "Vol_Ratio"] = 1.0
+                        success = True
+                except: pass
+        except Exception as e:
+            warnings_bus.push("SINGLE_YF_FAIL", str(e), {"symbol": sym})
 
     return out
 
@@ -395,7 +409,7 @@ def main():
     account_mode = st.sidebar.selectbox("帳戶模式", ["Conservative", "Balanced", "Aggressive"])
     topn = st.sidebar.selectbox("TopN（監控數量）", [5, 8, 10, 15], index=2)
     
-    run_btn = st.sidebar.button("啟動中控台 (V16.3.19)")
+    run_btn = st.sidebar.button("啟動中控台 (V16.3.20)")
     
     if run_btn:
         with st.spinner("執行中..."):
