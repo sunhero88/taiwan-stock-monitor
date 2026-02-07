@@ -1,12 +1,12 @@
 # main.py
 # =========================================================
-# Sunhero｜股市智能超盤中控台（Predator V16.3.18-FINAL）
-# 針對雲端環境 + 假日 + IP封鎖 的最終防崩潰版本
+# Sunhero｜股市智能超盤中控台（Predator V16.3.19-PATCHED）
+# 針對數據精確度的最終修正版
 #
-# [核心修復]
-# 1. UI 防爆：修復 SMR/VIX 為 None 時導致的 TypeError 崩潰。
-# 2. 假日邏輯：自動鎖定「最近交易日」，避免週六抓不到數據。
-# 3. 資源控管：維持 TopN=8，保護雲端主機記憶體。
+# [核心修正]
+# 1. 指數抓取：fetch_history 改為 "5y"，確保 MA200/SMR 能算出數值。
+# 2. 數據保底：Doomsday 改為 1700 億 (170B)，符合真實行情量級。
+# 3. 個股補抓：增加單檔補抓機制，解決 Price NULL 問題。
 # =========================================================
 
 from __future__ import annotations
@@ -34,17 +34,17 @@ warnings.filterwarnings('ignore')
 # Streamlit page config
 # =========================
 st.set_page_config(
-    page_title="Sunhero｜股市智能超盤中控台（Predator V16.3.18）",
+    page_title="Sunhero｜股市智能超盤中控台（Predator V16.3.19）",
     layout="wide",
 )
 
-APP_TITLE = "Sunhero｜股市智能超盤中控台（TopN + 持倉監控 / V16.3.18-FINAL）"
+APP_TITLE = "Sunhero｜股市智能超盤中控台（TopN + 持倉監控 / V16.3.19-PATCHED）"
 st.title(APP_TITLE)
 
 # =========================
 # Global Constants
 # =========================
-DEFAULT_TOPN = 8  # 雲端安全值
+DEFAULT_TOPN = 10
 DEFAULT_CASH = 2_000_000
 DEFAULT_EQUITY = 2_000_000
 
@@ -112,12 +112,12 @@ warnings_bus = WarningBus()
 # =========================
 def _http_session() -> requests.Session:
     s = requests.Session()
-    # 盡量模擬真實瀏覽器，減少被擋機率
     s.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/json,*/*",
         "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
     })
+    # 若需 Proxy 可在此處加入: s.proxies = ...
     return s
 
 # =========================
@@ -140,7 +140,7 @@ def _fetch_twse_robust(trade_date: str) -> Tuple[int, str]:
     # 1. 官方 API
     try:
         url = f"https://www.twse.com.tw/exchangeReport/FMTQIK?response=json&date={date_str}"
-        r = _http_session().get(url, timeout=3) # 縮短超時，避免卡住
+        r = _http_session().get(url, timeout=3)
         if r.status_code == 200:
             data = r.json()
             if 'data' in data and len(data['data']) > 0:
@@ -160,12 +160,13 @@ def _fetch_twse_robust(trade_date: str) -> Tuple[int, str]:
     except:
         pass
     
+    # 保底 3000億
     return 300_000_000_000, "TWSE_SAFE_MODE"
 
 def _fetch_tpex_robust(trade_date: str) -> Tuple[int, str]:
     """上櫃 (TPEX) - 雲端多重備援"""
     
-    # 1. HiStock (結構簡單，較不易擋)
+    # 1. HiStock
     try:
         url = "https://histock.tw/index/TWO"
         r = _http_session().get(url, timeout=5)
@@ -199,7 +200,7 @@ def _fetch_tpex_robust(trade_date: str) -> Tuple[int, str]:
     except Exception:
         pass
 
-    # 3. Yahoo Finance 估算 (5日保護)
+    # 3. Yahoo Finance 估算
     try:
         t = yf.Ticker("^TWO")
         h = t.history(period="5d") 
@@ -211,8 +212,8 @@ def _fetch_tpex_robust(trade_date: str) -> Tuple[int, str]:
     except Exception:
         pass
 
-    # 4. 保底值
-    return 1_700_000_000_000, "DOOMSDAY_SAFE_VAL_1700B" 
+    # 4. 保底值 [FIX: 修正為 1700 億]
+    return 170_000_000_000, "DOOMSDAY_SAFE_VAL_1700B" 
 
 def fetch_amount_total(trade_date: str) -> MarketAmount:
     _ensure_dir(AUDIT_DIR)
@@ -222,13 +223,13 @@ def fetch_amount_total(trade_date: str) -> MarketAmount:
     return MarketAmount(twse_amt, tpex_amt, total, twse_src, tpex_src, "FULL", {"trade_date": trade_date})
 
 # =========================
-# Data Fetchers (Light)
+# Data Fetchers (Optimized)
 # =========================
 @st.cache_data(ttl=600, show_spinner=False)
-def fetch_history_light(symbol: str) -> pd.DataFrame:
+def fetch_history(symbol: str) -> pd.DataFrame:
+    """抓取歷史數據 (大盤專用) - [FIX] 改為 5y 以計算 SMR"""
     try:
-        # [CRITICAL] 抓5天，確保遇到假日不回傳空值
-        df = yf.download(symbol, period="5d", interval="1d", progress=False, threads=False)
+        df = yf.download(symbol, period="5y", interval="1d", progress=False, threads=False)
         if isinstance(df.columns, pd.MultiIndex):
             df = df.xs(symbol, axis=1, level=1, drop_level=True)
         return df
@@ -236,11 +237,13 @@ def fetch_history_light(symbol: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_batch_light(symbols: List[str]) -> pd.DataFrame:
+def fetch_batch_prices_volratio(symbols: List[str]) -> pd.DataFrame:
+    """批次抓取股價 (含個股補抓機制)"""
     out = pd.DataFrame({"Symbol": symbols, "Price": None, "Vol_Ratio": None})
     if not symbols: return out
+    
+    # 1. 批量嘗試
     try:
-        # [CRITICAL] 抓5天
         data = yf.download(symbols, period="5d", progress=False, group_by="ticker", threads=False)
         for i, sym in out.iterrows():
             try:
@@ -252,22 +255,41 @@ def fetch_batch_light(symbols: List[str]) -> pd.DataFrame:
                     else: continue
 
                 if isinstance(df, pd.DataFrame) and not df.empty:
-                    close = df["Close"].dropna()
-                    vol = df["Volume"].dropna()
+                    close = df["Close"].dropna() if "Close" in df.columns else pd.Series()
+                    vol = df["Volume"].dropna() if "Volume" in df.columns else pd.Series()
+                    
                     if not close.empty: out.at[i, "Price"] = float(close.iloc[-1])
                     if len(vol) >= 20:
                         ma20 = vol.rolling(20).mean().iloc[-1]
                         if ma20 > 0: out.at[i, "Vol_Ratio"] = float(vol.iloc[-1] / ma20)
             except: pass
     except: pass
+
+    # 2. [FIX] 強制個股單檔補抓 (解決 Price NULL)
+    missing = out[out["Price"].isna()]["Symbol"].tolist()
+    for sym in missing:
+        try:
+            t = yf.Ticker(sym)
+            h = t.history(period="5d")
+            if not h.empty:
+                out.loc[out["Symbol"] == sym, "Price"] = float(h["Close"].iloc[-1])
+                # 簡易補一個 VolRatio
+                vol = h["Volume"].iloc[-1]
+                avg = h["Volume"].mean()
+                if avg > 0:
+                    out.loc[out["Symbol"] == sym, "Vol_Ratio"] = float(vol / avg)
+        except:
+            pass
+
     return out
 
 # =========================
 # Logic Builders
 # =========================
 def compute_regime_metrics(market_df: pd.DataFrame) -> dict:
-    if market_df.empty or len(market_df) < 5: 
-        return {"SMR": None, "Slope5": None} # 數據不足回傳 None
+    # 需要足夠長的歷史數據算 MA200
+    if market_df.empty or len(market_df) < 200: 
+        return {"SMR": None, "Slope5": None}
     
     close = market_df["Close"]
     ma200 = close.rolling(200).mean()
@@ -277,7 +299,7 @@ def compute_regime_metrics(market_df: pd.DataFrame) -> dict:
     
     smr = float(smr_series.iloc[-1])
     slope5 = 0.0
-    if len(smr_series) >= 2: # 避免索引錯誤
+    if len(smr_series) >= 2:
         slope5 = float(smr_series.rolling(5).mean().diff().iloc[-1])
         
     return {"SMR": smr, "Slope5": slope5}
@@ -286,7 +308,6 @@ def pick_regime(metrics: dict, vix: float) -> Tuple[str, float]:
     smr = metrics.get("SMR")
     slope5 = metrics.get("Slope5")
     
-    # [FIX] 如果 SMR 是 None，直接回傳預設值，不要報錯
     if smr is None: return "DATA_INSUFFICIENT", 0.0
     if slope5 is None: slope5 = 0.0
 
@@ -309,25 +330,22 @@ def build_arbiter_input(session, account_mode, topn, positions, cash, equity, to
     gc.collect() 
     
     # 1. Market Data
-    twii = fetch_history_light(TWII_SYMBOL)
-    vix = fetch_history_light(VIX_SYMBOL)
+    # 使用 fetch_history (5y)
+    twii = fetch_history(TWII_SYMBOL)
+    vix = fetch_history(VIX_SYMBOL)
     
-    # [TIME MACHINE FIX] 自動鎖定最後有效交易日
     if not twii.empty:
-        last_dt = twii.index[-1] # 這會抓到週五的日期
+        last_dt = twii.index[-1]
         trade_date_str = last_dt.strftime("%Y-%m-%d")
-        
-        # 使用最後一筆收盤價，而不是 iloc[-1] (如果是空的)
         twii_close = float(twii["Close"].iloc[-1])
         
         if not vix.empty:
             vix_last = float(vix["Close"].iloc[-1])
         else:
-            vix_last = 20.0 # VIX保底
+            vix_last = 20.0 
             
         amount = fetch_amount_total(trade_date_str)
     else:
-        # 完全抓不到歷史數據 (嚴重IP封鎖)
         trade_date_str = _now_ts().split()[0]
         twii_close = 0.0
         vix_last = 20.0
@@ -338,7 +356,7 @@ def build_arbiter_input(session, account_mode, topn, positions, cash, equity, to
     
     # 3. Stocks
     base_pool = list(STOCK_NAME_MAP.keys())[:topn] 
-    pv = fetch_batch_light(base_pool)
+    pv = fetch_batch_prices_volratio(base_pool)
     stocks = []
     for sym in base_pool:
         row = pv[pv["Symbol"] == sym]
@@ -375,12 +393,12 @@ def build_arbiter_input(session, account_mode, topn, positions, cash, equity, to
 def main():
     st.sidebar.header("設定 (Settings)")
     account_mode = st.sidebar.selectbox("帳戶模式", ["Conservative", "Balanced", "Aggressive"])
-    topn = st.sidebar.selectbox("TopN（監控數量 - 雲端版限制）", [5, 8, 10, 15], index=1)
+    topn = st.sidebar.selectbox("TopN（監控數量）", [5, 8, 10, 15], index=2)
     
-    run_btn = st.sidebar.button("啟動中控台 (V16.3.18)")
+    run_btn = st.sidebar.button("啟動中控台 (V16.3.19)")
     
     if run_btn:
-        with st.spinner("執行中 (自動校正交易日)..."):
+        with st.spinner("執行中..."):
             payload, warns = build_arbiter_input("INTRADAY", account_mode, topn, [], 2000000, 2000000, None)
             
         ov = payload["macro"]["overview"]
@@ -396,12 +414,11 @@ def main():
         
         c3.metric("總成交額 (億)", f"{amt_val:,.0f}", help=f"來源: {src_label}")
         
-        # [CRITICAL FIX] 安全顯示 SMR，避免 TypeError
         smr_val = ov.get('smr')
         if smr_val is not None:
             c4.metric("SMR 乖離", f"{smr_val:.4f}")
         else:
-            c4.metric("SMR 乖離", "N/A (數據不足)")
+            c4.metric("SMR 乖離", "N/A")
         
         if "HISTOCK" in src_label or "CNYES" in src_label:
             st.success(f"✅ 成功獲取數據 ({src_label})")
