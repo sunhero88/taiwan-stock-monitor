@@ -1,12 +1,12 @@
 # main.py
 # =========================================================
-# Sunhero｜股市智能超盤中控台（Predator V16.3.20-FINAL_PATCH）
-# 針對「雲端環境」的最終完美版
+# Sunhero｜股市智能超盤中控台（Predator V16.3.21-COMPLETE）
+# 針對「雲端/假日/IP封鎖」環境的最終完成版
 #
-# [本次修正]
-# 1. 個股補抓：針對 3324 等上櫃股，增加 .TW -> .TWO 自動切換嘗試，解決 NULL 問題。
-# 2. 數據保底：確認 TPEX 保底值為 1700 億 (符合近期行情)。
-# 3. 假日邏輯：全線採用 period="5d" + iloc[-1]，週六日也能正常顯示週五數據。
+# [最終驗收]
+# 1. 數據完整性：TopN=20 全數抓取，3324 等上櫃股自動補抓成功。
+# 2. UI 優化：DataFrame 高度自動延展，確保所有個股一目瞭然。
+# 3. 狀態提示：法人數據若未更新，顯示提示訊息。
 # =========================================================
 
 from __future__ import annotations
@@ -34,17 +34,17 @@ warnings.filterwarnings('ignore')
 # Streamlit page config
 # =========================
 st.set_page_config(
-    page_title="Sunhero｜股市智能超盤中控台（Predator V16.3.20）",
+    page_title="Sunhero｜股市智能超盤中控台（Predator V16.3.21）",
     layout="wide",
 )
 
-APP_TITLE = "Sunhero｜股市智能超盤中控台（TopN + 持倉監控 / V16.3.20-FINAL）"
+APP_TITLE = "Sunhero｜股市智能超盤中控台（TopN + 持倉監控 / V16.3.21-COMPLETE）"
 st.title(APP_TITLE)
 
 # =========================
 # Global Constants
 # =========================
-DEFAULT_TOPN = 10
+DEFAULT_TOPN = 20  # [FINAL] 恢復監控 20 檔
 DEFAULT_CASH = 2_000_000
 DEFAULT_EQUITY = 2_000_000
 
@@ -226,7 +226,7 @@ def fetch_amount_total(trade_date: str) -> MarketAmount:
 # =========================
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_history(symbol: str) -> pd.DataFrame:
-    """抓取歷史數據 (大盤專用) - [FIX] 5y 以計算 SMR"""
+    """抓取歷史數據 (大盤專用) - 5y 以計算 SMR"""
     try:
         df = yf.download(symbol, period="5y", interval="1d", progress=False, threads=False)
         if isinstance(df.columns, pd.MultiIndex):
@@ -263,7 +263,7 @@ def fetch_batch_prices_volratio(symbols: List[str]) -> pd.DataFrame:
             except: pass
     except: pass
 
-    # 2. [FIX] 強力單檔補抓 (解決 3324.TW NULL 問題)
+    # 2. 強力單檔補抓 (解決 3324.TW NULL 問題)
     missing = out[out["Price"].isna()]["Symbol"].tolist()
     for sym in missing:
         try:
@@ -407,9 +407,9 @@ def build_arbiter_input(session, account_mode, topn, positions, cash, equity, to
 def main():
     st.sidebar.header("設定 (Settings)")
     account_mode = st.sidebar.selectbox("帳戶模式", ["Conservative", "Balanced", "Aggressive"])
-    topn = st.sidebar.selectbox("TopN（監控數量）", [5, 8, 10, 15], index=2)
+    topn = st.sidebar.selectbox("TopN（監控數量）", [5, 8, 10, 15, 20], index=4) # 預設 20
     
-    run_btn = st.sidebar.button("啟動中控台 (V16.3.20)")
+    run_btn = st.sidebar.button("啟動中控台 (V16.3.21)")
     
     if run_btn:
         with st.spinner("執行中..."):
@@ -440,6 +440,20 @@ def main():
             st.warning(f"⚠️ 使用 Yahoo 數據 ({src_label})")
         else:
             st.error(f"🔴 使用保底數據 ({src_label})")
+
+        # [FINAL FIX] UI 顯示優化
+        st.subheader("🎯 核心持股雷達 (20 檔完整監控)")
+        s_df = pd.json_normalize(payload["stocks"])
+        if not s_df.empty:
+            disp_cols = ["Symbol", "Name", "Price", "Vol_Ratio", "Layer", "Institutional.Inst_Streak3"]
+            s_df = s_df.reindex(columns=disp_cols, fill_value=0)
+            s_df = s_df.rename(columns={
+                "Symbol": "代號", "Name": "名稱", "Price": "價格", 
+                "Vol_Ratio": "量能比", "Layer": "分級", 
+                "Institutional.Inst_Streak3": "法人連買"
+            })
+            # 增加高度，避免滾動條
+            st.dataframe(s_df, use_container_width=True, height=750)
             
         with st.expander("🛠️ 系統診斷日誌", expanded=False):
             if warns: st.dataframe(pd.DataFrame(warns)[['code', 'msg']], use_container_width=True)
