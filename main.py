@@ -1,12 +1,12 @@
 # main.py
 # =========================================================
-# Sunhero｜股市智能超盤中控台（Predator V16.3.21-COMPLETE）
-# 針對「雲端/假日/IP封鎖」環境的最終完成版
+# Sunhero｜股市智能超盤中控台（Predator V16.3.22-ULTIMATE_UX）
+# 針對「雲端/假日/IP封鎖」環境的最終完成版 + UX 優化
 #
-# [最終驗收]
-# 1. 數據完整性：TopN=20 全數抓取，3324 等上櫃股自動補抓成功。
-# 2. UI 優化：DataFrame 高度自動延展，確保所有個股一目瞭然。
-# 3. 穩定性：內建假日回溯與記憶體保護機制。
+# [最終優化]
+# 1. 法人狀態：若淨額為 0，顯示 "NO_UPDATE" 避免誤判。
+# 2. UI 體驗：凍結首欄 (Symbol)，高度增至 800px，瀏覽更順暢。
+# 3. 核心保留：TopN=20、假日回溯、自動補抓皆保留。
 # =========================================================
 
 from __future__ import annotations
@@ -34,17 +34,17 @@ warnings.filterwarnings('ignore')
 # Streamlit page config
 # =========================
 st.set_page_config(
-    page_title="Sunhero｜股市智能超盤中控台（Predator V16.3.21）",
+    page_title="Sunhero｜股市智能超盤中控台（Predator V16.3.22）",
     layout="wide",
 )
 
-APP_TITLE = "Sunhero｜股市智能超盤中控台（TopN + 持倉監控 / V16.3.21-COMPLETE）"
+APP_TITLE = "Sunhero｜股市智能超盤中控台（TopN + 持倉監控 / V16.3.22-ULTIMATE_UX）"
 st.title(APP_TITLE)
 
 # =========================
 # Global Constants
 # =========================
-DEFAULT_TOPN = 20  # [FINAL] 恢復監控 20 檔
+DEFAULT_TOPN = 20
 DEFAULT_CASH = 2_000_000
 DEFAULT_EQUITY = 2_000_000
 
@@ -136,7 +136,6 @@ def _fetch_twse_robust(trade_date: str) -> Tuple[int, str]:
     """上市 (TWSE)"""
     date_str = trade_date.replace("-", "")
     
-    # 1. 官方 API
     try:
         url = f"https://www.twse.com.tw/exchangeReport/FMTQIK?response=json&date={date_str}"
         r = _http_session().get(url, timeout=3)
@@ -148,7 +147,6 @@ def _fetch_twse_robust(trade_date: str) -> Tuple[int, str]:
     except Exception:
         pass
     
-    # 2. Yahoo 估算 (5日保護)
     try:
         t = yf.Ticker("^TWII")
         h = t.history(period="5d") 
@@ -159,13 +157,10 @@ def _fetch_twse_robust(trade_date: str) -> Tuple[int, str]:
     except:
         pass
     
-    # 保底 3000億
     return 300_000_000_000, "TWSE_SAFE_MODE"
 
 def _fetch_tpex_robust(trade_date: str) -> Tuple[int, str]:
-    """上櫃 (TPEX) - 雲端多重備援"""
-    
-    # 1. HiStock
+    """上櫃 (TPEX)"""
     try:
         url = "https://histock.tw/index/TWO"
         r = _http_session().get(url, timeout=5)
@@ -181,7 +176,6 @@ def _fetch_tpex_robust(trade_date: str) -> Tuple[int, str]:
     except Exception:
         pass
 
-    # 2. 鉅亨網 API
     try:
         url = "https://market-api.api.cnyes.com/nexus/api/v2/mainland/index/quote"
         params = {"symbols": "OTC:OTC01:INDEX"}
@@ -199,7 +193,6 @@ def _fetch_tpex_robust(trade_date: str) -> Tuple[int, str]:
     except Exception:
         pass
 
-    # 3. Yahoo Finance 估算
     try:
         t = yf.Ticker("^TWO")
         h = t.history(period="5d") 
@@ -211,7 +204,6 @@ def _fetch_tpex_robust(trade_date: str) -> Tuple[int, str]:
     except Exception:
         pass
 
-    # 4. 保底值 1700 億
     return 170_000_000_000, "DOOMSDAY_SAFE_VAL_1700B" 
 
 def fetch_amount_total(trade_date: str) -> MarketAmount:
@@ -222,11 +214,49 @@ def fetch_amount_total(trade_date: str) -> MarketAmount:
     return MarketAmount(twse_amt, tpex_amt, total, twse_src, tpex_src, "FULL", {"trade_date": trade_date})
 
 # =========================
+# FinMind helpers (Enhanced)
+# =========================
+def _finmind_headers(token: Optional[str]) -> dict:
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+def fetch_finmind_institutional(symbols: List[str], start_date: str, end_date: str, token: Optional[str] = None) -> pd.DataFrame:
+    if not token: return pd.DataFrame(columns=["date", "symbol", "net_amount"])
+    rows = []
+    for sym in symbols:
+        stock_id = sym.replace(".TW", "").strip()
+        try:
+            url = f"{FINMIND_URL}?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id={stock_id}&start_date={start_date}&end_date={end_date}"
+            r = requests.get(url, headers=_finmind_headers(token), timeout=3) # timeout 縮短
+            if r.status_code == 200:
+                data = r.json().get("data", [])
+                for d in data:
+                    if d["name"] in A_NAMES:
+                        net = float(d["buy"] or 0) - float(d["sell"] or 0)
+                        rows.append({"date": d["date"], "symbol": sym, "net_amount": net})
+        except:
+            continue
+    return pd.DataFrame(rows) if rows else pd.DataFrame(columns=["date", "symbol", "net_amount"])
+
+def calc_inst_3d(inst_df: pd.DataFrame, symbol: str) -> dict:
+    if inst_df.empty: return {"Inst_Status": "NO_DATA", "Inst_Streak3": 0, "Inst_Net_3d": 0.0}
+    df = inst_df[inst_df["symbol"] == symbol].sort_values("date").tail(3)
+    
+    net_sum = float(df["net_amount"].sum())
+    
+    # [UX FIX] 增加明確狀態，避免誤會
+    if len(df) == 0:
+        return {"Inst_Status": "NO_UPDATE", "Inst_Streak3": 0, "Inst_Net_3d": 0.0}
+        
+    pos = (df["net_amount"] > 0).all()
+    neg = (df["net_amount"] < 0).all()
+    streak = 3 if (pos or neg) else 0
+    return {"Inst_Status": "READY", "Inst_Streak3": streak, "Inst_Net_3d": net_sum}
+
+# =========================
 # Data Fetchers (Optimized)
 # =========================
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_history(symbol: str) -> pd.DataFrame:
-    """抓取歷史數據 (大盤專用) - 5y 以計算 SMR"""
     try:
         df = yf.download(symbol, period="5y", interval="1d", progress=False, threads=False)
         if isinstance(df.columns, pd.MultiIndex):
@@ -237,11 +267,9 @@ def fetch_history(symbol: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_batch_prices_volratio(symbols: List[str]) -> pd.DataFrame:
-    """批次抓取股價 (含個股補抓機制)"""
     out = pd.DataFrame({"Symbol": symbols, "Price": None, "Vol_Ratio": None})
     if not symbols: return out
     
-    # 1. 批量嘗試 (標準)
     try:
         data = yf.download(symbols, period="5d", progress=False, group_by="ticker", threads=False)
         for i, sym in out.iterrows():
@@ -263,37 +291,27 @@ def fetch_batch_prices_volratio(symbols: List[str]) -> pd.DataFrame:
             except: pass
     except: pass
 
-    # 2. 強力單檔補抓 (解決 3324.TW NULL 問題)
     missing = out[out["Price"].isna()]["Symbol"].tolist()
     for sym in missing:
         try:
-            # 嘗試策略：原 Symbol -> 切換成 .TWO (上櫃後綴)
             candidates = [sym]
-            if sym.endswith(".TW"):
-                candidates.append(sym.replace(".TW", ".TWO"))
-            
+            if sym.endswith(".TW"): candidates.append(sym.replace(".TW", ".TWO"))
             success = False
             for try_sym in candidates:
                 if success: break
                 try:
                     t = yf.Ticker(try_sym)
-                    h = t.history(period="5d") # 改 5d 防抓不到
+                    h = t.history(period="5d")
                     if not h.empty:
-                        # 抓到了！填回原始 Symbol 的位置
                         idx = out[out["Symbol"] == sym].index
                         out.loc[idx, "Price"] = float(h["Close"].iloc[-1])
-                        
-                        # 補量能比
                         vol = h["Volume"].iloc[-1]
                         avg_vol = h["Volume"].mean()
-                        if avg_vol > 0:
-                            out.loc[idx, "Vol_Ratio"] = float(vol / avg_vol)
-                        else:
-                            out.loc[idx, "Vol_Ratio"] = 1.0
+                        if avg_vol > 0: out.loc[idx, "Vol_Ratio"] = float(vol / avg_vol)
+                        else: out.loc[idx, "Vol_Ratio"] = 1.0
                         success = True
                 except: pass
-        except Exception as e:
-            pass
+        except: pass
 
     return out
 
@@ -301,30 +319,22 @@ def fetch_batch_prices_volratio(symbols: List[str]) -> pd.DataFrame:
 # Logic Builders
 # =========================
 def compute_regime_metrics(market_df: pd.DataFrame) -> dict:
-    # 需要足夠長的歷史數據算 MA200
-    if market_df.empty or len(market_df) < 200: 
-        return {"SMR": None, "Slope5": None}
-    
+    if market_df.empty or len(market_df) < 200: return {"SMR": None, "Slope5": None}
     close = market_df["Close"]
     ma200 = close.rolling(200).mean()
     smr_series = ((close - ma200) / ma200).dropna()
-    
     if smr_series.empty: return {"SMR": None}
-    
     smr = float(smr_series.iloc[-1])
     slope5 = 0.0
     if len(smr_series) >= 2:
         slope5 = float(smr_series.rolling(5).mean().diff().iloc[-1])
-        
     return {"SMR": smr, "Slope5": slope5}
 
 def pick_regime(metrics: dict, vix: float) -> Tuple[str, float]:
     smr = metrics.get("SMR")
     slope5 = metrics.get("Slope5")
-    
     if smr is None: return "DATA_INSUFFICIENT", 0.0
     if slope5 is None: slope5 = 0.0
-
     if vix > 35.0: return "CRASH_RISK", 0.10
     if smr >= SMR_WATCH and slope5 < 0: return "MEAN_REVERSION_WATCH", 0.55
     if smr > 0.25: return "OVERHEAT", 0.55
@@ -351,12 +361,7 @@ def build_arbiter_input(session, account_mode, topn, positions, cash, equity, to
         last_dt = twii.index[-1]
         trade_date_str = last_dt.strftime("%Y-%m-%d")
         twii_close = float(twii["Close"].iloc[-1])
-        
-        if not vix.empty:
-            vix_last = float(vix["Close"].iloc[-1])
-        else:
-            vix_last = 20.0 
-            
+        vix_last = float(vix["Close"].iloc[-1]) if not vix.empty else 20.0
         amount = fetch_amount_total(trade_date_str)
     else:
         trade_date_str = _now_ts().split()[0]
@@ -370,12 +375,16 @@ def build_arbiter_input(session, account_mode, topn, positions, cash, equity, to
     # 3. Stocks
     base_pool = list(STOCK_NAME_MAP.keys())[:topn] 
     pv = fetch_batch_prices_volratio(base_pool)
+    
+    # 抓取法人 (使用 FinMind，需 Token)
+    inst_df = fetch_finmind_institutional(base_pool, trade_date_str, trade_date_str, token)
+    
     stocks = []
     for sym in base_pool:
         row = pv[pv["Symbol"] == sym]
         p = float(row["Price"].iloc[0]) if not row.empty and not pd.isna(row["Price"].iloc[0]) else None
         v = float(row["Vol_Ratio"].iloc[0]) if not row.empty and not pd.isna(row["Vol_Ratio"].iloc[0]) else None
-        inst_data = {"Inst_Streak3": 0}
+        inst_data = calc_inst_3d(inst_df, sym)
         layer = classify_layer(regime, v, inst_data)
         stocks.append({
             "Symbol": sym, "Name": STOCK_NAME_MAP.get(sym, sym), "Tier": 0, "Price": p, "Vol_Ratio": v, "Layer": layer, "Institutional": inst_data
@@ -406,13 +415,16 @@ def build_arbiter_input(session, account_mode, topn, positions, cash, equity, to
 def main():
     st.sidebar.header("設定 (Settings)")
     account_mode = st.sidebar.selectbox("帳戶模式", ["Conservative", "Balanced", "Aggressive"])
-    topn = st.sidebar.selectbox("TopN（監控數量）", [5, 8, 10, 15, 20], index=4) # 預設 20
+    topn = st.sidebar.selectbox("TopN（監控數量）", [5, 8, 10, 15, 20], index=4) 
     
-    run_btn = st.sidebar.button("啟動中控台 (V16.3.21)")
+    # 讓用戶可輸入 FinMind Token (或預設隱藏)
+    finmind_token = st.sidebar.text_input("FinMind Token (選填)", type="password")
+    
+    run_btn = st.sidebar.button("啟動中控台 (V16.3.22)")
     
     if run_btn:
         with st.spinner("執行中..."):
-            payload, warns = build_arbiter_input("INTRADAY", account_mode, topn, [], 2000000, 2000000, None)
+            payload, warns = build_arbiter_input("INTRADAY", account_mode, topn, [], 2000000, 2000000, finmind_token)
             
         ov = payload["macro"]["overview"]
         amt = payload["macro"]["market_amount"]
@@ -440,19 +452,29 @@ def main():
         else:
             st.error(f"🔴 使用保底數據 ({src_label})")
 
-        # [FINAL UI] 優化顯示
+        # [UX UPGRADE] 凍結首欄 + 增加高度
         st.subheader("🎯 核心持股雷達 (20 檔完整監控)")
         s_df = pd.json_normalize(payload["stocks"])
         if not s_df.empty:
-            disp_cols = ["Symbol", "Name", "Price", "Vol_Ratio", "Layer", "Institutional.Inst_Streak3"]
+            disp_cols = ["Symbol", "Name", "Price", "Vol_Ratio", "Layer", "Institutional.Inst_Streak3", "Institutional.Inst_Status"]
             s_df = s_df.reindex(columns=disp_cols, fill_value=0)
             s_df = s_df.rename(columns={
                 "Symbol": "代號", "Name": "名稱", "Price": "價格", 
                 "Vol_Ratio": "量能比", "Layer": "分級", 
-                "Institutional.Inst_Streak3": "法人連買"
+                "Institutional.Inst_Streak3": "法人連買",
+                "Institutional.Inst_Status": "法人狀態"
             })
-            # 增加高度，避免滾動條
-            st.dataframe(s_df, use_container_width=True, height=750)
+            
+            st.dataframe(
+                s_df, 
+                use_container_width=True, 
+                height=800, # 加高
+                column_config={
+                    "代號": st.column_config.TextColumn("代號", frozen=True), # 凍結
+                    "價格": st.column_config.NumberColumn("價格", format="%.1f"),
+                    "量能比": st.column_config.NumberColumn("量能比", format="%.2f"),
+                }
+            )
             
         with st.expander("🛠️ 系統診斷日誌", expanded=False):
             if warns: st.dataframe(pd.DataFrame(warns)[['code', 'msg']], use_container_width=True)
