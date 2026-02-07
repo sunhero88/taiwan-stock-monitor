@@ -1,12 +1,12 @@
 # main.py
 # =========================================================
-# Sunhero｜股市智能超盤中控台（Predator V16.3.22-ULTIMATE_UX）
-# 針對「雲端/假日/IP封鎖」環境的最終完成版 + UX 優化
+# Sunhero｜股市智能超盤中控台 (Predator V16.3.23-FIXED_UX)
+# 針對「雲端/假日/IP封鎖」環境的最終穩定版
 #
-# [最終優化]
-# 1. 法人狀態：若淨額為 0，顯示 "NO_UPDATE" 避免誤判。
-# 2. UI 體驗：凍結首欄 (Symbol)，高度增至 800px，瀏覽更順暢。
-# 3. 核心保留：TopN=20、假日回溯、自動補抓皆保留。
+# [修復紀錄]
+# 1. UI 修正：移除不支援的 'frozen' 參數，解決 TypeError 崩潰。
+# 2. 顯示優化：保留 800px 高度與隱藏索引 (hide_index)，讓表格更乾淨。
+# 3. 核心邏輯：維持 TopN=20、假日回溯 (5d)、自動補抓 (3324) 機制。
 # =========================================================
 
 from __future__ import annotations
@@ -34,17 +34,17 @@ warnings.filterwarnings('ignore')
 # Streamlit page config
 # =========================
 st.set_page_config(
-    page_title="Sunhero｜股市智能超盤中控台（Predator V16.3.22）",
+    page_title="Sunhero｜股市智能超盤中控台（Predator V16.3.23）",
     layout="wide",
 )
 
-APP_TITLE = "Sunhero｜股市智能超盤中控台（TopN + 持倉監控 / V16.3.22-ULTIMATE_UX）"
+APP_TITLE = "Sunhero｜股市智能超盤中控台（TopN + 持倉監控 / V16.3.23-FIXED）"
 st.title(APP_TITLE)
 
 # =========================
 # Global Constants
 # =========================
-DEFAULT_TOPN = 20
+DEFAULT_TOPN = 20  
 DEFAULT_CASH = 2_000_000
 DEFAULT_EQUITY = 2_000_000
 
@@ -135,7 +135,6 @@ class MarketAmount:
 def _fetch_twse_robust(trade_date: str) -> Tuple[int, str]:
     """上市 (TWSE)"""
     date_str = trade_date.replace("-", "")
-    
     try:
         url = f"https://www.twse.com.tw/exchangeReport/FMTQIK?response=json&date={date_str}"
         r = _http_session().get(url, timeout=3)
@@ -146,7 +145,6 @@ def _fetch_twse_robust(trade_date: str) -> Tuple[int, str]:
                 return int(val_str), "TWSE_OFFICIAL_API"
     except Exception:
         pass
-    
     try:
         t = yf.Ticker("^TWII")
         h = t.history(period="5d") 
@@ -156,7 +154,6 @@ def _fetch_twse_robust(trade_date: str) -> Tuple[int, str]:
             return est, "TWSE_YAHOO_EST"
     except:
         pass
-    
     return 300_000_000_000, "TWSE_SAFE_MODE"
 
 def _fetch_tpex_robust(trade_date: str) -> Tuple[int, str]:
@@ -175,7 +172,6 @@ def _fetch_tpex_robust(trade_date: str) -> Tuple[int, str]:
                         if amt > 10_000_000_000: return amt, "HISTOCK_WEB"
     except Exception:
         pass
-
     try:
         url = "https://market-api.api.cnyes.com/nexus/api/v2/mainland/index/quote"
         params = {"symbols": "OTC:OTC01:INDEX"}
@@ -192,7 +188,6 @@ def _fetch_tpex_robust(trade_date: str) -> Tuple[int, str]:
                         if amt > 10_000_000_000: return amt, "CNYES_API"
     except Exception:
         pass
-
     try:
         t = yf.Ticker("^TWO")
         h = t.history(period="5d") 
@@ -203,7 +198,6 @@ def _fetch_tpex_robust(trade_date: str) -> Tuple[int, str]:
             return est, "YAHOO_EST_CALC"
     except Exception:
         pass
-
     return 170_000_000_000, "DOOMSDAY_SAFE_VAL_1700B" 
 
 def fetch_amount_total(trade_date: str) -> MarketAmount:
@@ -214,7 +208,7 @@ def fetch_amount_total(trade_date: str) -> MarketAmount:
     return MarketAmount(twse_amt, tpex_amt, total, twse_src, tpex_src, "FULL", {"trade_date": trade_date})
 
 # =========================
-# FinMind helpers (Enhanced)
+# FinMind helpers
 # =========================
 def _finmind_headers(token: Optional[str]) -> dict:
     return {"Authorization": f"Bearer {token}"} if token else {}
@@ -226,7 +220,7 @@ def fetch_finmind_institutional(symbols: List[str], start_date: str, end_date: s
         stock_id = sym.replace(".TW", "").strip()
         try:
             url = f"{FINMIND_URL}?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id={stock_id}&start_date={start_date}&end_date={end_date}"
-            r = requests.get(url, headers=_finmind_headers(token), timeout=3) # timeout 縮短
+            r = requests.get(url, headers=_finmind_headers(token), timeout=3) 
             if r.status_code == 200:
                 data = r.json().get("data", [])
                 for d in data:
@@ -243,7 +237,6 @@ def calc_inst_3d(inst_df: pd.DataFrame, symbol: str) -> dict:
     
     net_sum = float(df["net_amount"].sum())
     
-    # [UX FIX] 增加明確狀態，避免誤會
     if len(df) == 0:
         return {"Inst_Status": "NO_UPDATE", "Inst_Streak3": 0, "Inst_Net_3d": 0.0}
         
@@ -253,7 +246,7 @@ def calc_inst_3d(inst_df: pd.DataFrame, symbol: str) -> dict:
     return {"Inst_Status": "READY", "Inst_Streak3": streak, "Inst_Net_3d": net_sum}
 
 # =========================
-# Data Fetchers (Optimized)
+# Data Fetchers
 # =========================
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_history(symbol: str) -> pd.DataFrame:
@@ -269,7 +262,6 @@ def fetch_history(symbol: str) -> pd.DataFrame:
 def fetch_batch_prices_volratio(symbols: List[str]) -> pd.DataFrame:
     out = pd.DataFrame({"Symbol": symbols, "Price": None, "Vol_Ratio": None})
     if not symbols: return out
-    
     try:
         data = yf.download(symbols, period="5d", progress=False, group_by="ticker", threads=False)
         for i, sym in out.iterrows():
@@ -312,7 +304,6 @@ def fetch_batch_prices_volratio(symbols: List[str]) -> pd.DataFrame:
                         success = True
                 except: pass
         except: pass
-
     return out
 
 # =========================
@@ -353,7 +344,6 @@ def classify_layer(regime: str, vol_ratio: Optional[float], inst: dict) -> str:
 def build_arbiter_input(session, account_mode, topn, positions, cash, equity, token):
     gc.collect() 
     
-    # 1. Market Data
     twii = fetch_history(TWII_SYMBOL)
     vix = fetch_history(VIX_SYMBOL)
     
@@ -372,11 +362,8 @@ def build_arbiter_input(session, account_mode, topn, positions, cash, equity, to
     metrics = compute_regime_metrics(twii)
     regime, max_equity = pick_regime(metrics, vix_last)
     
-    # 3. Stocks
     base_pool = list(STOCK_NAME_MAP.keys())[:topn] 
     pv = fetch_batch_prices_volratio(base_pool)
-    
-    # 抓取法人 (使用 FinMind，需 Token)
     inst_df = fetch_finmind_institutional(base_pool, trade_date_str, trade_date_str, token)
     
     stocks = []
@@ -416,11 +403,9 @@ def main():
     st.sidebar.header("設定 (Settings)")
     account_mode = st.sidebar.selectbox("帳戶模式", ["Conservative", "Balanced", "Aggressive"])
     topn = st.sidebar.selectbox("TopN（監控數量）", [5, 8, 10, 15, 20], index=4) 
-    
-    # 讓用戶可輸入 FinMind Token (或預設隱藏)
     finmind_token = st.sidebar.text_input("FinMind Token (選填)", type="password")
     
-    run_btn = st.sidebar.button("啟動中控台 (V16.3.22)")
+    run_btn = st.sidebar.button("啟動中控台 (V16.3.23)")
     
     if run_btn:
         with st.spinner("執行中..."):
@@ -436,7 +421,6 @@ def main():
         
         amt_val = (amt['amount_total'] or 0) / 100_000_000
         src_label = amt['source_tpex']
-        
         c3.metric("總成交額 (億)", f"{amt_val:,.0f}", help=f"來源: {src_label}")
         
         smr_val = ov.get('smr')
@@ -452,7 +436,7 @@ def main():
         else:
             st.error(f"🔴 使用保底數據 ({src_label})")
 
-        # [UX UPGRADE] 凍結首欄 + 增加高度
+        # [FIXED] 移除 frozen=True，保留 hide_index 與 height
         st.subheader("🎯 核心持股雷達 (20 檔完整監控)")
         s_df = pd.json_normalize(payload["stocks"])
         if not s_df.empty:
@@ -468,9 +452,10 @@ def main():
             st.dataframe(
                 s_df, 
                 use_container_width=True, 
-                height=800, # 加高
+                height=800, # 保持高度
+                hide_index=True, # 隱藏索引
                 column_config={
-                    "代號": st.column_config.TextColumn("代號", frozen=True), # 凍結
+                    "代號": st.column_config.TextColumn("代號"), # 移除不支援的參數
                     "價格": st.column_config.NumberColumn("價格", format="%.1f"),
                     "量能比": st.column_config.NumberColumn("量能比", format="%.2f"),
                 }
