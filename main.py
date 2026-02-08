@@ -2,17 +2,13 @@
 # =========================================================
 # Sunhero｜股市智能超盤中控台（TopN + 持倉監控 / Predator V16.3.32-AUDIT_ENFORCED）
 #
-# 由 V16.3.5 終極修復版整合升級：
-#  - (A) TWSE/TPEX 成交額：官方抓取 + SSL 自動修復 + Yahoo 估算 + Safe Mode
-#  - (B) 個股資料：Yahoo Batch + 單檔補抓 + .TWO suffix fallback（解決上櫃抓不到）
-#  - (C) 憲章（Decision Constitution v1.0）：核心股 2330 缺失熔斷、動態缺失門檻 max(2, topn*10%)
-#  - (D) 自動違憲檢查器（Self-Audit）：違憲 UI 紅燈自首
-#
-# 憲章核心條款（摘要）：
-# 1.1 不可隱匿錯誤：必須輸出 value / source / status
-# 1.2 完整性優先：核心股(2330)缺失 或 缺失數 > max(2, topn*0.1) -> KILL
-# 1.3 信心等級：輸出 confidence_level (HIGH/MEDIUM/LOW)
-# 2   分層：Layer B 有權否決 Layer A；Layer A 紅燈，Layer C 不得出現 ENTRY
+# ✅ V16.3.32-AUDIT_ENFORCED (Constitution-Ready Hotfix)
+# 修復重點（P0 必修）：
+#  - [憲章 1.1] MarketAmount / VIX 四件套：value + source + status + confidence 全面落地
+#  - [憲章 1.2] Integrity 缺失判定改採「核心欄位缺失（Price/Vol_Ratio）」而非僅看 source_map==FAIL
+#  - [憲章 2 + 1.2] Kill Switch 觸發：regime=INTEGRITY_KILL/DATA_FAILURE、max_equity=0、全股票 Layer 強制 NONE
+#  - [補丁 Date Audit] trade_date 不得猜：加入 date_status=VERIFIED/UNVERIFIED，且 UNVERIFIED 時信心不得高於 MEDIUM
+#  - [Self-Audit] 強化違憲檢查：Amount/VIX 四件套缺失即判違憲
 # =========================================================
 
 from __future__ import annotations
@@ -101,6 +97,12 @@ COL_TRANSLATION = {
 }
 
 
+# ====== Output Contract enums (fixed) ======
+STATUS_ENUM = {"OK", "DEGRADED", "ESTIMATED", "FAIL"}
+CONF_ENUM = {"HIGH", "MEDIUM", "LOW"}
+DATE_STATUS_ENUM = {"VERIFIED", "UNVERIFIED", "INVALID"}  # INVALID reserved; we don't guess holiday here
+
+
 def _now_ts() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
 
@@ -155,6 +157,49 @@ def _to_roc_date(ymd: str, format_type: str = "standard") -> str:
         return f"{roc_year:03d}/{dt.month:02d}/{dt.day:02d}"
 
 
+def _is_nan(x: Any) -> bool:
+    try:
+        return bool(isinstance(x, float) and np.isnan(x))
+    except Exception:
+        return False
+
+
+def _infer_status_confidence_from_source(src: str) -> Tuple[str, str]:
+    """
+    [憲章 1.1 四件套]：由 source 字串推導 status/confidence（不得輸出自創枚舉）
+    """
+    s = (src or "").upper()
+
+    # OK
+    if "OK" in s and ("TWSE_OK" in s or "TPEX_OK" in s):
+        return "OK", "HIGH"
+
+    # YAHOO estimate
+    if "YAHOO" in s and "ESTIMATE" in s:
+        return "ESTIMATED", "MEDIUM"
+
+    # SAFE_MODE
+    if "SAFE_MODE" in s:
+        return "ESTIMATED", "LOW"
+
+    # fallback / bypass etc
+    if "FALLBACK" in s or "SSL_BYPASS" in s:
+        return "DEGRADED", "MEDIUM"
+
+    return "FAIL", "LOW"
+
+
+def _overall_confidence(levels: List[str]) -> str:
+    # levels are in CONF_ENUM
+    if not levels:
+        return "LOW"
+    if all(l == "HIGH" for l in levels):
+        return "HIGH"
+    if any(l == "LOW" for l in levels):
+        return "LOW"
+    return "MEDIUM"
+
+
 # =========================
 # Warnings recorder
 # =========================
@@ -198,15 +243,25 @@ def _http_session() -> requests.Session:
 
 
 # =========================================================
-# Market amount (TWSE/TPEX) - 終極修復版（沿用 V16.3.5）
+# Market amount (TWSE/TPEX)
 # =========================================================
 @dataclass
 class MarketAmount:
     amount_twse: Optional[int]
     amount_tpex: Optional[int]
     amount_total: Optional[int]
+
+    # source
     source_twse: str
     source_tpex: str
+
+    # [憲章 1.1] 四件套補齊：status/confidence
+    status_twse: str
+    status_tpex: str
+    confidence_twse: str
+    confidence_tpex: str
+    confidence_level: str  # overall
+
     allow_insecure_ssl: bool
     scope: str
     meta: Optional[Dict[str, Any]] = None
@@ -233,6 +288,7 @@ def _yahoo_estimate_twse() -> Tuple[int, str]:
             vol = hist["Volume"].iloc[-1]
             close = hist["Close"].iloc[-1]
             est = int(vol * close * 0.45)
+            # 合理區間：0.2~1.0 兆
             if 200_000_000_000 <= est <= 1_000_000_000_000:
                 warnings_bus.push("TWSE_YAHOO_ESTIMATE", f"使用 Yahoo 估算 TWSE: {est:,}", {})
                 return est, "YAHOO_ESTIMATE_TWSE"
@@ -258,6 +314,7 @@ def _yahoo_estimate_tpex() -> Tuple[int, str]:
                 coef = 0.60
 
             est = int(vol * close * coef)
+            # 合理區間：0.1~0.5 兆
             if 100_000_000_000 <= est <= 500_000_000_000:
                 warnings_bus.push("TPEX_YAHOO_ESTIMATE", f"使用 Yahoo 估算 TPEX: {est:,} (係數 {coef})", {})
                 return est, f"YAHOO_ESTIMATE_TPEX_{coef}"
@@ -307,7 +364,7 @@ def _twse_audit_sum_by_stock_day_all(trade_date: str, allow_insecure_ssl: bool) 
                     amt_idx = i
                     break
             if amt_idx is None:
-                amt_idx = 3  # 保底
+                amt_idx = 3  # 保底（但仍記 audit）
 
             total = 0
             for row in data:
@@ -338,7 +395,7 @@ def _twse_audit_sum_by_stock_day_all(trade_date: str, allow_insecure_ssl: bool) 
 
 
 def _tpex_audit_sum_by_st43(trade_date: str, allow_insecure_ssl: bool) -> Tuple[Optional[int], str, Dict[str, Any]]:
-    """TPEX 抓取 + 多重 Fallback（沿用 V16.3.5）"""
+    """TPEX 抓取 + 多重 Fallback"""
     session = _http_session()
     roc_formats = [
         ("standard", _to_roc_date(trade_date, "standard")),
@@ -349,7 +406,7 @@ def _tpex_audit_sum_by_st43(trade_date: str, allow_insecure_ssl: bool) -> Tuple[
         "Referer": "https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43.php?l=zh-tw"
     })
 
-    meta = {"url": url, "attempts": []}
+    meta = {"url": url, "attempts": [], "audit": None}
 
     # PRIME
     try:
@@ -382,6 +439,7 @@ def _tpex_audit_sum_by_st43(trade_date: str, allow_insecure_ssl: bool) -> Tuple[
                 for row in aa:
                     if not isinstance(row, list):
                         continue
+                    # 常見欄位：成交金額欄位位置不一定，保留兩個候選
                     for idx in [7, 8]:
                         if idx >= len(row):
                             continue
@@ -392,6 +450,7 @@ def _tpex_audit_sum_by_st43(trade_date: str, allow_insecure_ssl: bool) -> Tuple[
 
                 if total > 50_000_000_000:
                     warnings_bus.push("TPEX_SUCCESS", f"成功: {attempt_id}, 總額: {total:,}", {})
+                    meta["audit"] = {"market": "TPEX", "trade_date": trade_date, "attempt": attempt_id, "amount_sum": total, "rows": len(aa)}
                     return int(total), f"TPEX_OK:{attempt_id}", meta
 
                 meta["attempts"].append({"id": attempt_id, "result": f"total_too_low_{total}"})
@@ -418,7 +477,7 @@ def _amount_scope(twse_amt: Optional[int], tpex_amt: Optional[int]) -> str:
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_amount_total(trade_date: str, allow_insecure_ssl: bool = False) -> MarketAmount:
-    """終極修復版：確保一定有數據"""
+    """終極修復版：確保一定有數據 + 四件套輸出"""
     _ensure_dir(AUDIT_DIR)
 
     twse_amt, twse_src, twse_meta = _twse_audit_sum_by_stock_day_all(trade_date, allow_insecure_ssl)
@@ -435,6 +494,10 @@ def fetch_amount_total(trade_date: str, allow_insecure_ssl: bool = False) -> Mar
     total = int(twse_amt) + int(tpex_amt)
     scope = _amount_scope(twse_amt, tpex_amt)
 
+    st_twse, cf_twse = _infer_status_confidence_from_source(twse_src)
+    st_tpex, cf_tpex = _infer_status_confidence_from_source(tpex_src)
+    overall = _overall_confidence([cf_twse, cf_tpex])
+
     meta = {
         "trade_date": trade_date,
         "audit_dir": AUDIT_DIR,
@@ -446,8 +509,16 @@ def fetch_amount_total(trade_date: str, allow_insecure_ssl: bool = False) -> Mar
         amount_twse=twse_amt,
         amount_tpex=tpex_amt,
         amount_total=total,
+
         source_twse=twse_src,
         source_tpex=tpex_src,
+
+        status_twse=st_twse,
+        status_tpex=st_tpex,
+        confidence_twse=cf_twse,
+        confidence_tpex=cf_tpex,
+        confidence_level=overall,
+
         allow_insecure_ssl=bool(allow_insecure_ssl),
         scope=scope,
         meta=meta,
@@ -478,12 +549,12 @@ def fetch_market_inst_summary(allow_insecure_ssl: bool = False) -> List[Dict[str
 
 
 # =========================
-# FinMind helpers (修正：FinMind v4 token 應使用 query param token)
+# FinMind helpers (token uses query param)
 # =========================
 def _finmind_get(dataset: str, params: dict, token: Optional[str]) -> dict:
     p = {"dataset": dataset, **params}
     if token:
-        p["token"] = token  # ✅ v4 正確方式：token query param
+        p["token"] = token
     r = requests.get(FINMIND_URL, params=p, timeout=25)
     r.raise_for_status()
     return r.json()
@@ -569,7 +640,6 @@ def calc_inst_3d(inst_df: pd.DataFrame, symbol: str, has_token: bool) -> dict:
     if all(d == "NEGATIVE" for d in dirs):
         return {"Inst_Status": "READY", "Inst_Streak3": 3, "Inst_Dir3": "NEGATIVE", "Inst_Net_3d": net_sum}
 
-    # 有 token 但三日淨額=0 且不是 READY → 視為 NO_UPDATE_TODAY
     if net_sum == 0.0:
         return {"Inst_Status": "NO_UPDATE_TODAY", "Inst_Streak3": 0, "Inst_Dir3": "NO_UPDATE_TODAY", "Inst_Net_3d": 0.0}
 
@@ -625,19 +695,13 @@ def fetch_history(symbol: str, period: str = "5y", interval: str = "1d") -> pd.D
 def _single_fetch_price_volratio(sym: str) -> Tuple[Optional[float], Optional[float], str]:
     """
     單檔抓取（含 .TWO fallback），回傳 (price, vol_ratio, source)
-    source:
-      - YF_SINGLE_TW
-      - YF_SINGLE_TPEX_FALLBACK
-      - FAIL
     """
     try:
         df = yf.download(sym, period="6mo", interval="1d", auto_adjust=False, progress=False, group_by="column", threads=False)
         src = "YF_SINGLE_TW"
         if df is None or df.empty or df.get("Close") is None or df["Close"].dropna().empty:
             raise RuntimeError("EMPTY_TW")
-
     except Exception:
-        # .TWO fallback（上櫃抓不到時）
         try:
             alt = sym.replace(".TW", ".TWO")
             df = yf.download(alt, period="6mo", interval="1d", auto_adjust=False, progress=False, group_by="column", threads=False)
@@ -665,7 +729,7 @@ def fetch_batch_prices_volratio_with_source(symbols: List[str]) -> Tuple[pd.Data
     """
     Yahoo Batch + 單檔補抓 + .TWO fallback
     回傳：
-      - DataFrame: Symbol, Price, Vol_Ratio
+      - DataFrame: Symbol, Price, Vol_Ratio, source
       - source_map: {Symbol: source}
     """
     out = pd.DataFrame({"Symbol": symbols})
@@ -708,7 +772,6 @@ def fetch_batch_prices_volratio_with_source(symbols: List[str]) -> Tuple[pd.Data
                 if vol_ratio is not None:
                     out.loc[out["Symbol"] == sym, "Vol_Ratio"] = vol_ratio
 
-                # Batch 成功標記
                 if (price is not None) or (vol_ratio is not None):
                     out.loc[out["Symbol"] == sym, "source"] = "YF_BATCH"
                     source_map[sym] = "YF_BATCH"
@@ -719,12 +782,12 @@ def fetch_batch_prices_volratio_with_source(symbols: List[str]) -> Tuple[pd.Data
     need_fix = out[(out["Price"].isna()) | (out["Vol_Ratio"].isna())]["Symbol"].tolist()
     for sym in need_fix:
         p, vr, src = _single_fetch_price_volratio(sym)
+
         if p is not None and (out.loc[out["Symbol"] == sym, "Price"].isna().iloc[0]):
             out.loc[out["Symbol"] == sym, "Price"] = float(p)
         if vr is not None and (out.loc[out["Symbol"] == sym, "Vol_Ratio"].isna().iloc[0]):
             out.loc[out["Symbol"] == sym, "Vol_Ratio"] = float(vr)
 
-        # 來源標記（憲章 1.1：不允許默默 fallback）
         if (p is not None) or (vr is not None):
             out.loc[out["Symbol"] == sym, "source"] = src
             source_map[sym] = src
@@ -736,7 +799,7 @@ def fetch_batch_prices_volratio_with_source(symbols: List[str]) -> Tuple[pd.Data
 
 
 # =========================
-# Regime & Metrics（沿用 V16.3.5，VIXTW 優先）
+# Regime & Metrics（VIXTW 優先）
 # =========================
 def _as_series(df: pd.DataFrame, col_name: str) -> pd.Series:
     if df is None or df.empty:
@@ -870,75 +933,126 @@ def pick_regime(metrics: dict, vix: Optional[float], vix_panic: float) -> Tuple[
 # =========================================================
 # Constitution Integrity (Layer B) + Self-Audit
 # =========================================================
-def evaluate_integrity_v1632(source_map: Dict[str, str], topn: int) -> Dict[str, Any]:
+def evaluate_integrity_v1632(stocks: List[dict], topn: int) -> Dict[str, Any]:
     """
-    [憲章 1.2]：
-      - 核心股缺失 -> KILL
-      - 缺失數 > max(2, topn*0.1) -> KILL
-    [憲章 1.3]：
-      - confidence: HIGH/MEDIUM/LOW
+    [憲章 1.2]：核心欄位缺失 -> KILL
+      - 核心股(2330) Price 或 Vol_Ratio 缺失 -> KILL
+      - 缺失數 > max(2, ceil(topn*0.1)) -> KILL
+    [憲章 1.3]：confidence HIGH/MEDIUM/LOW（整體）
     """
-    missing_list = [s for s, src in source_map.items() if src == "FAIL"]
-    missing_count = len(missing_list)
+    missing_syms = []
+    fallback_syms = []
+
+    for s in stocks:
+        sym = s.get("Symbol")
+        price = s.get("Price")
+        vr = s.get("Vol_Ratio")
+        src = str(s.get("source", "")).upper()
+
+        price_missing = (price is None) or _is_nan(price)
+        vr_missing = (vr is None) or _is_nan(vr)
+
+        # 核心欄位缺失：Price 或 Vol_Ratio 任一缺失即算缺失
+        if price_missing or vr_missing:
+            missing_syms.append(sym)
+
+        # fallback 訊號（不一定違憲，但影響信心）
+        if ("FALLBACK" in src) or ("SAFE_MODE" in src) or ("YF_SINGLE_TPEX_FALLBACK" in src):
+            fallback_syms.append(sym)
+
+    missing_syms = [x for x in missing_syms if x]
+    missing_count = len(set(missing_syms))
 
     # 核心股熔斷
     for core in CORE_WATCH_LIST:
-        if source_map.get(core, "FAIL") == "FAIL":
-            return {"status": "CRITICAL_FAILURE", "kill_switch": True, "confidence": "LOW",
-                    "reason": f"Core Asset Missing: {core}", "missing_count": missing_count, "missing_list": missing_list}
+        for s in stocks:
+            if s.get("Symbol") == core:
+                if s.get("Price") is None or s.get("Vol_Ratio") is None or _is_nan(s.get("Price")) or _is_nan(s.get("Vol_Ratio")):
+                    return {
+                        "status": "CRITICAL_FAILURE",
+                        "kill_switch": True,
+                        "confidence": "LOW",
+                        "reason": f"CORE_STOCK_MISSING:{core}",
+                        "missing_count": missing_count,
+                        "missing_list": sorted(list(set(missing_syms))),
+                    }
 
-    # 動態門檻 max(2, topn*10%)
     threshold = max(2, int(math.ceil(topn * 0.1)))
     if missing_count > threshold:
-        return {"status": "DATA_DEGRADED", "kill_switch": True, "confidence": "LOW",
-                "reason": f"Missing Count {missing_count} > Threshold {threshold}", "missing_count": missing_count, "missing_list": missing_list}
+        return {
+            "status": "DATA_DEGRADED",
+            "kill_switch": True,
+            "confidence": "LOW",
+            "reason": f"MISSING_COUNT_EXCEED:{missing_count}/{topn}>threshold:{threshold}",
+            "missing_count": missing_count,
+            "missing_list": sorted(list(set(missing_syms))),
+        }
 
-    fallback_count = sum(1 for src in source_map.values() if "FALLBACK" in src)
-    if missing_count == 0 and fallback_count == 0:
+    # confidence
+    if missing_count == 0 and len(fallback_syms) == 0:
         confidence = "HIGH"
     elif missing_count <= 1:
         confidence = "MEDIUM"
     else:
         confidence = "LOW"
 
-    return {"status": "OK", "kill_switch": False, "confidence": confidence,
-            "reason": "Integrity Check Passed", "missing_count": missing_count, "missing_list": missing_list}
+    return {
+        "status": "OK",
+        "kill_switch": False,
+        "confidence": confidence,
+        "reason": "INTEGRITY_PASS",
+        "missing_count": missing_count,
+        "missing_list": sorted(list(set(missing_syms))),
+        "fallback_count": int(len(set(fallback_syms))),
+    }
 
 
 def audit_constitution(payload: Dict[str, Any], topn: int) -> List[str]:
     """
     自動違憲檢查器（憲章法庭）
     必檢：
-      1) 有無默默 fallback 而未標記 source
-      2) 核心股缺失 -> kill_switch 是否啟動
-      3) VIX 抓不到 -> Layer A 是否降級/停機
+      - Amount 四件套是否存在
+      - VIX 四件套是否存在
+      - 核心股缺失 -> kill_switch 是否啟動
+      - VIX 缺失 -> 必須 DATA_FAILURE/停機
+      - max_equity=0 時不得出現 A/A+/B（必須覆寫 NONE）
     """
     violations: List[str] = []
-    integ = payload["macro"]["integrity_v1632"]
-    market = payload["macro"]["overview"]
-    stocks = payload["stocks"]
+
+    ov = payload.get("macro", {}).get("overview", {})
+    integ = payload.get("macro", {}).get("integrity_v1632", {})
+    amount = payload.get("macro", {}).get("market_amount", {})
+    stocks = payload.get("stocks", [])
+
+    # (A) Amount 四件套
+    for k in ["source_twse", "source_tpex", "status_twse", "status_tpex", "confidence_level"]:
+        if k not in amount:
+            violations.append(f"❌ [憲章 1.1] MarketAmount 缺少欄位: {k}")
+            break
+
+    # (B) VIX 四件套
+    for k in ["vix", "vix_source", "vix_status", "vix_confidence"]:
+        if k not in ov:
+            violations.append(f"❌ [憲章 1.1] VIX 四件套缺少欄位: {k}")
+            break
 
     # (1) Kill switch 啟動但 max_equity_allowed_pct 未歸零
-    if integ["kill_switch"] and float(market.get("max_equity_allowed_pct") or 0.0) != 0.0:
+    if bool(integ.get("kill_switch")) and float(ov.get("max_equity_allowed_pct") or 0.0) != 0.0:
         violations.append("❌ [憲章 1.2] Kill Switch 啟動但建議持倉上限未歸零")
 
-    # (2) 核心股缺失但未 KILL
-    if "Core Asset Missing" in str(integ.get("reason", "")) and not integ["kill_switch"]:
-        violations.append("❌ [憲章 1.2] 核心股缺失但 Kill Switch 未啟動")
-
-    # (3) VIX 缺失 -> 必須 DATA_FAILURE / 並停機
-    if market.get("vix") is None:
-        if not (integ["kill_switch"] and market.get("current_regime") in ("DATA_FAILURE", "INTEGRITY_KILL")):
+    # (2) VIX 缺失 -> 必須停機
+    if ov.get("vix") is None:
+        if not (bool(integ.get("kill_switch")) and ov.get("current_regime") in ("DATA_FAILURE", "INTEGRITY_KILL")):
             violations.append("❌ [Layer A / 憲章] VIX 缺失但未強制降級/停機")
 
-    # (4) Layer A 停機時（max_equity=0），不得有 ENTRY 類訊號（此版 stocks 尚未產 signal，先以 Layer 欄位檢）
-    if float(market.get("max_equity_allowed_pct") or 0.0) == 0.0:
+    # (3) max_equity=0 時不得給可參與層級
+    if float(ov.get("max_equity_allowed_pct") or 0.0) == 0.0:
         for s in stocks:
-            if str(s.get("Layer", "")) in ("A+", "A", "B"):
-                violations.append(f"❌ [憲章 2] 市場紅燈但個股 {s.get('Symbol')} 仍給出可參與層級({s.get('Layer')})")
+            if str(s.get("Layer", "")).strip() in ("A+", "A", "B"):
+                violations.append(f"❌ [憲章 2] 市場停機但個股 {s.get('Symbol')} 仍給出可參與層級({s.get('Layer')})")
                 break
 
-    # (5) source 欄位不得缺失/空白（憲章 1.1）
+    # (4) 個股 source 必填（憲章 1.1）
     for s in stocks:
         src = s.get("source")
         if src is None or str(src).strip() == "":
@@ -949,7 +1063,7 @@ def audit_constitution(payload: Dict[str, Any], topn: int) -> List[str]:
 
 
 # =========================
-# Layer C: classify layer（沿用你的邏輯）
+# Layer C: classify layer
 # =========================
 def classify_layer(regime: str, momentum_lock: bool, vol_ratio: Optional[float], inst: dict) -> str:
     foreign_buy = bool(inst.get("foreign_buy", False))
@@ -1011,14 +1125,24 @@ def build_arbiter_input(
     # VIXTW 優先，失敗再用 VIX（憲章要求：VIX 缺失必停機）
     vix_df_tw = fetch_history(VIX_SYMBOL_TW, period="2y", interval="1d")
     vix_df_us = fetch_history(VIX_SYMBOL_US, period="2y", interval="1d")
-    vix_df = vix_df_tw if (vix_df_tw is not None and not vix_df_tw.empty) else vix_df_us
+    using_vix_tw = bool(vix_df_tw is not None and not vix_df_tw.empty)
+    vix_df = vix_df_tw if using_vix_tw else vix_df_us
 
     src_twii = _source_snapshot("TWII", twii_df)
-    src_vix = _source_snapshot("VIXTW/VIX", vix_df)
+    src_vix = _source_snapshot("VIXTW" if using_vix_tw else "VIX", vix_df)
 
-    trade_date = src_twii.get("last_dt") or time.strftime("%Y-%m-%d", time.localtime())
+    # ---- Date Audit（不得猜）
+    # 若 TWII 有 last_dt -> 使用它（相對可驗證）
+    if src_twii.get("last_dt"):
+        trade_date = src_twii["last_dt"]
+        date_status = "VERIFIED"
+    else:
+        # 無可驗證依據：UNVERIFIED（不得假裝交易日）
+        trade_date = time.strftime("%Y-%m-%d", time.localtime())
+        date_status = "UNVERIFIED"
+        warnings_bus.push("DATE_UNVERIFIED", "TWII 無 last_dt，trade_date 使用本機日期（UNVERIFIED）", {"trade_date": trade_date})
 
-    # VIX last
+    # ---- VIX last + 四件套
     vix_last = None
     if vix_df is not None and not vix_df.empty:
         try:
@@ -1026,6 +1150,15 @@ def build_arbiter_input(
             vix_last = float(vix_close.iloc[-1]) if len(vix_close) else None
         except Exception:
             vix_last = None
+
+    if vix_last is None:
+        vix_source = "FAIL"
+        vix_status = "FAIL"
+        vix_confidence = "LOW"
+    else:
+        vix_source = "VIXTW" if using_vix_tw else "VIX"
+        vix_status = "OK"
+        vix_confidence = "HIGH" if using_vix_tw else "MEDIUM"
 
     dynamic_vix_threshold = calculate_dynamic_vix(vix_df)
     vix_panic = float(dynamic_vix_threshold) if dynamic_vix_threshold is not None else 35.0
@@ -1045,7 +1178,7 @@ def build_arbiter_input(
     except Exception:
         pass
 
-    # ---- Layer A regime（若 VIX 缺失，強制降級）
+    # ---- Layer A regime（若 VIX 缺失，強制 DATA_FAILURE）
     if vix_last is None:
         regime, max_equity = "DATA_FAILURE", 0.0
     else:
@@ -1060,7 +1193,7 @@ def build_arbiter_input(
     pos_pool = [p.get("symbol") for p in positions if isinstance(p, dict) and p.get("symbol")]
     symbols = list(dict.fromkeys(base_pool + pos_pool))
 
-    # ---- Prices + VolRatio + source_map（含 .TWO fallback）
+    # ---- Prices + VolRatio + source_map
     pv, source_map = fetch_batch_prices_volratio_with_source(symbols)
 
     # ---- FinMind institutional (3D)
@@ -1100,15 +1233,14 @@ def build_arbiter_input(
         vol_ratio = row["Vol_Ratio"] if row is not None else None
         src = row["source"] if row is not None else source_map.get(sym, "FAIL")
 
-        price_ok = not (price is None or (isinstance(price, float) and np.isnan(price)))
-        vr_ok = not (vol_ratio is None or (isinstance(vol_ratio, float) and np.isnan(vol_ratio)))
+        price_ok = not (price is None or _is_nan(price))
+        vr_ok = not (vol_ratio is None or _is_nan(vol_ratio))
 
         if not price_ok:
             warnings_bus.push("PRICE_NULL", "Missing Price", {"symbol": sym, "source": src})
         if not vr_ok:
             warnings_bus.push("VOLRATIO_NULL", "Missing VolRatio", {"symbol": sym, "source": src})
 
-        # Layer C: 分級（但如果 Layer A 已 DATA_FAILURE，後續會被 Kill 覆寫）
         layer = classify_layer(regime, bool(metrics.get("MOMENTUM_LOCK", False)), vol_ratio, inst_map.get(sym, {}))
 
         stocks.append({
@@ -1124,50 +1256,65 @@ def build_arbiter_input(
 
     institutional_panel = pd.DataFrame(panel_rows)
 
-    # ---- Layer B: Integrity（憲章版）
-    integrity_v1632 = evaluate_integrity_v1632(source_map={k: (v if v else "FAIL") for k, v in source_map.items()}, topn=len(symbols))
+    # ---- Layer B: Integrity（改用核心欄位缺失判定）
+    integrity_v1632 = evaluate_integrity_v1632(stocks=stocks, topn=len(symbols))
 
-    # VIX 缺失：強制 Kill（你指定的鐵律）
+    # ---- VIX 缺失：強制 Kill（憲章鐵律）
     if vix_last is None:
         integrity_v1632["kill_switch"] = True
         integrity_v1632["status"] = "CRITICAL_FAILURE"
         integrity_v1632["confidence"] = "LOW"
-        integrity_v1632["reason"] = "VIX_MISSING_FORCE_KILL"
+        integrity_v1632["reason"] = "VIX_MISSING: Layer A 無法計算"
 
-    # ---- Kill Override：一旦 kill_switch=True，全系統 max_equity=0，regime=INTEGRITY_KILL
+    # ---- Kill Override：一旦 kill_switch=True，全系統 max_equity=0，regime=INTEGRITY_KILL/DATA_FAILURE，且股票層級強制 NONE
     amount_partial = bool(amount.scope in ("TWSE_ONLY", "TPEX_ONLY"))
     final_regime = regime
     final_max_equity = float(max_equity)
 
-    if integrity_v1632["kill_switch"]:
-        final_regime = "INTEGRITY_KILL" if vix_last is not None else "DATA_FAILURE"
+    if bool(integrity_v1632["kill_switch"]):
+        final_regime = "DATA_FAILURE" if vix_last is None else "INTEGRITY_KILL"
         final_max_equity = 0.0
+        for s in stocks:
+            s["Layer"] = "NONE"
+            s["Layer_Reason"] = "KILL_SWITCH"
     else:
         final_max_equity = _apply_amount_degrade(float(max_equity), account_mode, amount_partial)
 
-    # Market status
-    if integrity_v1632["kill_switch"]:
+    # Market status（以資料來源推導）
+    if bool(integrity_v1632["kill_switch"]):
         market_status = "SHELTER"
     else:
         market_status = "NORMAL"
         if amount.amount_total is None or amount.amount_total <= 0:
             market_status = "DEGRADED"
-        elif ("YAHOO" in amount.source_twse or "YAHOO" in amount.source_tpex or "SAFE_MODE" in amount.source_twse or "SAFE_MODE" in amount.source_tpex):
+        elif (amount.status_twse != "OK") or (amount.status_tpex != "OK"):
             market_status = "ESTIMATED"
 
     # exposure（示意）
     current_exposure_pct = min(1.0, len(positions) * 0.05) if positions else 0.0
-    if integrity_v1632["kill_switch"]:
+    if bool(integrity_v1632["kill_switch"]):
         current_exposure_pct = 0.0
+
+    # ---- Global confidence_level（憲章 1.3）
+    # 來源：Integrity confidence + Amount confidence + Date status
+    conf_parts = [str(integrity_v1632.get("confidence", "LOW")), str(amount.confidence_level)]
+    if date_status == "UNVERIFIED":
+        conf_parts.append("MEDIUM")  # 不得高於 MEDIUM
+    global_confidence = _overall_confidence(conf_parts)
 
     sources = {
         "twii": src_twii,
         "vix": src_vix,
         "metrics_reason": metrics.get("metrics_reason", "NA"),
         "amount_source": {
-            "trade_date": trade_date,  # ✅ 你原本補齊的 trade_date 保留
+            "trade_date": trade_date,
             "source_twse": amount.source_twse,
             "source_tpex": amount.source_tpex,
+            "status_twse": amount.status_twse,
+            "status_tpex": amount.status_tpex,
+            "confidence_twse": amount.confidence_twse,
+            "confidence_tpex": amount.confidence_tpex,
+            "confidence_level": amount.confidence_level,
             "amount_twse": amount.amount_twse,
             "amount_tpex": amount.amount_tpex,
             "amount_total": amount.amount_total,
@@ -1176,7 +1323,7 @@ def build_arbiter_input(
             "twse_audit": (amount.meta or {}).get("twse", {}).get("audit") if amount.meta else None,
             "tpex_audit": (amount.meta or {}).get("tpex", {}).get("audit") if amount.meta else None,
         },
-        "prices_source_map": source_map,  # ✅ 憲章 1.1：可追溯每檔來源
+        "prices_source_map": source_map,
     }
 
     payload = {
@@ -1187,20 +1334,31 @@ def build_arbiter_input(
             "current_regime": final_regime,
             "account_mode": account_mode,
             "audit_tag": "V16.3.32_AUDIT_ENFORCED",
+            "confidence_level": global_confidence,     # ✅ 憲章 1.3
+            "date_status": date_status,               # ✅ Date Audit
         },
         "macro": {
             "overview": {
                 "trade_date": trade_date,
+                "date_status": date_status,
+
                 "twii_close": close_price,
                 "twii_change": twii_change,
                 "twii_pct": twii_pct,
+
+                # ✅ VIX 四件套
                 "vix": vix_last,
+                "vix_source": vix_source,
+                "vix_status": vix_status,
+                "vix_confidence": vix_confidence,
+
                 "vix_panic": vix_panic,
                 "smr": metrics.get("SMR"),
                 "slope5": metrics.get("Slope5"),
                 "drawdown_pct": metrics.get("drawdown_pct"),
                 "price_range_10d_pct": metrics.get("price_range_10d_pct"),
                 "dynamic_vix_threshold": dynamic_vix_threshold,
+
                 "max_equity_allowed_pct": final_max_equity,
                 "current_regime": final_regime,
             },
@@ -1248,7 +1406,6 @@ def main():
     account_mode = st.sidebar.selectbox("帳戶模式", ["Conservative", "Balanced", "Aggressive"], index=0)
     topn = st.sidebar.selectbox("TopN（監控數量）", [8, 10, 15, 20, 30], index=3)
 
-    # 網頁環境：預設 verify=True；只有使用者勾選才 allow_insecure_ssl
     allow_insecure_ssl = st.sidebar.checkbox("允許不安全 SSL（僅在雲端憑證錯誤時使用）", value=False)
 
     st.sidebar.subheader("FinMind")
@@ -1297,11 +1454,11 @@ def main():
 
         # --- 1. 關鍵指標 ---
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("交易日期", ov.get("trade_date", "-"))
-
+        c1.metric("交易日期", ov.get("trade_date", "-"), help=f"date_status={meta.get('date_status', '-')}")
         status = meta.get("market_status", "-")
+
         if status == "ESTIMATED":
-            c2.metric("市場狀態", f"⚠️ {status}", help="使用估算數據")
+            c2.metric("市場狀態", f"⚠️ {status}", help="使用估算/降級數據")
         elif status == "DEGRADED":
             c2.metric("市場狀態", f"🔴 {status}", help="數據缺失")
         elif status == "SHELTER":
@@ -1316,6 +1473,8 @@ def main():
             if ov.get("max_equity_allowed_pct") is not None else "-",
         )
 
+        st.caption(f"confidence_level = {meta.get('confidence_level', '-')}")
+
         # --- 1.1 憲章信心等級/熔斷 ---
         st.subheader("🛡️ Layer B：資料信任層（憲章）")
         b1, b2, b3, b4 = st.columns(4)
@@ -1327,7 +1486,7 @@ def main():
         if integ.get("kill_switch"):
             st.error(f"⛔ 系統強制停機（憲章 1.2）：{integ.get('reason')}")
 
-        # --- 2. 大盤與成交量 ---
+        # --- 2. 大盤與成交額 ---
         st.subheader("📊 大盤觀測站 (TAIEX Overview)")
         m1, m2, m3, m4 = st.columns(4)
 
@@ -1344,7 +1503,8 @@ def main():
             f"{chg:+.0f} ({pct:+.2%})" if (chg is not None and pct is not None) else None,
             delta_color=delta_color,
         )
-        m2.metric("VIX / VIXTW", f"{ov.get('vix'):.2f}" if ov.get("vix") is not None else "FAIL")
+        m2.metric("VIX/VIXTW", f"{ov.get('vix'):.2f}" if ov.get("vix") is not None else "FAIL",
+                  help=f"{ov.get('vix_source')}, {ov.get('vix_status')}, {ov.get('vix_confidence')}")
         m3.metric("VIX Panic Threshold", f"{ov.get('vix_panic'):.2f}" if ov.get("vix_panic") is not None else "-")
 
         amt_total = amount.get("amount_total")
@@ -1354,7 +1514,7 @@ def main():
             amt_str = f"{amt_total/1_000_000_000_000:.3f} 兆元 {scope_label}"
         else:
             amt_str = f"數據缺失 {scope_label}"
-        m4.metric("市場總成交額", amt_str)
+        m4.metric("市場總成交額", amt_str, help=f"amount_confidence={amount.get('confidence_level')}")
 
         # --- 2.1 成交額稽核摘要 ---
         with st.expander("📌 成交額稽核摘要（TWSE + TPEX + Yahoo Fallback + Safe Mode）", expanded=True):
@@ -1363,18 +1523,19 @@ def main():
             tpex_src = a_src.get("source_tpex", "")
 
             def _icon(src: str) -> str:
-                if "OK" in src:
+                s = (src or "").upper()
+                if "OK" in s:
                     return "✅"
-                if "YAHOO" in src:
+                if "YAHOO" in s:
                     return "⚠️"
-                if "SAFE_MODE" in src:
+                if "SAFE_MODE" in s:
                     return "🔴"
                 return "❌"
 
             st.markdown(f"""
-**上市 (TWSE)**: {_icon(twse_src)} {twse_src}  
-**上櫃 (TPEX)**: {_icon(tpex_src)} {tpex_src}  
-**總額**: {amt_total:,} 元 (scope={scope})
+**上市 (TWSE)**: {_icon(twse_src)} {twse_src} / status={a_src.get('status_twse')} / conf={a_src.get('confidence_twse')}  
+**上櫃 (TPEX)**: {_icon(tpex_src)} {tpex_src} / status={a_src.get('status_tpex')} / conf={a_src.get('confidence_tpex')}  
+**總額**: {amt_total:,} 元 (scope={scope}) / confidence_level={a_src.get('confidence_level')}
 """)
 
             st.json({
@@ -1415,11 +1576,14 @@ def main():
         s_df = pd.json_normalize(payload.get("stocks", []))
         if not s_df.empty:
             disp_cols = ["Symbol", "Name", "Price", "Vol_Ratio", "Layer", "source", "Institutional.Inst_Net_3d", "Institutional.Inst_Streak3"]
-            s_df = s_df.reindex(columns=disp_cols)
+            if "Layer_Reason" in s_df.columns:
+                disp_cols.insert(5, "Layer_Reason")
+            s_df = s_df.reindex(columns=[c for c in disp_cols if c in s_df.columns])
             s_df = s_df.rename(columns=COL_TRANSLATION)
             s_df = s_df.rename(columns={
                 "Institutional.Inst_Net_3d": "法人3日淨額",
                 "Institutional.Inst_Streak3": "法人連買天數",
+                "Layer_Reason": "分級原因",
             })
             st.dataframe(s_df, use_container_width=True)
 
@@ -1451,3 +1615,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
