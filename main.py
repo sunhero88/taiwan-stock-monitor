@@ -473,12 +473,6 @@ def _safe_int(x, default=None) -> Optional[int]:
 
 def _pct01_to_pct100(x: Optional[float]) -> Optional[float]:
     if x is None:
-        # 3) 直接寫在程式（不建議，但你要求）
-        token = FINMIND_TOKEN_DEFAULT
-        if token:
-            token = str(token).strip()
-            if token:
-                return token
         return None
     return float(x) * 100.0
 
@@ -1663,101 +1657,103 @@ def build_arbiter_input(
         final_max_equity = _apply_amount_degrade(float(max_equity), account_mode, amount_partial)
 
     # Market status：直接引用 market_amount.confidence_level（你要求）
-    if bool(integrity_v1632["kill_switch"]):
+    if bool(integrity_v1632.get("kill_switch")):
         market_status = "SHELTER"
     else:
         market_status = str(amount.confidence_level or "LOW").upper()
+
     # exposure（示意）
-        current_exposure_pct = min(1.0, len(positions) * 0.05) if positions else 0.0
-        if bool(integrity_v1632["kill_switch"]):
-            current_exposure_pct = 0.0
+    current_exposure_pct = min(1.0, len(positions) * 0.05) if positions else 0.0
+    if bool(integrity_v1632["kill_switch"]):
+        current_exposure_pct = 0.0
 
-        # ---- Global confidence_level（憲章 1.3）
-        # 來源：Integrity confidence + Amount confidence + Date status
-        conf_parts = [str(integrity_v1632.get("confidence", "LOW")), str(amount.confidence_level)]
-        if date_status == "UNVERIFIED":
-            conf_parts.append("MEDIUM")  # 不得高於 MEDIUM
-        global_confidence = _overall_confidence(conf_parts)
+    # ---- Global confidence_level（憲章 1.3）
+    # 來源：Integrity confidence + Amount confidence + Date status
+    conf_parts = [str(integrity_v1632.get("confidence", "LOW")), str(amount.confidence_level)]
+    if date_status == "UNVERIFIED":
+        conf_parts.append("MEDIUM")  # 不得高於 MEDIUM
+    global_confidence = _overall_confidence(conf_parts)
 
-        sources = {
-            "twii": src_twii,
-            "vix": src_vix,
-            "metrics_reason": metrics.get("metrics_reason", "NA"),
-            "amount_source": {
+    sources = {
+        "twii": src_twii,
+        "vix": src_vix,
+        "metrics_reason": metrics.get("metrics_reason", "NA"),
+        "amount_source": {
+            "trade_date": trade_date,
+            "source_twse": amount.source_twse,
+            "source_tpex": amount.source_tpex,
+            "status_twse": amount.status_twse,
+            "status_tpex": amount.status_tpex,
+            "confidence_twse": amount.confidence_twse,
+            "confidence_tpex": amount.confidence_tpex,
+            "confidence_level": amount.confidence_level,
+            "amount_twse": amount.amount_twse,
+            "amount_tpex": amount.amount_tpex,
+            "amount_total": amount.amount_total,
+            "scope": amount.scope,
+            "audit_dir": AUDIT_DIR,
+            "twse_audit": (amount.meta or {}).get("twse", {}).get("audit") if amount.meta else None,
+            "tpex_audit": (amount.meta or {}).get("tpex", {}).get("audit") if amount.meta else None,
+        },
+        "prices_source_map": source_map,
+            "finmind_token_loaded": bool(finmind_token),
+    }
+
+    payload = {
+        "meta": {
+            "timestamp": _now_ts(),
+            "session": session,
+            "market_status": market_status,
+            "current_regime": final_regime,
+            "account_mode": account_mode,
+            "audit_tag": "V16.3.32_AUDIT_ENFORCED",
+            "confidence_level": global_confidence,     # ✅ 憲章 1.3
+            "date_status": date_status,               # ✅ Date Audit
+        },
+        "macro": {
+            "overview": {
                 "trade_date": trade_date,
-                "source_twse": amount.source_twse,
-                "source_tpex": amount.source_tpex,
-                "status_twse": amount.status_twse,
-                "status_tpex": amount.status_tpex,
-                "confidence_twse": amount.confidence_twse,
-                "confidence_tpex": amount.confidence_tpex,
-                "confidence_level": amount.confidence_level,
-                "amount_twse": amount.amount_twse,
-                "amount_tpex": amount.amount_tpex,
-                "amount_total": amount.amount_total,
-                "scope": amount.scope,
-                "audit_dir": AUDIT_DIR,
-                "twse_audit": (amount.meta or {}).get("twse", {}).get("audit") if amount.meta else None,
-                "tpex_audit": (amount.meta or {}).get("tpex", {}).get("audit") if amount.meta else None,
-            },
-            "prices_source_map": source_map,
-        }
+                "date_status": date_status,
 
-        payload = {
-            "meta": {
-                "timestamp": _now_ts(),
-                "session": session,
-                "market_status": market_status,
+                "twii_close": close_price,
+                "twii_change": twii_change,
+                "twii_pct": twii_pct,
+
+                # ✅ VIX 四件套
+                "vix": vix_last,
+                "vix_source": vix_source,
+                "vix_status": vix_status,
+                "vix_confidence": vix_confidence,
+
+                "vix_panic": vix_panic,
+                "smr": metrics.get("SMR"),
+                "slope5": metrics.get("Slope5"),
+                "drawdown_pct": metrics.get("drawdown_pct"),
+                "price_range_10d_pct": metrics.get("price_range_10d_pct"),
+                "dynamic_vix_threshold": dynamic_vix_threshold,
+
+                "max_equity_allowed_pct": final_max_equity,
                 "current_regime": final_regime,
-                "account_mode": account_mode,
-                "audit_tag": "V16.3.32_AUDIT_ENFORCED",
-                "confidence_level": global_confidence,     # ✅ 憲章 1.3
-                "date_status": date_status,               # ✅ Date Audit
             },
-            "macro": {
-                "overview": {
-                    "trade_date": trade_date,
-                    "date_status": date_status,
+            "sources": sources,
+            "market_amount": asdict(amount),
+            "market_inst_summary": market_inst_summary,
+            "integrity_v1632": integrity_v1632,
+        },
+        "portfolio": {
+            "total_equity": int(total_equity),
+            "cash_balance": int(cash_balance),
+            "current_exposure_pct": float(current_exposure_pct),
+            "cash_pct": float(100.0 * max(0.0, 1.0 - current_exposure_pct)),
+        },
+        "institutional_panel": institutional_panel.to_dict(orient="records"),
+        "stocks": stocks,
+        "positions_input": positions,
+        "decisions": [],
+        "audit_log": [],
+    }
 
-                    "twii_close": close_price,
-                    "twii_change": twii_change,
-                    "twii_pct": twii_pct,
-
-                    # ✅ VIX 四件套
-                    "vix": vix_last,
-                    "vix_source": vix_source,
-                    "vix_status": vix_status,
-                    "vix_confidence": vix_confidence,
-
-                    "vix_panic": vix_panic,
-                    "smr": metrics.get("SMR"),
-                    "slope5": metrics.get("Slope5"),
-                    "drawdown_pct": metrics.get("drawdown_pct"),
-                    "price_range_10d_pct": metrics.get("price_range_10d_pct"),
-                    "dynamic_vix_threshold": dynamic_vix_threshold,
-
-                    "max_equity_allowed_pct": final_max_equity,
-                    "current_regime": final_regime,
-                },
-                "sources": sources,
-                "market_amount": asdict(amount),
-                "market_inst_summary": market_inst_summary,
-                "integrity_v1632": integrity_v1632,
-            },
-            "portfolio": {
-                "total_equity": int(total_equity),
-                "cash_balance": int(cash_balance),
-                "current_exposure_pct": float(current_exposure_pct),
-                "cash_pct": float(100.0 * max(0.0, 1.0 - current_exposure_pct)),
-            },
-            "institutional_panel": institutional_panel.to_dict(orient="records"),
-            "stocks": stocks,
-            "positions_input": positions,
-            "decisions": [],
-            "audit_log": [],
-        }
-
-        return payload, warnings_bus.latest(50)
+    return payload, warnings_bus.latest(50)
 
 
 # =========================
