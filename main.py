@@ -1,15 +1,17 @@
 # main.py
 # =========================================================
-# Sunhero｜股市智能超盤中控台（TopN + 持倉監控 / Predator V16.3.33)
-# - FinMind Token：優先讀取 Streamlit Secrets (FINMIND_TOKEN)
-# - OTC 成交額：FinMind 彙總，scope =「只算普通股」，用 industry_category + stock_name 排除 ETF/ETN/Index 等
-# - 四件套：value + source + status + confidence（重要欄位全落地）
+# Sunhero｜股市智能超盤中控台（TopN + 持倉監控 / Predator V16.3.34 FIX）
+# FIX:
+# 1) FinMind Token 只讀 Streamlit Secrets（不再要求 UI 貼 token）
+# 2) TaiwanStockInfo.market 支援 OTC/ROTC/上櫃/興櫃/櫃買 等
+# 3) OTC 成交額：只算普通股（industry_category + stock_name 排除 ETF/ETN/Index...）
+# 4) 若 FinMind 當日無資料：自動回退最近可用交易日（<=5天），並標記 date_status=DEGRADED
+# 5) 法人資料：節流 + 重試（避免 HTTP 429）
+# 6) UI 回復完整訊息（expanders 顯示 audit/meta）
 # =========================================================
 
-import os
 import time
 import json
-import math
 import warnings
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -21,28 +23,17 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-# -------------------------
-# Streamlit config
-# -------------------------
 st.set_page_config(page_title="Sunhero｜股市智能超盤中控台", layout="wide")
-st.title("Sunhero｜股市智能超盤中控台（TopN + 持倉監控 / Predator V16.3.33）")
+st.title("Sunhero｜股市智能超盤中控台（TopN + 持倉監控 / Predator V16.3.34 FIX）")
 
-# -------------------------
-# Constants
-# -------------------------
 TWII_SYMBOL = "^TWII"
 VIX_SYMBOL = "^VIX"
+FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
 
 DEFAULT_TOPN = 20
 DEFAULT_CASH = 2_000_000
 DEFAULT_EQUITY = 2_000_000
 
-FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
-
-STATUS_ENUM = {"OK", "DEGRADED", "ESTIMATED", "FAIL"}
-CONF_ENUM = {"HIGH", "MEDIUM", "LOW"}
-
-# 你的 Top20（可自行改）
 DEFAULT_WATCH = [
     "2330.TW", "2317.TW", "2454.TW", "2308.TW", "2382.TW",
     "3231.TW", "2376.TW", "3017.TW", "3324.TW", "3661.TW",
@@ -59,15 +50,17 @@ STOCK_NAME_MAP = {
     "1519.TW": "華城", "2002.TW": "中鋼",
 }
 
-# OTC 普通股排除關鍵字（你指定：industry_category + stock_name 關鍵字排除）
 EXCLUDE_KW = [
     "ETF", "ETN", "INDEX", "指數", "反向", "槓桿", "期貨", "債", "債券", "權證",
     "受益證券", "存託憑證", "DR",
 ]
 
-# -------------------------
-# Helpers
-# -------------------------
+# TaiwanStockInfo.market 可能長這樣（英文/中文/混合）
+OTC_MARKET_KEYS = {"OTC", "ROTC", "上櫃", "興櫃", "櫃買", "TPEX"}
+
+STATUS_ENUM = {"OK", "DEGRADED", "ESTIMATED", "FAIL"}
+CONF_ENUM = {"HIGH", "MEDIUM", "LOW"}
+
 def now_ts() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
 
@@ -106,44 +99,56 @@ def safe_float(x: Any, default: Optional[float] = None) -> Optional[float]:
 def clamp_enum(val: str, allowed: set, fallback: str) -> str:
     return val if val in allowed else fallback
 
-def http_get_json(url: str, params: Dict[str, Any], timeout: int = 30, verify: bool = True) -> Tuple[Optional[Dict[str, Any]], Optional[str], Optional[int]]:
-    try:
-        r = requests.get(url, params=params, timeout=timeout, verify=verify)
-        code = r.status_code
-        r.raise_for_status()
-        return r.json(), None, code
-    except Exception as e:
-        return None, f"{type(e).__name__}:{e}", getattr(e, "response", None).status_code if getattr(e, "response", None) else None
-
-# -------------------------
-# FinMind
-# -------------------------
-def finmind_fetch(dataset: str, params: Dict[str, Any], token: Optional[str], timeout: int = 30) -> Dict[str, Any]:
-    q = dict(params)
-    q["dataset"] = dataset
-    if token:
-        q["token"] = token
-    headers = {}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    r = requests.get(FINMIND_URL, params=q, headers=headers, timeout=timeout)
-    r.raise_for_status()
-    return r.json()
-
 def _kw_hit(text: str) -> bool:
     t = (text or "").upper()
     return any(k.upper() in t for k in EXCLUDE_KW)
 
-def finmind_get_otc_common_set(token: Optional[str]) -> Tuple[set, Dict[str, Any], str]:
+def finmind_fetch(dataset: str, params: Dict[str, Any], token: str, timeout: int = 30) -> Dict[str, Any]:
+    q = dict(params)
+    q["dataset"] = dataset
+    q["token"] = token
+    r = requests.get(FINMIND_URL, params=q, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
+
+def finmind_fetch_retry(dataset: str, params: Dict[str, Any], token: str, timeout: int = 30, retries: int = 3) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+    """
+    重試用於 429/暫時性失敗，回傳 (json or None, debug_meta)
+    """
+    debug = {"dataset": dataset, "params": params, "attempts": []}
+    backoff = 1.2
+    for i in range(1, retries + 1):
+        try:
+            js = finmind_fetch(dataset, params, token, timeout=timeout)
+            debug["attempts"].append({"i": i, "ok": True})
+            return js, debug
+        except requests.HTTPError as e:
+            code = getattr(e.response, "status_code", None)
+            txt = ""
+            try:
+                txt = (e.response.text or "")[:180]
+            except Exception:
+                pass
+            debug["attempts"].append({"i": i, "ok": False, "http_status": code, "body_head": txt})
+            # 429 或 5xx 才值得重試
+            if code in (429, 500, 502, 503, 504):
+                time.sleep(backoff)
+                backoff *= 1.6
+                continue
+            return None, debug
+        except Exception as e:
+            debug["attempts"].append({"i": i, "ok": False, "err": f"{type(e).__name__}:{e}"})
+            time.sleep(backoff)
+            backoff *= 1.6
+    return None, debug
+
+def finmind_get_otc_common_set(token: str) -> Tuple[set, Dict[str, Any], str]:
     """
     取 OTC/ROTC 普通股清單：
-    - market in (OTC, ROTC)
+    - market in OTC_MARKET_KEYS（英文/中文容錯）
     - 用 industry_category + stock_name 排除 ETF/ETN/Index...
     """
     meta = {"dataset": "TaiwanStockInfo", "rows": 0, "otc_total": 0, "otc_common": 0, "excluded": 0}
-    if not token:
-        return set(), meta, "NO_TOKEN"
-
     try:
         js = finmind_fetch("TaiwanStockInfo", params={}, token=token, timeout=30)
         data = js.get("data", [])
@@ -154,21 +159,28 @@ def finmind_get_otc_common_set(token: Optional[str]) -> Tuple[set, Dict[str, Any
         keep = set()
 
         for row in data:
-            market = str(row.get("market", "")).upper()
+            market_raw = str(row.get("market", "")).strip()
+            market_u = market_raw.upper()
             stock_id = str(row.get("stock_id", "")).strip()
             stock_name = str(row.get("stock_name", "")).strip()
             industry = str(row.get("industry_category", "")).strip()
 
-            if not stock_id or market not in ("OTC", "ROTC"):
+            if not stock_id:
+                continue
+
+            # 容錯：英文/中文 market 都視為 OTC
+            is_otc = (market_u in OTC_MARKET_KEYS) or (market_raw in OTC_MARKET_KEYS) or any(k in market_raw for k in ["上櫃", "興櫃", "櫃買"])
+            if not is_otc:
                 continue
 
             otc_total += 1
 
-            # 只留「看起來像普通股」：四碼為主（你要更嚴格也可加規則）
+            # 只留數字 stock_id（排除基金/債券/票券類）
             if not stock_id.isdigit():
                 excluded += 1
                 continue
 
+            # 你指定：industry_category + stock_name 關鍵字排除
             if _kw_hit(industry) or _kw_hit(stock_name):
                 excluded += 1
                 continue
@@ -182,9 +194,9 @@ def finmind_get_otc_common_set(token: Optional[str]) -> Tuple[set, Dict[str, Any
     except Exception as e:
         return set(), meta, f"FAIL:{type(e).__name__}"
 
-def finmind_sum_otc_trading_money(trade_date: str, token: Optional[str]) -> Tuple[Optional[int], str, Dict[str, Any]]:
+def finmind_sum_otc_trading_money(trade_date: str, token: str) -> Tuple[Optional[int], str, Dict[str, Any]]:
     """
-    取 OTC 普通股成交額（Trading_money）：
+    OTC 普通股成交額（Trading_money）：
     - TaiwanStockInfo 建普通股集合
     - TaiwanStockPrice 分頁拉 trade_date 當日資料
     - 只加總 stock_id in keep_set
@@ -199,9 +211,6 @@ def finmind_sum_otc_trading_money(trade_date: str, token: Optional[str]) -> Tupl
         "stockinfo": {},
         "reason": "",
     }
-    if not token:
-        meta["reason"] = "NO_TOKEN"
-        return None, "FAIL", meta
 
     keep_set, info_meta, info_status = finmind_get_otc_common_set(token)
     meta["stockinfo"] = {"status": info_status, **info_meta}
@@ -216,18 +225,19 @@ def finmind_sum_otc_trading_money(trade_date: str, token: Optional[str]) -> Tupl
 
     page = 1
     while True:
-        try:
-            js = finmind_fetch(
-                "TaiwanStockPrice",
-                params={"start_date": trade_date, "end_date": trade_date, "page": page},
-                token=token,
-                timeout=30,
-            )
-            data = js.get("data", [])
-        except Exception as e:
-            meta["reason"] = f"FETCH_FAIL:{type(e).__name__}"
+        js, dbg = finmind_fetch_retry(
+            "TaiwanStockPrice",
+            params={"start_date": trade_date, "end_date": trade_date, "page": page},
+            token=token,
+            timeout=30,
+            retries=3,
+        )
+        if js is None:
+            meta["reason"] = "FETCH_FAIL"
+            meta["fetch_debug"] = dbg
             break
 
+        data = js.get("data", [])
         if not data:
             break
 
@@ -252,50 +262,86 @@ def finmind_sum_otc_trading_money(trade_date: str, token: Optional[str]) -> Tupl
     meta["matched_rows"] = matched
     meta["amount_sum"] = int(total)
 
-    # 下限合理性（避免空集合或抓錯欄位導致很小）
-    # OTC 正常日量級常見 > 500 億；你要更保守可提高門檻
-    if total >= 50_000_000_000:
+    # 合理性下限：OTC 一般日量級常 > 500 億；這裡用 200 億當「最低可接受」
+    if total >= 20_000_000_000:
         meta["reason"] = "OK"
         return int(total), "OK", meta
 
-    meta["reason"] = "AMOUNT_TOO_LOW"
+    meta["reason"] = "AMOUNT_TOO_LOW_OR_NO_DATA"
     return None, "FAIL", meta
 
-# -------------------------
-# Market amount (TWSE + TPEX)
-# -------------------------
+def yf_last_close(symbol: str, period: str = "60d") -> Tuple[Optional[float], Optional[str], str]:
+    try:
+        df = yf.download(symbol, period=period, interval="1d", progress=False, auto_adjust=False, threads=True)
+        if df is None or df.empty:
+            return None, "YF_EMPTY", "FAIL"
+        close = safe_float(df["Close"].iloc[-1], None)
+        last_dt = str(pd.to_datetime(df.index[-1]).date())
+        return close, f"YF:{last_dt}", "OK"
+    except Exception as e:
+        return None, f"YF_FAIL:{type(e).__name__}", "FAIL"
+
+def yf_batch_quotes(symbols: List[str], lookback_days: int = 90) -> Tuple[pd.DataFrame, Dict[str, str]]:
+    src_map = {}
+    if not symbols:
+        return pd.DataFrame(), src_map
+    try:
+        df = yf.download(" ".join(symbols), period=f"{lookback_days}d", interval="1d", progress=False, auto_adjust=False, threads=True)
+        return df, {s: "YF_BATCH" for s in symbols}
+    except Exception:
+        frames = {}
+        for s in symbols:
+            try:
+                d = yf.download(s, period=f"{lookback_days}d", interval="1d", progress=False, auto_adjust=False, threads=False)
+                frames[s] = d
+                src_map[s] = "YF_SINGLE"
+            except Exception:
+                src_map[s] = "YF_FAIL"
+        return pd.concat(frames, axis=1) if frames else pd.DataFrame(), src_map
+
+def parse_positions(text: str) -> List[Dict[str, Any]]:
+    try:
+        data = json.loads(text)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+def pick_trade_date() -> str:
+    # 以 TWII 最新日期當作預設交易日（比用「今天」可靠）
+    close, last_dt, status = yf_last_close(TWII_SYMBOL, period="60d")
+    if last_dt and last_dt.startswith("YF:"):
+        return last_dt.replace("YF:", "")
+    return str(pd.Timestamp.now(tz="Asia/Taipei").date())
+
 def fetch_twse_amount(trade_date: str, allow_insecure_ssl: bool) -> Tuple[Optional[int], str, str, str, Dict[str, Any]]:
-    """
-    取 TWSE 全市場成交金額（TWSE STOCK_DAY_ALL 加總 amount）
-    回傳：amount, source, status, confidence, meta
-    """
     url = "https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL"
     params = {"response": "json", "date": trade_date.replace("-", "")}
-    js, err, code = http_get_json(url, params=params, timeout=30, verify=(not allow_insecure_ssl))
+    meta = {"trade_date": trade_date, "url": url, "params": params, "status_code": None, "error": None, "rows": 0, "amount_sum": None}
 
-    meta = {"trade_date": trade_date, "url": url, "params": params, "status_code": code, "error": err, "rows": 0, "amount_sum": None}
-    if js is None:
+    try:
+        r = requests.get(url, params=params, timeout=30, verify=(not allow_insecure_ssl))
+        meta["status_code"] = r.status_code
+        r.raise_for_status()
+        js = r.json()
+    except Exception as e:
+        meta["error"] = f"{type(e).__name__}:{e}"
         return None, "TWSE_FAIL", "FAIL", "LOW", meta
 
     data = js.get("data", []) or []
     meta["rows"] = len(data)
-    # data columns vary; usually last columns include 成交金額
-    # 我們用「成交金額」欄位：一般是第 8 or 9 欄 (index 8)；為避免格式變動，以「可轉 int 的大數」保守抓取
+
     amount_sum = 0
     ok_rows = 0
     for row in data:
         if not isinstance(row, list):
             continue
-        # 從右往左找最可能是成交金額的欄
-        candidates = row[::-1]
+        # 右往左找成交金額（>=1e8）
         found = None
-        for c in candidates:
+        for c in row[::-1]:
             v = safe_int(c, None)
-            if v is not None and v > 0:
-                # 成交金額通常是 9~13 位數（> 1e8）
-                if v >= 100_000_000:
-                    found = v
-                    break
+            if v is not None and v >= 100_000_000:
+                found = v
+                break
         if found is not None:
             amount_sum += int(found)
             ok_rows += 1
@@ -303,56 +349,62 @@ def fetch_twse_amount(trade_date: str, allow_insecure_ssl: bool) -> Tuple[Option
     meta["ok_rows"] = ok_rows
     meta["amount_sum"] = int(amount_sum)
 
-    if amount_sum > 200_000_000_000:  # 2,000 億以上才視為可信
+    if amount_sum > 200_000_000_000:
         return int(amount_sum), "TWSE_OK:AUDIT_SUM", "OK", "HIGH", meta
     return None, "TWSE_FAIL:LOW_SUM", "FAIL", "LOW", meta
 
-def fetch_market_amount(trade_date: str, allow_insecure_ssl: bool, finmind_token: Optional[str]) -> Dict[str, Any]:
+def fetch_market_amount(trade_date: str, allow_insecure_ssl: bool, finmind_token: Optional[str]) -> Tuple[Dict[str, Any], str]:
     """
-    回傳 market_amount 區塊（含 TWSE + TPEX + total）
+    回傳 (market_amount, date_status)
+    date_status: VERIFIED 或 DEGRADED（若 FinMind 回退日期）
     """
-    # TWSE
     twse_amt, twse_src, twse_status, twse_conf, twse_meta = fetch_twse_amount(trade_date, allow_insecure_ssl)
 
-    # TPEX（OTC）— 你指定：只算普通股、排除 ETF/ETN/Index...
     tpex_amt = None
     tpex_src = "TPEX_FAIL"
     tpex_status = "FAIL"
     tpex_conf = "LOW"
     tpex_meta = {}
+    date_status = "VERIFIED"
+    used_trade_date = trade_date
 
     if finmind_token:
-        tpex_val, tpex_status_raw, tpex_meta = finmind_sum_otc_trading_money(trade_date, finmind_token)
-        if tpex_status_raw == "OK" and tpex_val is not None:
-            tpex_amt = int(tpex_val)
-            tpex_src = "FINMIND_OK:OTC_COMMON_SUM"
-            tpex_status = "OK"
-            tpex_conf = "HIGH"
-        else:
-            # 失敗就降級估計（保守）
+        # 若當日無資料，自動回退最多 5 天（避免「盤後早段 FinMind 尚未上線」）
+        for back in range(0, 6):
+            dt = (pd.to_datetime(trade_date) - pd.Timedelta(days=back)).strftime("%Y-%m-%d")
+            val, stt, meta = finmind_sum_otc_trading_money(dt, finmind_token)
+            if stt == "OK" and val is not None:
+                tpex_amt = int(val)
+                tpex_src = "FINMIND_OK:OTC_COMMON_SUM"
+                tpex_status = "OK"
+                tpex_conf = "HIGH"
+                tpex_meta = meta
+                used_trade_date = dt
+                if dt != trade_date:
+                    date_status = "DEGRADED"
+                break
+            tpex_meta = meta
+
+        if tpex_status != "OK":
             tpex_amt = 200_000_000_000
             tpex_src = "TPEX_SAFE_MODE_200B"
             tpex_status = "ESTIMATED"
             tpex_conf = "LOW"
     else:
-        # 無 token：直接估計
         tpex_amt = 200_000_000_000
         tpex_src = "TPEX_SAFE_MODE_200B"
         tpex_status = "ESTIMATED"
         tpex_conf = "LOW"
 
-    # total
     total = None
     if twse_amt is not None and tpex_amt is not None:
         total = int(twse_amt + tpex_amt)
 
-    # overall confidence（取較低者）
     conf_rank = {"LOW": 1, "MEDIUM": 2, "HIGH": 3}
     overall_conf = "LOW"
-    if twse_conf in conf_rank and tpex_conf in conf_rank:
-        overall_conf = twse_conf if conf_rank[twse_conf] <= conf_rank[tpex_conf] else tpex_conf
+    overall_conf = twse_conf if conf_rank[twse_conf] <= conf_rank[tpex_conf] else tpex_conf
 
-    return {
+    out = {
         "amount_twse": twse_amt,
         "amount_tpex": tpex_amt,
         "amount_total": total,
@@ -366,160 +418,98 @@ def fetch_market_amount(trade_date: str, allow_insecure_ssl: bool, finmind_token
         "allow_insecure_ssl": bool(allow_insecure_ssl),
         "scope": "ALL",
         "meta": {
-            "trade_date": trade_date,
+            "trade_date": used_trade_date,
             "twse": twse_meta,
             "tpex": {
-                "fallback": "finmind_common_stock_sum_or_estimate",
+                "scope_note": "OTC 普通股 = TaiwanStockInfo + (industry_category/stock_name 排除 ETF/ETN/Index...)",
                 "finmind": tpex_meta,
             },
         },
     }
+    return out, date_status
 
-# -------------------------
-# Price / VIX / TWII
-# -------------------------
-def yf_last_close(symbol: str, period: str = "10d") -> Tuple[Optional[float], Optional[str], Optional[str]]:
-    try:
-        df = yf.download(symbol, period=period, interval="1d", progress=False, auto_adjust=False, threads=True)
-        if df is None or df.empty:
-            return None, "YF_EMPTY", "FAIL"
-        close = safe_float(df["Close"].iloc[-1], None)
-        last_dt = str(pd.to_datetime(df.index[-1]).date())
-        return close, f"YF:{last_dt}", "OK"
-    except Exception as e:
-        return None, f"YF_FAIL:{type(e).__name__}", "FAIL"
-
-def yf_batch_quotes(symbols: List[str], lookback_days: int = 60) -> Tuple[pd.DataFrame, Dict[str, str]]:
-    src_map = {}
-    if not symbols:
-        return pd.DataFrame(), src_map
-    tickers = " ".join(symbols)
-    try:
-        df = yf.download(tickers, period=f"{lookback_days}d", interval="1d", progress=False, auto_adjust=False, threads=True)
-        # df columns: OHLCV in multiindex if multiple
-        return df, {s: "YF_BATCH" for s in symbols}
-    except Exception:
-        # fallback single
-        frames = {}
-        for s in symbols:
-            try:
-                d = yf.download(s, period=f"{lookback_days}d", interval="1d", progress=False, auto_adjust=False, threads=False)
-                frames[s] = d
-                src_map[s] = "YF_SINGLE"
-            except Exception:
-                src_map[s] = "YF_FAIL"
-        return pd.concat(frames, axis=1) if frames else pd.DataFrame(), src_map
-
-# -------------------------
-# Institutional (FinMind) - 3D net (Foreign + Trust)
-# -------------------------
-def finmind_inst_3d_net(stock_id_wo_suffix: str, trade_date: str, token: Optional[str]) -> Tuple[Optional[float], str]:
+def finmind_inst_3d_net(stock_id_wo_suffix: str, end_date: str, token: str) -> Tuple[Optional[float], str, Dict[str, Any]]:
     """
-    以 FinMind 的法人買賣資料計算「近 3 個交易日淨額」
-    dataset 常見：TaiwanStockInstitutionalInvestorsBuySell
-    欄位常見：buy/sell 或者 同名拆欄；這裡用保守加總「Foreign_Investor + Investment_Trust + Dealer_self + Dealer_Hedging」
-    若資料結構不同 → 自動 FAIL 並回傳 None
+    近 3 個交易日法人淨額（節流 + 重試）
     """
-    if not token:
-        return None, "NO_TOKEN"
-    try:
-        js = finmind_fetch(
-            "TaiwanStockInstitutionalInvestorsBuySell",
-            params={"stock_id": stock_id_wo_suffix, "start_date": (pd.to_datetime(trade_date) - pd.Timedelta(days=10)).strftime("%Y-%m-%d"), "end_date": trade_date},
-            token=token,
-            timeout=30,
-        )
-        data = js.get("data", [])
-        if not data:
-            return None, "EMPTY"
-        df = pd.DataFrame(data)
-        if "date" not in df.columns:
-            return None, "BAD_SCHEMA"
-        df["date"] = pd.to_datetime(df["date"])
-        df = df.sort_values("date").tail(3)
+    start_date = (pd.to_datetime(end_date) - pd.Timedelta(days=10)).strftime("%Y-%m-%d")
+    js, dbg = finmind_fetch_retry(
+        "TaiwanStockInstitutionalInvestorsBuySell",
+        params={"stock_id": stock_id_wo_suffix, "start_date": start_date, "end_date": end_date},
+        token=token,
+        timeout=30,
+        retries=3,
+    )
+    if js is None:
+        return None, "FAIL:HTTPError", dbg
 
-        # 依 FinMind 常見欄位：name, buy, sell
-        if {"name", "buy", "sell"}.issubset(df.columns):
-            df["net"] = pd.to_numeric(df["buy"], errors="coerce").fillna(0) - pd.to_numeric(df["sell"], errors="coerce").fillna(0)
-            target = {"Foreign_Investor", "Investment_Trust", "Dealer_self", "Dealer_Hedging"}
-            net = df.loc[df["name"].isin(target), "net"].sum()
-            return float(net), "FINMIND_3D_NET"
+    data = js.get("data", [])
+    if not data:
+        return None, "EMPTY", dbg
 
-        # 若是已展開欄位（較少見），就找包含 Foreign/Trust 關鍵欄
-        cols = [c for c in df.columns if "foreign" in c.lower() or "trust" in c.lower()]
-        if cols:
-            net = 0.0
-            for c in cols:
-                net += pd.to_numeric(df[c], errors="coerce").fillna(0).sum()
-            return float(net), "FINMIND_3D_NET_FALLBACK"
+    df = pd.DataFrame(data)
+    if "date" not in df.columns:
+        return None, "BAD_SCHEMA", dbg
 
-        return None, "BAD_SCHEMA"
-    except Exception as e:
-        return None, f"FAIL:{type(e).__name__}"
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date").tail(3)
+
+    if {"name", "buy", "sell"}.issubset(df.columns):
+        df["net"] = pd.to_numeric(df["buy"], errors="coerce").fillna(0) - pd.to_numeric(df["sell"], errors="coerce").fillna(0)
+        target = {"Foreign_Investor", "Investment_Trust", "Dealer_self", "Dealer_Hedging"}
+        net = df.loc[df["name"].isin(target), "net"].sum()
+        return float(net), "FINMIND_3D_NET", dbg
+
+    return None, "BAD_SCHEMA", dbg
 
 # -------------------------
-# UI Sidebar
+# Sidebar
 # -------------------------
 st.sidebar.header("設定 (Settings)")
-
 session = st.sidebar.selectbox("Session", ["EOD", "INTRADAY"], index=0)
 account_mode = st.sidebar.selectbox("帳戶模式", ["Conservative", "Balanced", "Aggressive"], index=0)
-topn = st.sidebar.selectbox("TopN（監控數量）", [10, 20, 30, 50], index=[10,20,30,50].index(DEFAULT_TOPN))
-allow_insecure_ssl = st.sidebar.checkbox("允許不安全 SSL（僅在雲端源憑證錯誤時使用）", value=True)
+topn = st.sidebar.selectbox("TopN（監控數量）", [10, 20, 30, 50], index=[10, 20, 30, 50].index(DEFAULT_TOPN))
+allow_insecure_ssl = st.sidebar.checkbox("允許不安全 SSL（雲端憑證錯誤時用）", value=True)
 
 st.sidebar.divider()
-st.sidebar.subheader("FinMind")
-
-# 讀 secrets
-token_from_secrets = None
+st.sidebar.subheader("FinMind（只用 Secrets）")
 try:
-    token_from_secrets = st.secrets.get("FINMIND_TOKEN", None)
+    finmind_token = st.secrets.get("FINMIND_TOKEN", None)
 except Exception:
-    token_from_secrets = None
+    finmind_token = None
 
-# UI 允許 override（不強制）
-token_override = st.sidebar.text_input("FinMind Token（可留空，優先用 Secrets）", value="", type="password")
-finmind_token = token_override.strip() if token_override.strip() else (token_from_secrets.strip() if isinstance(token_from_secrets, str) and token_from_secrets.strip() else None)
-
-if finmind_token:
-    st.sidebar.success("FinMind Token：已載入 ✅")
+finmind_token_ok = isinstance(finmind_token, str) and finmind_token.strip() != ""
+if finmind_token_ok:
+    st.sidebar.success("FinMind Token：已載入 ✅（Secrets）")
 else:
-    st.sidebar.error("FinMind Token：未載入 ❌（OTC/法人資料會降級）")
+    st.sidebar.error("FinMind Token：未載入 ❌（請到 App settings → Secrets 設定 FINMIND_TOKEN）")
 
 st.sidebar.divider()
 st.sidebar.subheader("持倉 (JSON List)")
 positions_text = st.sidebar.text_area("positions", value="[]", height=140)
-
 cash_balance = st.sidebar.number_input("現金餘額", min_value=0, value=DEFAULT_CASH, step=10000)
 total_equity = st.sidebar.number_input("總權益", min_value=0, value=DEFAULT_EQUITY, step=10000)
 
 run_btn = st.sidebar.button("啟動中控台（Audit Enforced）", type="primary")
 
 # -------------------------
-# Main execution
+# Core
 # -------------------------
-def parse_positions(text: str) -> List[Dict[str, Any]]:
-    try:
-        data = json.loads(text)
-        return data if isinstance(data, list) else []
-    except Exception:
-        return []
-
 def build_output(trade_date: str) -> Dict[str, Any]:
-    # TWII + VIX
     twii_close, twii_src, twii_status = yf_last_close(TWII_SYMBOL, period="60d")
     vix_close, vix_src, vix_status = yf_last_close(VIX_SYMBOL, period="120d")
 
-    # Market amount
-    market_amount = fetch_market_amount(trade_date, allow_insecure_ssl, finmind_token)
+    market_amount, date_status = fetch_market_amount(trade_date, allow_insecure_ssl, finmind_token.strip() if finmind_token_ok else None)
+    used_date = market_amount["meta"]["trade_date"]
 
-    # Watch list prices & vol ratio
     df, price_src_map = yf_batch_quotes(DEFAULT_WATCH, lookback_days=90)
 
     stocks_out = []
     inst_panel = []
 
-    # 取 Close/Volume 序列（多檔時為 MultiIndex）
+    # 法人節流（避免 20 檔一口氣打爆 API）
+    per_call_sleep = 0.25
+
     for i, sym in enumerate(DEFAULT_WATCH, start=1):
         name = STOCK_NAME_MAP.get(sym, sym)
         price = None
@@ -543,35 +533,32 @@ def build_output(trade_date: str) -> Dict[str, Any]:
         except Exception:
             pass
 
-        # FinMind 法人 3D net（可用就填）
         inst_net_3d = 0.0
         inst_src = "NO_TOKEN"
         inst_status = "NO_DATA"
         inst_dir3 = "NO_DATA"
         inst_streak3 = 0
+        inst_debug = None
 
-        if finmind_token:
+        if finmind_token_ok:
             stock_id = sym.replace(".TW", "")
-            net, src2 = finmind_inst_3d_net(stock_id, trade_date, finmind_token)
+            net, src2, dbg = finmind_inst_3d_net(stock_id, used_date, finmind_token.strip())
+            inst_debug = dbg
             inst_src = src2
             if net is not None:
                 inst_net_3d = float(net)
                 inst_status = "READY"
-                # 方向（簡化：>0 為 POSITIVE，<0 為 NEGATIVE）
                 if inst_net_3d > 0:
                     inst_dir3 = "POSITIVE"
                 elif inst_net_3d < 0:
                     inst_dir3 = "NEGATIVE"
                 else:
                     inst_dir3 = "NEUTRAL"
-                # streak（簡化：只要 net>0 視作 1；你要精準連買需逐日判斷）
                 inst_streak3 = 3 if inst_net_3d > 0 else 0
-            else:
-                inst_status = "NO_DATA"
-                inst_dir3 = "NO_DATA"
+
+            time.sleep(per_call_sleep)
 
         layer = "NONE"
-        # Layer 規則（示範：量能>1 且法人偏多且 streak>=3 → A+）
         if vol_ratio is not None and vol_ratio >= 1.0 and inst_dir3 == "POSITIVE" and inst_streak3 >= 3:
             layer = "A+"
 
@@ -583,6 +570,7 @@ def build_output(trade_date: str) -> Dict[str, Any]:
             "Inst_Dir3": inst_dir3,
             "Inst_Net_3d": float(inst_net_3d),
             "inst_source": inst_src,
+            "inst_debug": inst_debug,
         })
 
         stocks_out.append({
@@ -602,24 +590,21 @@ def build_output(trade_date: str) -> Dict[str, Any]:
             "source": src,
         })
 
-    # market_inst_summary（若你未接 TWSE 三大法人，先留空可擴充）
-    market_inst_summary = []
-
     out = {
         "meta": {
             "timestamp": now_ts(),
             "session": session,
-            "market_status": "LOW",  # 你可再用 amount_total 判斷級別
+            "market_status": "LOW",
             "current_regime": "OVERHEAT",
             "account_mode": account_mode,
-            "audit_tag": "V16.3.33_AUDIT_ENFORCED",
+            "audit_tag": "V16.3.34_AUDIT_ENFORCED_FIX",
             "confidence_level": market_amount.get("confidence_level", "LOW"),
-            "date_status": "VERIFIED",
+            "date_status": date_status,
         },
         "macro": {
             "overview": {
-                "trade_date": trade_date,
-                "date_status": "VERIFIED",
+                "trade_date": used_date,
+                "date_status": date_status,
                 "twii_close": twii_close,
                 "twii_change": None,
                 "twii_pct": None,
@@ -628,24 +613,19 @@ def build_output(trade_date: str) -> Dict[str, Any]:
                 "vix_status": clamp_enum(vix_status, STATUS_ENUM, "FAIL"),
                 "vix_confidence": "MEDIUM" if vix_close is not None else "LOW",
                 "vix_panic": 35.0,
-                "smr": None,
-                "slope5": None,
-                "drawdown_pct": None,
-                "price_range_10d_pct": None,
                 "dynamic_vix_threshold": 35.0,
-                "max_equity_allowed_pct": 0.55 if account_mode != "Conservative" else 0.45,
+                "max_equity_allowed_pct": 0.45 if account_mode == "Conservative" else 0.55,
                 "current_regime": "OVERHEAT",
             },
             "sources": {
                 "twii": {"name": "TWII", "ok": twii_close is not None, "last_dt": twii_src, "reason": twii_status},
                 "vix": {"name": "VIX", "ok": vix_close is not None, "last_dt": vix_src, "reason": vix_status},
-                "amount_source": market_amount.get("meta", {}).get("tpex", {}).get("finmind", {}),
                 "prices_source_map": price_src_map,
-                "finmind_token_loaded": bool(finmind_token),
+                "finmind_token_loaded": bool(finmind_token_ok),
             },
             "market_amount": market_amount,
-            "market_inst_summary": market_inst_summary,
-            "integrity_v1633": {
+            "market_inst_summary": [],
+            "integrity_v1634": {
                 "status": "OK",
                 "kill_switch": False,
                 "confidence": "MEDIUM" if market_amount.get("confidence_level") != "LOW" else "LOW",
@@ -669,16 +649,13 @@ def build_output(trade_date: str) -> Dict[str, Any]:
     }
     return out
 
-def guess_trade_date_for_demo() -> str:
-    # 你已經在上游做 VERIFIED；這裡只取今天日期（不做假日判斷）
-    return str(pd.Timestamp.now(tz="Asia/Taipei").date())
-
 if run_btn:
-    trade_date = guess_trade_date_for_demo()
+    trade_date = pick_trade_date()
     payload = build_output(trade_date)
 
-    # ---- UI 展示 ----
+    # -------- UI（恢復完整資訊）--------
     col1, col2 = st.columns([1, 1])
+
     with col1:
         st.subheader("大盤 / 成交額（四件套）")
         ma = payload["macro"]["market_amount"]
@@ -689,30 +666,41 @@ if run_btn:
             "OTC source/status/conf": (ma["source_tpex"], ma["status_tpex"], ma["confidence_tpex"]),
             "Total 成交額": ma["amount_total"],
             "Overall confidence": ma["confidence_level"],
+            "trade_date(used)": ma["meta"]["trade_date"],
+            "date_status": payload["meta"]["date_status"],
         })
-        st.caption("OTC scope：只算普通股（industry_category + stock_name 排除 ETF/ETN/Index/反向/槓桿等）。")
+
+        with st.expander("OTC 彙總細節（stockinfo / 排除規則 / 分頁）", expanded=True):
+            st.json(ma["meta"]["tpex"]["finmind"])
+
+        with st.expander("TWSE audit 細節（rows / ok_rows / sum）", expanded=False):
+            st.json(ma["meta"]["twse"])
 
     with col2:
         st.subheader("Token / 資料狀態")
         st.write({
-            "FINMIND_TOKEN_LOADED": bool(finmind_token),
+            "FINMIND_TOKEN_LOADED": payload["macro"]["sources"]["finmind_token_loaded"],
             "VIX": payload["macro"]["overview"]["vix"],
             "TWII": payload["macro"]["overview"]["twii_close"],
+            "trade_date(overview)": payload["macro"]["overview"]["trade_date"],
         })
+        if not payload["macro"]["sources"]["finmind_token_loaded"]:
+            st.error("FinMind Token 未從 Secrets 載入：請到 App settings → Secrets 設定 FINMIND_TOKEN")
 
     st.subheader("TopN 監控（含股票名稱）")
     df_show = pd.DataFrame(payload["stocks"])
-    # 展開一點點欄位
     if not df_show.empty:
         df_show = df_show[["Tier", "Symbol", "Name", "Price", "Vol_Ratio", "Layer", "source"]]
     st.dataframe(df_show, use_container_width=True)
 
-    st.subheader("法人面板（FinMind 3D Net）")
+    st.subheader("法人面板（FinMind 3D Net + debug）")
     df_inst = pd.DataFrame(payload["institutional_panel"])
-    st.dataframe(df_inst, use_container_width=True)
+    st.dataframe(df_inst[["Symbol","Name","Inst_Status","Inst_Dir3","Inst_Streak3","Inst_Net_3d","inst_source"]], use_container_width=True)
+
+    with st.expander("法人 API debug（若出現 HTTPError，可在此看到 429/401 與回應片段）", expanded=False):
+        st.json(payload["institutional_panel"])
 
     st.subheader("輸出 JSON（可直接餵給裁決器）")
     st.code(json.dumps(payload, ensure_ascii=False, indent=2), language="json")
-
 else:
     st.info("左側設定完成後，按「啟動中控台」產出完整 JSON 與面板。")
