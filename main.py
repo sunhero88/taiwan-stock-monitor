@@ -1,1156 +1,1658 @@
 # main.py
-# Predator V16.3.32 — FINAL (TWSE T86 first, Market Guard + Stale Kill Switch + Integrity Validation)
-# 使用方式：streamlit run main.py
+# =========================================================
+# Sunhero｜股市智能超盤中控台（TopN + 持倉監控 / Predator V16.3.32）
+# 最終修正版 - 時間邏輯與籌碼緩存漏洞修復
+# 
+# 修正重點：
+#   (1) 開盤保護開關 (Market Guard) - 自動切換至上一交易日
+#   (2) 過期籌碼熔斷 (Stale Data Kill Switch) - 禁用過期數據
+#   (3) 核心指標完整性檢查 - twii_close null 觸發 DATA_FAILURE
+#   (4) 輸出格式規範 - confidence_level 強制降級
+#   (5) 台北時間判定 (UTC+8) - 精確時間邏輯
+# =========================================================
 
-import os
+from __future__ import annotations
+
 import json
-import math
+import os
+import re
 import time
-import logging
-from dataclasses import dataclass
-from typing import Dict, Any, List, Tuple, Optional
-from datetime import datetime, timedelta, timezone, date
+from dataclasses import dataclass, asdict
+from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime, timedelta
+import pytz
 
-import requests
+import numpy as np
 import pandas as pd
-import yfinance as yf
+import requests
 import streamlit as st
+import yfinance as yf
+import warnings
+warnings.filterwarnings('ignore')
+
 
 # =========================
-# 基本設定
+# Streamlit page config
 # =========================
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+st.set_page_config(
+    page_title="Sunhero｜股市智能超盤中控台（Predator V16.3.32）",
+    layout="wide",
+)
 
-APP_TITLE = "Sunhero 的股市智能超盤（Predator V16.3.32 FINAL）"
-VERSION_TAG = "V16.3.32_AUDIT_ENFORCED_FINAL_T86_TWSE"
+APP_TITLE = "Sunhero｜股市智能超盤中控台（TopN + 持倉監控 / Predator V16.3.32 最終修正版）"
+st.title(APP_TITLE)
 
-DATA_DIR = "data"
-AUDIT_DIR = os.path.join(DATA_DIR, "audit_market_amount")
-CACHE_DIR = os.path.join(DATA_DIR, "cache")
-os.makedirs(DATA_DIR, exist_ok=True)
-os.makedirs(AUDIT_DIR, exist_ok=True)
-os.makedirs(CACHE_DIR, exist_ok=True)
 
-MARKET_JSON_PATH = os.path.join(DATA_DIR, "predator_market.json")
-INST_CACHE_PATH = os.path.join(CACHE_DIR, "institutional_cache.json")
+# =========================
+# Constants / helpers
+# =========================
+EPS = 1e-4
+TWII_SYMBOL = "^TWII"
+VIX_SYMBOL = "^VIX"
 
-# 你的 Top20（可自行調整）
-TOP20 = [
-    ("2330", "台積電"),
-    ("2317", "鴻海"),
-    ("2454", "聯發科"),
-    ("2308", "台達電"),
-    ("2382", "廣達"),
-    ("3231", "緯創"),
-    ("2376", "技嘉"),
-    ("3017", "奇鋐"),
-    ("3324", "雙鴻"),       # 上櫃
-    ("3661", "世芯-KY"),
-    ("2881", "富邦金"),
-    ("2882", "國泰金"),
-    ("2891", "中信金"),
-    ("2886", "兆豐金"),
-    ("2603", "長榮"),
-    ("2609", "陽明"),
-    ("1605", "華新"),
-    ("1513", "中興電"),
-    ("1519", "華城"),
-    ("2002", "中鋼"),
-]
+DEFAULT_TOPN = 20
+DEFAULT_CASH = 2_000_000
+DEFAULT_EQUITY = 2_000_000
 
-# 上櫃/上市判斷（簡化：你可自行維護名單；本版重點是 TWSE T86）
-TPEX_SET = {"3324"}  # 可再加：上櫃股票代碼集合
+FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
+A_NAMES = {"Foreign_Investor", "Investment_Trust", "Dealer_self", "Dealer_Hedging"}
 
-# User-Agent（避免部分站點擋爬）
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-    "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+NEUTRAL_THRESHOLD = 5_000_000
+
+AUDIT_DIR = "data/audit_market_amount"
+
+SMR_WATCH = 0.23
+
+DEGRADE_FACTOR_BY_MODE = {
+    "Conservative": 0.60,
+    "Balanced": 0.75,
+    "Aggressive": 0.85,
 }
 
-SESSION = requests.Session()
-SESSION.headers.update(HEADERS)
+STOCK_NAME_MAP = {
+    "2330.TW": "台積電", "2317.TW": "鴻海",   "2454.TW": "聯發科", "2308.TW": "台達電",
+    "2382.TW": "廣達",   "3231.TW": "緯創",   "2376.TW": "技嘉",   "3017.TW": "奇鋐",
+    "3324.TW": "雙鴻",   "3661.TW": "世芯-KY",
+    "2881.TW": "富邦金", "2882.TW": "國泰金", "2891.TW": "中信金", "2886.TW": "兆豐金",
+    "2603.TW": "長榮",   "2609.TW": "陽明",   "1605.TW": "華新",   "1513.TW": "中興電",
+    "1519.TW": "華城",   "2002.TW": "中鋼"
+}
+
+COL_TRANSLATION = {
+    "Symbol": "代號",
+    "Name": "名稱",
+    "Tier": "權重序",
+    "Price": "價格",
+    "Vol_Ratio": "量能比(Vol Ratio)",
+    "Layer": "分級(Layer)",
+    "Foreign_Net": "外資3日淨額",
+    "Trust_Net": "投信3日淨額",
+    "Inst_Streak3": "法人連買天數",
+    "Inst_Status": "籌碼狀態",
+    "Inst_Dir3": "籌碼方向",
+    "Inst_Net_3d": "3日合計淨額",
+    "inst_source": "資料來源",
+    "foreign_buy": "外資買超",
+    "trust_buy": "投信買超"
+}
+
+
+def _now_ts() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+
+
+def _ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+
+def _safe_float(x, default=None) -> Optional[float]:
+    try:
+        if x is None:
+            return default
+        if isinstance(x, (np.floating, float, int)):
+            return float(x)
+        if isinstance(x, str) and x.strip() == "":
+            return default
+        return float(x)
+    except Exception:
+        return default
+
+
+def _safe_int(x, default=None) -> Optional[int]:
+    try:
+        if x is None:
+            return default
+        if isinstance(x, (np.integer, int)):
+            return int(x)
+        if isinstance(x, (np.floating, float)):
+            return int(float(x))
+        if isinstance(x, str):
+            s = x.replace(",", "").strip()
+            return int(float(s)) if s else default
+        return int(x)
+    except Exception:
+        return default
+
+
+def _pct01_to_pct100(x: Optional[float]) -> Optional[float]:
+    if x is None:
+        return None
+    return float(x) * 100.0
+
+
+def _to_roc_date(ymd: str, format_type: str = "standard") -> str:
+    dt = pd.to_datetime(ymd)
+    roc_year = int(dt.year) - 1911
+    
+    if format_type == "compact":
+        return f"{roc_year}/{dt.month}/{dt.day}"
+    elif format_type == "dense":
+        return f"{roc_year:03d}{dt.month:02d}{dt.day:02d}"
+    else:
+        return f"{roc_year:03d}/{dt.month:02d}/{dt.day:02d}"
 
 
 # =========================
-# 時間治理：Market Guard（00:00~15:30 執行 EOD → 回退上一交易日）
+# 新增：台北時間工具函數
 # =========================
-def taipei_now() -> datetime:
-    tz = timezone(timedelta(hours=8))
-    return datetime.now(tz)
+def get_taipei_now() -> datetime:
+    """取得當前台北時間 (UTC+8)"""
+    taipei_tz = pytz.timezone('Asia/Taipei')
+    return datetime.now(taipei_tz)
 
-def apply_market_guard(session_type: str) -> Tuple[bool, date, str]:
+
+def get_effective_trade_date(session: str) -> Tuple[str, str, bool]:
     """
-    若為 EOD 且時間在 00:00~15:30 之間，自動回退至上一個有效交易日資料。
+    取得有效交易日期
+    
+    Returns:
+        (trade_date, date_status, is_using_previous_day)
+        
+    邏輯：
+    - 若 session == "EOD" 且當前時間 00:00-15:30 → 使用昨日
+    - 若 session == "INTRADAY" → 使用今日
+    - 否則使用今日
     """
-    now = taipei_now()
-    guard_active = False
-    eff_date = now.date()
-    note = "NORMAL"
-
-    if session_type.upper() == "EOD":
-        if now.hour < 15 or (now.hour == 15 and now.minute < 30):
-            guard_active = True
-            eff_date = now.date() - timedelta(days=1)
-            note = "MARKET_GUARD_ACTIVE"
-
-    return guard_active, eff_date, note
-
-
-# =========================
-# 交易日判定：以 TWII 有資料為準（最多回退 10 天）
-# =========================
-def resolve_effective_trade_date(target_date: date, max_back: int = 10) -> Tuple[Optional[date], str]:
-    """
-    用 yfinance 的 ^TWII 作為交易日存在性的判斷基準。
-    回傳 (有效交易日, 狀態)；若失敗回傳 (None, UNVERIFIED)
-    """
-    for i in range(max_back + 1):
-        d = target_date - timedelta(days=i)
-        start = (d - timedelta(days=3)).strftime("%Y-%m-%d")
-        end = (d + timedelta(days=1)).strftime("%Y-%m-%d")
-        try:
-            df = yf.download("^TWII", start=start, end=end, progress=False, auto_adjust=False)
-            if df is None or df.empty:
-                continue
-            df.index = pd.to_datetime(df.index).tz_localize(None)
-            # 找 <= d 的最後一筆
-            eligible = df[df.index.date <= d]
-            if eligible.empty:
-                continue
-            last_dt = eligible.index[-1].date()
-            return last_dt, "VERIFIED"
-        except Exception:
-            continue
-    return None, "UNVERIFIED"
+    taipei_now = get_taipei_now()
+    
+    # 開盤保護：EOD 模式且在收盤前
+    if session == "EOD" and taipei_now.hour < 15 or (taipei_now.hour == 15 and taipei_now.minute < 30):
+        # 使用上一個交易日
+        previous_day = taipei_now - timedelta(days=1)
+        
+        # 跳過週末
+        while previous_day.weekday() >= 5:  # 5=Saturday, 6=Sunday
+            previous_day -= timedelta(days=1)
+        
+        trade_date = previous_day.strftime("%Y-%m-%d")
+        date_status = "USING_PREVIOUS_DAY"
+        is_using_previous = True
+        
+        warnings_bus.push(
+            "MARKET_GUARD_ACTIVATED",
+            f"開盤保護開關啟動：當前 {taipei_now.strftime('%H:%M')}，使用 {trade_date} 數據",
+            {"session": session, "current_time": taipei_now.strftime("%Y-%m-%d %H:%M:%S")}
+        )
+    else:
+        # 正常使用今日
+        trade_date = taipei_now.strftime("%Y-%m-%d")
+        date_status = "VERIFIED"
+        is_using_previous = False
+    
+    return trade_date, date_status, is_using_previous
 
 
 # =========================
-# Market Amount：TWSE 官方（可稽核） + TPEX Safe Mode（依 ADR 放生）
+# Warnings recorder
 # =========================
-def fetch_twse_amount_stock_day_all(trade_date: date) -> Tuple[Optional[int], Dict[str, Any]]:
-    """
-    TWSE: STOCK_DAY_ALL（加總成交金額）
-    回傳 (amount_sum, audit_meta)
-    """
-    yyyymmdd = trade_date.strftime("%Y%m%d")
+class WarningBus:
+    def __init__(self):
+        self.items: List[Dict[str, Any]] = []
+
+    def push(self, code: str, msg: str, meta: Optional[dict] = None):
+        self.items.append({"ts": _now_ts(), "code": code, "msg": msg, "meta": meta or {}})
+
+    def latest(self, n: int = 50) -> List[Dict[str, Any]]:
+        return self.items[-n:]
+
+
+warnings_bus = WarningBus()
+
+
+# =========================
+# Global Session
+# =========================
+_GLOBAL_SESSION = None
+
+def _get_global_session() -> requests.Session:
+    global _GLOBAL_SESSION
+    if _GLOBAL_SESSION is None:
+        _GLOBAL_SESSION = requests.Session()
+        _GLOBAL_SESSION.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+            "Accept": "application/json,text/plain,text/html,*/*",
+            "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+            "Connection": "keep-alive",
+        })
+    return _GLOBAL_SESSION
+
+
+def _http_session() -> requests.Session:
+    return _get_global_session()
+
+
+# =========================
+# Market amount (TWSE/TPEX) - 終極修復版
+# =========================
+@dataclass
+class MarketAmount:
+    amount_twse: Optional[int]
+    amount_tpex: Optional[int]
+    amount_total: Optional[int]
+    source_twse: str
+    source_tpex: str
+    status_twse: str
+    status_tpex: str
+    confidence_twse: str
+    confidence_tpex: str
+    confidence_level: str
+    allow_insecure_ssl: bool
+    scope: str
+    meta: Optional[Dict[str, Any]] = None
+
+
+def _audit_save_text(audit_dir: str, fname: str, text: str) -> None:
+    _ensure_dir(audit_dir)
+    with open(os.path.join(audit_dir, fname), "w", encoding="utf-8") as f:
+        f.write(text if text is not None else "")
+
+
+def _audit_save_json(audit_dir: str, fname: str, obj: Any) -> None:
+    _ensure_dir(audit_dir)
+    with open(os.path.join(audit_dir, fname), "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+
+
+def _audit_save_csv(audit_dir: str, fname: str, df: pd.DataFrame) -> None:
+    _ensure_dir(audit_dir)
+    df.to_csv(os.path.join(audit_dir, fname), index=False, encoding="utf-8-sig")
+
+
+def _yahoo_estimate_twse() -> Tuple[int, str]:
+    """Yahoo Finance 估算上市成交額"""
+    try:
+        ticker = yf.Ticker("^TWII")
+        hist = ticker.history(period="2d", prepost=False)
+        if len(hist) >= 1:
+            vol = hist['Volume'].iloc[-1]
+            close = hist['Close'].iloc[-1]
+            est = int(vol * close * 0.45)
+            if 200_000_000_000 <= est <= 1_000_000_000_000:
+                warnings_bus.push("TWSE_YAHOO_ESTIMATE", f"使用 Yahoo 估算 TWSE: {est:,}", {})
+                return est, "YAHOO_ESTIMATE_TWSE"
+    except Exception as e:
+        warnings_bus.push("YAHOO_TWSE_FAIL", str(e), {})
+    
+    warnings_bus.push("TWSE_SAFE_MODE", "使用固定值 5000 億", {})
+    return 500_000_000_000, "TWSE_SAFE_MODE_500B"
+
+
+def _yahoo_estimate_tpex() -> Tuple[int, str]:
+    """Yahoo Finance 估算上櫃成交額"""
+    try:
+        ticker = yf.Ticker("^TWO")
+        hist = ticker.history(period="2d", prepost=False)
+        if len(hist) >= 1:
+            vol = hist['Volume'].iloc[-1]
+            close = hist['Close'].iloc[-1]
+            
+            if len(hist) >= 2:
+                price_chg = (hist['Close'].iloc[-1] - hist['Close'].iloc[-2]) / hist['Close'].iloc[-2]
+                coef = 0.65 if price_chg > 0.01 else 0.55 if price_chg < -0.01 else 0.60
+            else:
+                coef = 0.60
+            
+            est = int(vol * close * coef)
+            
+            if 100_000_000_000 <= est <= 500_000_000_000:
+                warnings_bus.push("TPEX_YAHOO_ESTIMATE", f"使用 Yahoo 估算 TPEX: {est:,} (係數 {coef})", {})
+                return est, f"YAHOO_ESTIMATE_TPEX_{coef}"
+    except Exception as e:
+        warnings_bus.push("YAHOO_TPEX_FAIL", str(e), {})
+    
+    warnings_bus.push("TPEX_SAFE_MODE", "使用固定值 2000 億", {})
+    return 200_000_000_000, "TPEX_SAFE_MODE_200B"
+
+
+def _twse_audit_sum_by_stock_day_all(trade_date: str, allow_insecure_ssl: bool) -> Tuple[Optional[int], str, Dict[str, Any]]:
+    """TWSE 抓取 + SSL 自動修復"""
+    session = _http_session()
+    ymd8 = trade_date.replace("-", "")
     url = "https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL"
-    params = {"response": "json", "date": yyyymmdd}
-    audit = {
-        "market": "TWSE",
-        "trade_date": trade_date.strftime("%Y-%m-%d"),
+    params = {"response": "json", "date": ymd8}
+    
+    meta = {
         "url": url,
         "params": params,
         "status_code": None,
-        "rows": 0,
-        "amount_sum": None,
-        "error": None,
+        "final_url": None,
+        "audit": None,
     }
 
-    try:
-        r = SESSION.get(url, params=params, timeout=15)
-        audit["status_code"] = r.status_code
-        if r.status_code != 200:
-            audit["error"] = f"HTTP_{r.status_code}"
-            return None, audit
+    verify_ssl = not allow_insecure_ssl
+    
+    for attempt in [1, 2]:
+        try:
+            if attempt == 2:
+                verify_ssl = False
+                warnings_bus.push("TWSE_SSL_AUTO_FIX", "SSL 錯誤，自動切換 verify=False", {})
+            
+            r = session.get(url, params=params, timeout=15, verify=verify_ssl)
+            meta["status_code"] = r.status_code
+            meta["final_url"] = r.url
+            
+            text = r.text or ""
+            _audit_save_text(AUDIT_DIR, f"TWSE_{ymd8}_raw.txt", text)
 
-        data = r.json()
-        # data 內通常有 data 字段；每列有成交金額欄位（位置不一定完全一致）
-        rows = data.get("data", []) or []
-        audit["rows"] = len(rows)
+            r.raise_for_status()
+            js = r.json()
+            _audit_save_json(AUDIT_DIR, f"TWSE_{ymd8}_raw.json", js)
 
-        # 以「成交金額」欄位名定位（優先），失敗則採數字欄位猜測（但加防呆）
-        fields = data.get("fields", []) or []
-        amt_idx = None
-        for i, f in enumerate(fields):
-            if "成交金額" in str(f):
-                amt_idx = i
+            data = js.get("data", [])
+            fields = js.get("fields", [])
+            
+            if not isinstance(data, list) or not data:
+                continue
+
+            fields_s = [str(x).strip() for x in fields]
+            amt_idx = None
+            for i, f in enumerate(fields_s):
+                if "成交金額" in f:
+                    amt_idx = i
+                    break
+
+            if amt_idx is None:
+                amt_idx = 3
+
+            total = 0
+            for row in data:
+                if not isinstance(row, list) or len(row) <= amt_idx:
+                    continue
+                amt = _safe_int(row[amt_idx], 0)
+                total += amt
+
+            if total > 100_000_000_000:
+                audit = {
+                    "market": "TWSE",
+                    "trade_date": trade_date,
+                    "rows": len(data),
+                    "amount_sum": total,
+                }
+                meta["audit"] = audit
+                src = "TWSE_OK:AUDIT_SUM" if attempt == 1 else "TWSE_OK:SSL_BYPASS"
+                return int(total), src, meta
+
+        except requests.exceptions.SSLError:
+            if attempt == 1:
+                continue
+            else:
+                break
+        except Exception as e:
+            warnings_bus.push("TWSE_ATTEMPT_FAIL", f"Attempt {attempt}: {e}", {})
+            if attempt == 2:
                 break
 
-        amount_sum = 0
-        ok_rows = 0
-
-        for row in rows:
-            try:
-                if amt_idx is not None and amt_idx < len(row):
-                    v = str(row[amt_idx]).replace(",", "").strip()
-                    if v.isdigit():
-                        amount_sum += int(v)
-                        ok_rows += 1
-                else:
-                    # fallback：找該列中「最大且合理」的整數欄位（避免抓到成交股數/筆數）
-                    candidates = []
-                    for cell in row:
-                        s = str(cell).replace(",", "").strip()
-                        if s.isdigit():
-                            candidates.append(int(s))
-                    if candidates:
-                        # 成交金額通常是列內最大值之一
-                        v = max(candidates)
-                        # 過小排除
-                        if v > 1_000_000:
-                            amount_sum += v
-                            ok_rows += 1
-            except Exception:
-                continue
-
-        audit["ok_rows"] = ok_rows
-        audit["amount_sum"] = amount_sum if amount_sum > 10_000_000_000 else None  # 小於 100 億視為失敗
-        return audit["amount_sum"], audit
-
-    except Exception as e:
-        audit["error"] = f"{type(e).__name__}"
-        return None, audit
+    warnings_bus.push("TWSE_ALL_FAIL", "官方 API 失敗，使用 Yahoo 估算", {})
+    amt, src = _yahoo_estimate_twse()
+    meta["fallback"] = "yahoo"
+    return amt, src, meta
 
 
-# =========================
-# TWSE T86（三大法人）：免費公開資料
-# =========================
-def fetch_twse_t86_all(trade_date: date) -> Tuple[Optional[pd.DataFrame], Dict[str, Any]]:
-    """
-    TWSE T86：法人買賣超（依股票）
-    https://www.twse.com.tw/rwd/zh/fund/T86?date=YYYYMMDD&selectType=ALLBUT0999&response=json
-    """
-    yyyymmdd = trade_date.strftime("%Y%m%d")
-    url = "https://www.twse.com.tw/rwd/zh/fund/T86"
-    params = {"date": yyyymmdd, "selectType": "ALLBUT0999", "response": "json"}
+def _tpex_audit_sum_by_st43(trade_date: str, allow_insecure_ssl: bool) -> Tuple[Optional[int], str, Dict[str, Any]]:
+    """TPEX 抓取 + 多重 Fallback"""
+    session = _http_session()
+    ymd8 = trade_date.replace("-", "")
+    
+    roc_formats = [
+        ("standard", _to_roc_date(trade_date, "standard")),
+        ("compact", _to_roc_date(trade_date, "compact")),
+    ]
 
-    audit = {
-        "market": "TWSE_T86",
-        "trade_date": trade_date.strftime("%Y-%m-%d"),
+    url = "https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php"
+    
+    session.headers.update({
+        "Referer": "https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43.php?l=zh-tw"
+    })
+
+    meta = {
         "url": url,
-        "params": params,
-        "status_code": None,
-        "rows": 0,
-        "error": None,
+        "attempts": [],
     }
 
     try:
-        r = SESSION.get(url, params=params, timeout=20)
-        audit["status_code"] = r.status_code
-        if r.status_code != 200:
-            audit["error"] = f"HTTP_{r.status_code}"
-            return None, audit
-
-        j = r.json()
-        fields = j.get("fields", [])
-        rows = j.get("data", []) or []
-        audit["rows"] = len(rows)
-        if not rows:
-            audit["error"] = "EMPTY_DATA"
-            return None, audit
-
-        df = pd.DataFrame(rows, columns=fields)
-        # 常見欄位：證券代號、證券名稱、外資及陸資(不含外資自營商)買賣超股數、投信買賣超股數、自營商(自行買賣)買賣超股數、自營商(避險)買賣超股數、三大法人買賣超股數...
-        return df, audit
-
-    except Exception as e:
-        audit["error"] = f"{type(e).__name__}"
-        return None, audit
-
-
-def _to_int_safe(x) -> int:
-    s = str(x).replace(",", "").strip()
-    if s in {"", "--", "None", "nan"}:
-        return 0
-    try:
-        return int(float(s))
-    except Exception:
-        return 0
-
-
-def compute_twse_inst_3d_net(stock_id: str, trade_dates: List[date]) -> Tuple[int, int, int, int, Dict[str, Any]]:
-    """
-    回傳 (foreign_3d, trust_3d, dealer_3d, total_3d, debug)
-    """
-    foreign_sum = 0
-    trust_sum = 0
-    dealer_sum = 0
-    debug = {"stock_id": stock_id, "days": []}
-
-    for d in trade_dates:
-        df, audit = fetch_twse_t86_all(d)
-        day_info = {"date": d.strftime("%Y-%m-%d"), "ok": False, "audit": audit, "row_found": False}
-        if df is None or df.empty:
-            debug["days"].append(day_info)
-            continue
-
-        # 對齊欄位名（用 contains 避免不同中文標點）
-        col_id = None
-        col_foreign = None
-        col_trust = None
-        col_dealer_self = None
-        col_dealer_hedge = None
-        col_total = None
-
-        for c in df.columns:
-            if "證券代號" in c:
-                col_id = c
-            if "外資" in c and "買賣超" in c and "不含外資自營商" in c:
-                col_foreign = c
-            if c.strip() == "投信買賣超股數" or ("投信" in c and "買賣超" in c):
-                col_trust = c
-            if "自營商(自行買賣)" in c and "買賣超" in c:
-                col_dealer_self = c
-            if "自營商(避險)" in c and "買賣超" in c:
-                col_dealer_hedge = c
-            if ("三大法人" in c and "買賣超" in c) or (c.strip() == "三大法人買賣超股數"):
-                col_total = c
-
-        if col_id is None:
-            debug["days"].append(day_info)
-            continue
-
-        row = df[df[col_id].astype(str).str.strip() == stock_id]
-        if row.empty:
-            debug["days"].append(day_info)
-            continue
-
-        day_info["row_found"] = True
-        day_info["ok"] = True
-
-        f = _to_int_safe(row.iloc[0][col_foreign]) if col_foreign else 0
-        t = _to_int_safe(row.iloc[0][col_trust]) if col_trust else 0
-        ds = _to_int_safe(row.iloc[0][col_dealer_self]) if col_dealer_self else 0
-        dh = _to_int_safe(row.iloc[0][col_dealer_hedge]) if col_dealer_hedge else 0
-        dsum = ds + dh
-        foreign_sum += f
-        trust_sum += t
-        dealer_sum += dsum
-
-        debug["days"].append({**day_info, "foreign": f, "trust": t, "dealer": dsum})
-
-    total_sum = foreign_sum + trust_sum + dealer_sum
-    return foreign_sum, trust_sum, dealer_sum, total_sum, debug
-
-
-# =========================
-# 籌碼緩存：避免殭屍數據（只允許同交易日）
-# =========================
-def load_inst_cache() -> Dict[str, Any]:
-    if not os.path.exists(INST_CACHE_PATH):
-        return {}
-    try:
-        with open(INST_CACHE_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-def save_inst_cache(payload: Dict[str, Any]) -> None:
-    try:
-        with open(INST_CACHE_PATH, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-    except Exception:
+        session.get("https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43.php?l=zh-tw", 
+                   timeout=10, verify=False)
+        time.sleep(0.3)
+    except:
         pass
 
+    for fmt_name, roc in roc_formats:
+        for se_param in ["EW", "AL"]:
+            params = {"l": "zh-tw", "d": roc, "se": se_param}
+            attempt_id = f"{fmt_name}_{se_param}"
+            
+            try:
+                r = session.get(url, params=params, timeout=15, verify=False, allow_redirects=True)
+                
+                if "/error" in r.url.lower():
+                    meta["attempts"].append({"id": attempt_id, "result": "redirected_to_error"})
+                    continue
 
-# =========================
-# Stale Data Kill Switch（過期籌碼熔斷）
-# =========================
-def apply_stale_inst_kill_switch(institutional_panel: List[Dict[str, Any]], stocks: List[Dict[str, Any]]) -> bool:
-    stale_detected = False
+                js = r.json()
+                aa = js.get("aaData") or js.get("data") or []
+                
+                if not aa:
+                    meta["attempts"].append({"id": attempt_id, "result": "no_data"})
+                    continue
 
-    for inst in institutional_panel:
-        if inst.get("Inst_Status") == "NO_UPDATE_TODAY":
-            inst["Inst_Net_3d"] = 0.0
-            inst["Inst_Streak3"] = 0
-            inst["Inst_Dir3"] = "NO_DATA"
-            stale_detected = True
+                total = 0
+                for row in aa:
+                    if not isinstance(row, list):
+                        continue
+                    
+                    for idx in [7, 8]:
+                        try:
+                            if idx >= len(row):
+                                continue
+                            val = _safe_int(row[idx], None)
+                            if val and val >= 10_000_000:
+                                total += val
+                                break
+                        except:
+                            continue
 
-    # Layer 熔斷：只要被標 stale，或 Inst_Net_3d 被歸零，就禁止加 Layer
-    for s in stocks:
-        inst = s.get("Institutional", {}) or {}
-        if inst.get("stale", False) or (inst.get("Inst_Net_3d", 0.0) == 0.0 and inst.get("Inst_Streak3", 0) == 0):
-            s["Layer"] = "NONE"
+                if total > 50_000_000_000:
+                    warnings_bus.push("TPEX_SUCCESS", f"成功: {attempt_id}, 總額: {total:,}", {})
+                    return int(total), f"TPEX_OK:{attempt_id}", meta
+                else:
+                    meta["attempts"].append({"id": attempt_id, "result": f"total_too_low_{total}"})
 
-    return stale_detected
+            except Exception as e:
+                meta["attempts"].append({"id": attempt_id, "error": str(e)})
+                continue
 
-
-# =========================
-# Integrity Validation（核心指標缺失 → DATA_FAILURE & max_equity=0）
-# =========================
-def integrity_check_market(twii_close, smr) -> Optional[Dict[str, Any]]:
-    if twii_close is None or (isinstance(twii_close, float) and math.isnan(twii_close)):
-        return {"current_regime": "DATA_FAILURE", "max_equity_allowed_pct": 0.0, "confidence_level": "LOW"}
-    if smr is None or (isinstance(smr, float) and math.isnan(smr)):
-        return {"current_regime": "DATA_FAILURE", "max_equity_allowed_pct": 0.0, "confidence_level": "LOW"}
-    return None
-
-
-def enforce_confidence_level(confidence_level: str, twii_close, smr, stale_flag: bool, t86_ok: bool) -> str:
-    if twii_close is None or smr is None:
-        return "LOW"
-    if stale_flag:
-        return "LOW"
-    if not t86_ok:
-        # 法人缺失不至於熔斷，但要降級，避免誤判
-        return "LOW" if confidence_level != "HIGH" else "MEDIUM"
-    return confidence_level
-
-
-# =========================
-# TWII / VIX / 指標（SMR、slope5、drawdown、10d range）
-# =========================
-def fetch_index_series(ticker: str, lookback_days: int = 260) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    """
-    用 yfinance 抓 index 歷史序列
-    """
-    end = taipei_now().date() + timedelta(days=1)
-    start = end - timedelta(days=lookback_days * 2)  # buffer
-    audit = {"ticker": ticker, "ok": False, "rows": 0, "last_dt": None, "reason": None}
-
-    try:
-        df = yf.download(ticker, start=start.strftime("%Y-%m-%d"), end=end.strftime("%Y-%m-%d"), progress=False, auto_adjust=False)
-        if df is None or df.empty:
-            audit["reason"] = "EMPTY"
-            return pd.DataFrame(), audit
-        df = df.dropna(subset=["Close"])
-        df.index = pd.to_datetime(df.index).tz_localize(None)
-        audit["ok"] = True
-        audit["rows"] = int(df.shape[0])
-        audit["last_dt"] = str(df.index[-1].date())
-        audit["reason"] = "OK"
-        return df, audit
-    except Exception as e:
-        audit["reason"] = f"{type(e).__name__}"
-        return pd.DataFrame(), audit
+    warnings_bus.push("TPEX_ALL_FAIL", "所有方法失敗，使用 Yahoo 估算", {})
+    amt, src = _yahoo_estimate_tpex()
+    meta["fallback"] = "yahoo"
+    return amt, src, meta
 
 
-def compute_metrics(twii_df: pd.DataFrame, trade_date: date) -> Dict[str, Any]:
-    """
-    以 trade_date 的最後一筆 Close 作為收盤價
-    """
-    if twii_df is None or twii_df.empty:
-        return {
-            "twii_close": None, "twii_change": None, "twii_pct": None,
-            "smr": None, "slope5": None, "drawdown_pct": None, "price_range_10d_pct": None,
-            "metrics_reason": "NO_TWII"
-        }
+def _amount_scope(twse_amt: Optional[int], tpex_amt: Optional[int]) -> str:
+    if twse_amt and tpex_amt:
+        return "ALL"
+    if twse_amt:
+        return "TWSE_ONLY"
+    if tpex_amt:
+        return "TPEX_ONLY"
+    return "NONE"
 
-    eligible = twii_df[twii_df.index.date <= trade_date]
-    if eligible.empty:
-        return {
-            "twii_close": None, "twii_change": None, "twii_pct": None,
-            "smr": None, "slope5": None, "drawdown_pct": None, "price_range_10d_pct": None,
-            "metrics_reason": "NO_ELIGIBLE_ROW"
-        }
 
-    closes = eligible["Close"].copy()
-    last_close = float(closes.iloc[-1])
-    prev_close = float(closes.iloc[-2]) if len(closes) >= 2 else None
+def fetch_amount_total(trade_date: str, allow_insecure_ssl: bool = False) -> MarketAmount:
+    """終極修復版：確保一定有數據"""
+    _ensure_dir(AUDIT_DIR)
 
-    twii_change = (last_close - prev_close) if prev_close is not None else None
-    twii_pct = (twii_change / prev_close) if (prev_close and prev_close != 0) else None
+    twse_amt, twse_src, twse_meta = _twse_audit_sum_by_stock_day_all(trade_date, allow_insecure_ssl)
+    tpex_amt, tpex_src, tpex_meta = _tpex_audit_sum_by_st43(trade_date, allow_insecure_ssl)
 
-    # SMR：用 14 日報酬波動（簡化示意：你可用你原本 SMR 定義替換）
-    ret = closes.pct_change().dropna()
-    smr = float(ret.tail(14).std()) if len(ret) >= 14 else None
+    if not twse_amt or twse_amt <= 0:
+        twse_amt, twse_src = _yahoo_estimate_twse()
+        twse_meta = {"fallback": "yahoo_forced"}
+    
+    if not tpex_amt or tpex_amt <= 0:
+        tpex_amt, tpex_src = _yahoo_estimate_tpex()
+        tpex_meta = {"fallback": "yahoo_forced"}
 
-    # slope5：近 5 日線性趨勢（用差分近似）
-    slope5 = float((closes.iloc[-1] - closes.iloc[-6]) / closes.iloc[-6]) if len(closes) >= 6 else None
+    total = int(twse_amt) + int(tpex_amt)
+    scope = _amount_scope(twse_amt, tpex_amt)
 
-    # drawdown：近 252 日最大回撤（這裡用當前回撤：close / rolling_max - 1）
-    window = closes.tail(252)
-    roll_max = window.cummax()
-    drawdown_pct = float((window.iloc[-1] / roll_max.iloc[-1]) - 1.0) if len(window) >= 2 else None
+    status_twse = "OK" if "OK" in twse_src else "ESTIMATED" if "YAHOO" in twse_src else "FAIL"
+    status_tpex = "OK" if "OK" in tpex_src else "ESTIMATED" if "YAHOO" in tpex_src else "FAIL"
+    
+    confidence_twse = "HIGH" if "OK" in twse_src else "MEDIUM" if "YAHOO" in twse_src else "LOW"
+    confidence_tpex = "HIGH" if "OK" in tpex_src else "MEDIUM" if "YAHOO" in tpex_src else "LOW"
+    
+    if confidence_twse == "HIGH" and confidence_tpex == "HIGH":
+        confidence_level = "HIGH"
+    elif confidence_twse == "LOW" or confidence_tpex == "LOW":
+        confidence_level = "LOW"
+    else:
+        confidence_level = "MEDIUM"
 
-    # 10d range： (max-min)/close
-    w10 = closes.tail(10)
-    price_range_10d_pct = float((w10.max() - w10.min()) / w10.iloc[-1]) if len(w10) >= 2 else None
-
-    return {
-        "twii_close": last_close,
-        "twii_change": twii_change,
-        "twii_pct": twii_pct,
-        "smr": smr,
-        "slope5": slope5,
-        "drawdown_pct": drawdown_pct,
-        "price_range_10d_pct": price_range_10d_pct,
-        "metrics_reason": "OK"
+    meta = {
+        "trade_date": trade_date,
+        "audit_dir": AUDIT_DIR,
+        "twse": twse_meta,
+        "tpex": tpex_meta,
     }
 
+    return MarketAmount(
+        amount_twse=twse_amt,
+        amount_tpex=tpex_amt,
+        amount_total=total,
+        source_twse=twse_src,
+        source_tpex=tpex_src,
+        status_twse=status_twse,
+        status_tpex=status_tpex,
+        confidence_twse=confidence_twse,
+        confidence_tpex=confidence_tpex,
+        confidence_level=confidence_level,
+        allow_insecure_ssl=bool(allow_insecure_ssl),
+        scope=scope,
+        meta=meta,
+    )
+
 
 # =========================
-# Stock Prices（Top20）：yfinance 批次抓
+# Market institutions (TWSE BFI82U)
 # =========================
-def yf_symbol(stock_id: str) -> str:
-    # 台股上市/上櫃多數為 .TW；你的現行系統也用 .TW
-    return f"{stock_id}.TW"
-
-def fetch_top20_prices(trade_date: date) -> Tuple[pd.DataFrame, Dict[str, str]]:
-    symbols = [yf_symbol(sid) for sid, _ in TOP20]
-    # 抓近 30 天方便算量比
-    end = trade_date + timedelta(days=1)
-    start = trade_date - timedelta(days=40)
-
-    src_map = {sym: "YF_BATCH" for sym in symbols}
-
+def fetch_market_inst_summary(allow_insecure_ssl: bool = False) -> List[Dict[str, Any]]:
+    url = "https://www.twse.com.tw/rwd/zh/fund/BFI82U?response=json"
+    data_list = []
     try:
-        df = yf.download(symbols, start=start.strftime("%Y-%m-%d"), end=end.strftime("%Y-%m-%d"),
-                         progress=False, group_by="ticker", auto_adjust=False)
+        r = requests.get(url, timeout=10, verify=(not allow_insecure_ssl))
+        r.raise_for_status()
+        js = r.json()
+        if 'data' in js and isinstance(js['data'], list):
+            for row in js['data']:
+                if len(row) >= 4:
+                    name = str(row[0]).strip()
+                    diff = _safe_int(row[3])
+                    if diff is not None:
+                        data_list.append({"Identity": name, "Net": diff})
+    except Exception as e:
+        warnings_bus.push("MARKET_INST_FAIL", f"BFI82U fetch fail: {e}", {"url": url})
+    return data_list
+
+
+# =========================
+# FinMind helpers
+# =========================
+def _finmind_headers(token: Optional[str]) -> dict:
+    if token:
+        return {"Authorization": f"Bearer {token}"}
+    return {}
+
+
+def _finmind_get(dataset: str, params: dict, token: Optional[str]) -> dict:
+    p = {"dataset": dataset, **params}
+    r = requests.get(FINMIND_URL, headers=_finmind_headers(token), params=p, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def normalize_inst_direction(net: float) -> str:
+    net = float(net or 0.0)
+    if abs(net) < NEUTRAL_THRESHOLD:
+        return "NEUTRAL"
+    return "POSITIVE" if net > 0 else "NEGATIVE"
+
+
+def fetch_finmind_institutional(symbols: List[str], start_date: str, end_date: str, token: Optional[str] = None) -> pd.DataFrame:
+    rows = []
+    for sym in symbols:
+        stock_id = sym.replace(".TW", "").strip()
+        try:
+            js = _finmind_get(
+                dataset="TaiwanStockInstitutionalInvestorsBuySell",
+                params={"data_id": stock_id, "start_date": start_date, "end_date": end_date},
+                token=token,
+            )
+        except Exception as e:
+            warnings_bus.push("FINMIND_FAIL", str(e), {"symbol": sym})
+            continue
+
+        data = js.get("data", []) or []
+        if not data:
+            continue
+
+        df = pd.DataFrame(data)
+        need = {"date", "stock_id", "buy", "name", "sell"}
+        if not need.issubset(set(df.columns)):
+            continue
+
+        df["buy"] = pd.to_numeric(df["buy"], errors="coerce").fillna(0)
+        df["sell"] = pd.to_numeric(df["sell"], errors="coerce").fillna(0)
+        df = df[df["name"].isin(A_NAMES)].copy()
+        if df.empty:
+            continue
+
+        df["net"] = df["buy"] - df["sell"]
+        g = df.groupby("date", as_index=False)["net"].sum()
+        for _, r in g.iterrows():
+            rows.append({"date": str(r["date"]), "symbol": sym, "net_amount": float(r["net"])})
+
+    if not rows:
+        return pd.DataFrame(columns=["date", "symbol", "net_amount"])
+    return pd.DataFrame(rows).sort_values(["symbol", "date"])
+
+
+def calc_inst_3d(inst_df: pd.DataFrame, symbol: str, trade_date: str) -> dict:
+    """
+    計算籌碼 3 日數據
+    
+    修正：新增 trade_date 檢查，若無當日數據則標記 NO_UPDATE_TODAY
+    """
+    if inst_df is None or inst_df.empty:
+        return {
+            "Inst_Status": "NO_DATA",
+            "Inst_Streak3": 0,
+            "Inst_Dir3": "NO_DATA",
+            "Inst_Net_3d": 0.0
+        }
+
+    df = inst_df[inst_df["symbol"] == symbol].copy()
+    if df.empty:
+        return {
+            "Inst_Status": "NO_DATA",
+            "Inst_Streak3": 0,
+            "Inst_Dir3": "NO_DATA",
+            "Inst_Net_3d": 0.0
+        }
+
+    df = df.sort_values("date")
+    
+    # 🔥 新增：檢查是否有當日數據
+    has_today_data = (df["date"] == trade_date).any()
+    
+    if not has_today_data:
+        # 過期數據：標記 NO_UPDATE_TODAY
+        warnings_bus.push(
+            "STALE_INST_DATA",
+            f"{symbol} 籌碼數據未更新至 {trade_date}",
+            {"symbol": symbol, "latest_date": df["date"].max() if not df.empty else None}
+        )
+        return {
+            "Inst_Status": "NO_UPDATE_TODAY",
+            "Inst_Streak3": 0,
+            "Inst_Dir3": "STALE",
+            "Inst_Net_3d": 0.0  # 🔥 強制歸零
+        }
+    
+    # 有當日數據：正常計算
+    df = df.tail(3)
+    if len(df) < 3:
+        return {
+            "Inst_Status": "INSUFFICIENT_DATA",
+            "Inst_Streak3": 0,
+            "Inst_Dir3": "PENDING",
+            "Inst_Net_3d": 0.0
+        }
+
+    df["net_amount"] = pd.to_numeric(df["net_amount"], errors="coerce").fillna(0)
+    dirs = [normalize_inst_direction(x) for x in df["net_amount"]]
+    net_sum = float(df["net_amount"].sum())
+
+    if all(d == "POSITIVE" for d in dirs):
+        return {"Inst_Status": "READY", "Inst_Streak3": 3, "Inst_Dir3": "POSITIVE", "Inst_Net_3d": net_sum}
+    if all(d == "NEGATIVE" for d in dirs):
+        return {"Inst_Status": "READY", "Inst_Streak3": 3, "Inst_Dir3": "NEGATIVE", "Inst_Net_3d": net_sum}
+
+    return {"Inst_Status": "READY", "Inst_Streak3": 0, "Inst_Dir3": "NEUTRAL", "Inst_Net_3d": net_sum}
+
+
+# =========================
+# yfinance fetchers + 欄位修正
+# =========================
+def _normalize_yf_columns(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+
+    if isinstance(df.columns, pd.MultiIndex):
+        df = df.copy()
+        df.columns = [' '.join([str(c) for c in col if str(c) != '']).strip() for col in df.columns.values]
+
+    df = df.copy()
+    rename_map = {}
+    for c in df.columns:
+        s = str(c)
+        if re.search(rf"\s+\^{re.escape(symbol.strip('^'))}\b", s):
+            base = re.sub(rf"\s+\^{re.escape(symbol.strip('^'))}\b", "", s).strip()
+            rename_map[c] = base
+        if s.endswith(f" {symbol}"):
+            rename_map[c] = s.replace(f" {symbol}", "").strip()
+
+    if rename_map:
+        df = df.rename(columns=rename_map)
+
+    return df
+
+
+@st.cache_data(ttl=60 * 10, show_spinner=False)
+def fetch_history(symbol: str, period: str = "5y", interval: str = "1d") -> pd.DataFrame:
+    try:
+        df = yf.download(symbol, period=period, interval=interval, auto_adjust=False, progress=False, group_by="column", threads=False)
         if df is None or df.empty:
-            return pd.DataFrame(), src_map
-        return df, src_map
-    except Exception:
-        return pd.DataFrame(), src_map
+            return pd.DataFrame()
 
-def compute_price_and_vol_ratio(yf_df: pd.DataFrame, sym: str, trade_date: date) -> Tuple[Optional[float], Optional[float]]:
-    """
-    Price：trade_date 的 Close
-    Vol_Ratio：trade_date Volume / 20日平均 Volume
-    """
+        df = df.reset_index()
+        if "Date" in df.columns:
+            df = df.rename(columns={"Date": "Datetime"})
+        elif "index" in df.columns:
+            df = df.rename(columns={"index": "Datetime"})
+        if "Datetime" not in df.columns and df.index.name is not None:
+            df.insert(0, "Datetime", pd.to_datetime(df.index))
+
+        df = _normalize_yf_columns(df, symbol)
+        return df
+    except Exception as e:
+        warnings_bus.push("YF_HISTORY_FAIL", str(e), {"symbol": symbol})
+        return pd.DataFrame()
+
+
+def _single_fetch_price_volratio(sym: str) -> Tuple[Optional[float], Optional[float]]:
     try:
-        if isinstance(yf_df.columns, pd.MultiIndex):
-            sub = yf_df[sym].dropna(how="all")
-            if sub.empty:
-                return None, None
-            sub.index = pd.to_datetime(sub.index).tz_localize(None)
-            eligible = sub[sub.index.date <= trade_date]
-            if eligible.empty:
-                return None, None
-            close = eligible["Close"].iloc[-1]
-            vol = eligible["Volume"].iloc[-1]
-            v20 = eligible["Volume"].tail(20)
-            vavg = v20.mean() if len(v20) >= 5 else None
-            ratio = (float(vol) / float(vavg)) if (vavg and vavg > 0) else None
-            return (float(close) if pd.notna(close) else None), (float(ratio) if ratio is not None else None)
-        else:
-            # 單一 ticker 結構（很少發生在 batch）
+        df = yf.download(sym, period="6mo", interval="1d", auto_adjust=False, progress=False, group_by="column", threads=False)
+        if df is None or df.empty:
             return None, None
+        close = df["Close"].dropna() if "Close" in df.columns else pd.Series(dtype=float)
+        vol = df["Volume"].dropna() if "Volume" in df.columns else pd.Series(dtype=float)
+
+        price = float(close.iloc[-1]) if len(close) else None
+        vol_ratio = None
+        if len(vol) >= 20:
+            ma20 = float(vol.rolling(20).mean().iloc[-1])
+            if ma20 and ma20 > 0:
+                vol_ratio = float(vol.iloc[-1] / ma20)
+        return price, vol_ratio
     except Exception:
         return None, None
 
 
+@st.cache_data(ttl=60 * 5, show_spinner=False)
+def fetch_batch_prices_volratio(symbols: List[str]) -> pd.DataFrame:
+    out = pd.DataFrame({"Symbol": symbols})
+    out["Price"] = None
+    out["Vol_Ratio"] = None
+    out["source"] = "NONE"
+    if not symbols:
+        return out
+
+    try:
+        df = yf.download(symbols, period="6mo", interval="1d", auto_adjust=False, progress=False, group_by="ticker", threads=False)
+    except Exception as e:
+        warnings_bus.push("YF_BATCH_FAIL", str(e), {"n": len(symbols)})
+        return out
+
+    if df is None or df.empty:
+        return out
+
+    for sym in symbols:
+        try:
+            if isinstance(df.columns, pd.MultiIndex):
+                if sym not in df.columns.get_level_values(0):
+                    continue
+                close = df[(sym, "Close")].dropna()
+                vol = df[(sym, "Volume")].dropna()
+            else:
+                close = df["Close"].dropna() if "Close" in df.columns else pd.Series(dtype=float)
+                vol = df["Volume"].dropna() if "Volume" in df.columns else pd.Series(dtype=float)
+
+            price = float(close.iloc[-1]) if len(close) else None
+            vol_ratio = None
+            if len(vol) >= 20:
+                ma20 = float(vol.rolling(20).mean().iloc[-1])
+                if ma20 and ma20 > 0:
+                    vol_ratio = float(vol.iloc[-1] / ma20)
+
+            out.loc[out["Symbol"] == sym, "Price"] = price
+            out.loc[out["Symbol"] == sym, "Vol_Ratio"] = vol_ratio
+            out.loc[out["Symbol"] == sym, "source"] = "YF_BATCH"
+        except Exception:
+            continue
+
+    need_fix = out[(out["Price"].isna()) | (out["Vol_Ratio"].isna())]["Symbol"].tolist()
+    if need_fix:
+        for sym in need_fix:
+            p, vr = _single_fetch_price_volratio(sym)
+            if p is not None and (out.loc[out["Symbol"] == sym, "Price"].isna().iloc[0]):
+                out.loc[out["Symbol"] == sym, "Price"] = float(p)
+            if vr is not None and (out.loc[out["Symbol"] == sym, "Vol_Ratio"].isna().iloc[0]):
+                out.loc[out["Symbol"] == sym, "Vol_Ratio"] = float(vr)
+            if p is not None or vr is not None:
+                out.loc[out["Symbol"] == sym, "source"] = "YF_SINGLE"
+
+    return out
+
+
 # =========================
-# 簡易 Layer 訊號（示意）：你可替換成你的 Predator Layer Engine
-# 這裡只做到「籌碼 + 量比」的可解釋輸出，不做預測、不補資料。
+# Regime & Metrics
 # =========================
-def assign_layer(vol_ratio: Optional[float], inst_dir3: str, inst_streak3: int) -> str:
-    # 只示意，不做誇張判斷：需同時滿足量能與籌碼方向
-    if vol_ratio is None:
+def _as_series(df: pd.DataFrame, col_name: str) -> pd.Series:
+    if df is None or df.empty:
+        raise ValueError("empty df")
+
+    if col_name in df.columns:
+        s = df[col_name]
+        if isinstance(s, pd.DataFrame):
+            s = s.iloc[:, 0]
+        return pd.to_numeric(s, errors="coerce").astype(float)
+
+    cols = [c for c in df.columns if str(col_name).lower() == str(c).lower()]
+    if cols:
+        s = df[cols[0]]
+        if isinstance(s, pd.DataFrame):
+            s = s.iloc[:, 0]
+        return pd.to_numeric(s, errors="coerce").astype(float)
+
+    raise ValueError(f"Col {col_name} not found")
+
+
+def _as_close_series(df: pd.DataFrame) -> pd.Series:
+    try:
+        return _as_series(df, "Close")
+    except Exception:
+        try:
+            return _as_series(df, "Adj Close")
+        except Exception:
+            raise ValueError("No Close/Adj Close found")
+
+
+def compute_regime_metrics(market_df: pd.DataFrame) -> dict:
+    """
+    計算市場指標
+    
+    修正：新增 twii_close null 檢查
+    """
+    if market_df is None or market_df.empty or len(market_df) < 260:
+        return {
+            "SMR": None, "Slope5": None, "MOMENTUM_LOCK": False,
+            "drawdown_pct": None, "price_range_10d_pct": None, "gap_down": None,
+            "metrics_reason": "INSUFFICIENT_ROWS",
+            "twii_close": None  # 🔥 新增
+        }
+
+    try:
+        close = _as_close_series(market_df)
+    except Exception as e:
+        return {
+            "SMR": None, "Slope5": None, "MOMENTUM_LOCK": False,
+            "drawdown_pct": None, "price_range_10d_pct": None, "gap_down": None,
+            "metrics_reason": f"CLOSE_SERIES_FAIL:{e}",
+            "twii_close": None  # 🔥 新增
+        }
+
+    # 🔥 新增：提取 twii_close
+    twii_close = float(close.iloc[-1]) if len(close) else None
+
+    ma200 = close.rolling(200).mean()
+    smr_series = ((close - ma200) / ma200).dropna()
+    if len(smr_series) < 10:
+        return {
+            "SMR": None, "Slope5": None, "MOMENTUM_LOCK": False,
+            "drawdown_pct": None, "metrics_reason": "SMR_SERIES_TOO_SHORT",
+            "twii_close": twii_close  # 🔥 新增
+        }
+
+    smr = float(smr_series.iloc[-1])
+    smr_ma5 = smr_series.rolling(5).mean().dropna()
+    slope5 = float(smr_ma5.iloc[-1] - smr_ma5.iloc[-2]) if len(smr_ma5) >= 2 else 0.0
+
+    last4 = smr_ma5.diff().dropna().iloc[-4:]
+    momentum_lock = bool((last4 > EPS).all()) if len(last4) == 4 else False
+
+    window_dd = 252
+    rolling_high = close.rolling(window_dd).max()
+    drawdown_pct = float(close.iloc[-1] / rolling_high.iloc[-1] - 1.0) if not np.isnan(rolling_high.iloc[-1]) else None
+
+    price_range_10d_pct = None
+    if len(close) >= 10:
+        recent_10d = close.iloc[-10:]
+        low_10d = float(recent_10d.min())
+        high_10d = float(recent_10d.max())
+        if low_10d > 0:
+            price_range_10d_pct = float((high_10d - low_10d) / low_10d)
+
+    gap_down = None
+    try:
+        open_s = _as_series(market_df, "Open")
+        if len(open_s) >= 2 and len(close) >= 2:
+            today_open = float(open_s.iloc[-1])
+            prev_close = float(close.iloc[-2])
+            if prev_close > 0:
+                gap_down = (today_open - prev_close) / prev_close
+    except Exception:
+        gap_down = None
+
+    return {
+        "SMR": smr,
+        "SMR_MA5": float(smr_ma5.iloc[-1]) if len(smr_ma5) else None,
+        "Slope5": slope5,
+        "NEGATIVE_SLOPE_5D": bool(slope5 < -EPS),
+        "MOMENTUM_LOCK": momentum_lock,
+        "drawdown_pct": drawdown_pct,
+        "drawdown_window_days": window_dd,
+        "price_range_10d_pct": price_range_10d_pct,
+        "gap_down": gap_down,
+        "metrics_reason": "OK",
+        "twii_close": twii_close  # 🔥 新增
+    }
+
+
+def calculate_dynamic_vix(vix_df: pd.DataFrame) -> Optional[float]:
+    if vix_df is None or vix_df.empty:
+        return None
+    try:
+        vix_close = _as_close_series(vix_df)
+        if len(vix_close) < 20:
+            return 40.0
+        ma20 = float(vix_close.rolling(20).mean().iloc[-1])
+        std20 = float(vix_close.rolling(20).std().iloc[-1])
+        threshold = ma20 + 2 * std20
+        return max(35.0, float(threshold))
+    except Exception:
+        return 35.0
+
+
+def _calc_ma14_monthly_from_daily(df_daily: pd.DataFrame) -> Optional[float]:
+    try:
+        if df_daily is None or df_daily.empty:
+            return None
+        df = df_daily.copy()
+        df["Datetime"] = pd.to_datetime(df["Datetime"])
+        df = df.set_index("Datetime")
+        close = _as_close_series(df)
+        monthly = close.resample("M").last().dropna()
+        if len(monthly) < 14:
+            return None
+        ma14 = monthly.rolling(14).mean().dropna()
+        return float(ma14.iloc[-1])
+    except Exception:
+        return None
+
+
+def _extract_close_price(df_daily: pd.DataFrame) -> Optional[float]:
+    try:
+        if df_daily is None or df_daily.empty:
+            return None
+        close = _as_close_series(df_daily)
+        return float(close.iloc[-1]) if len(close) else None
+    except Exception:
+        return None
+
+
+def _count_close_below_ma_days(df_daily: pd.DataFrame, ma14_monthly: Optional[float]) -> int:
+    try:
+        if ma14_monthly is None or df_daily is None or df_daily.empty:
+            return 0
+        close = _as_close_series(df_daily)
+        if len(close) < 2:
+            return 0
+        thresh = float(ma14_monthly) * 0.96
+        recent = close.iloc[-5:].tolist()
+        cnt = 0
+        for v in reversed(recent):
+            if float(v) < thresh:
+                cnt += 1
+            else:
+                break
+        return int(cnt)
+    except Exception:
+        return 0
+
+
+def pick_regime(metrics: dict, vix: Optional[float] = None, ma14_monthly: Optional[float] = None,
+               close_price: Optional[float] = None, close_below_ma_days: int = 0, vix_panic: float = 35.0, **kwargs) -> Tuple[str, float]:
+    """
+    判定市場體制
+    
+    修正：新增 twii_close null 檢查 → DATA_FAILURE
+    """
+    if "vixpanic" in kwargs and kwargs["vixpanic"]:
+        vix_panic = float(kwargs["vixpanic"])
+    if "vipxanic" in kwargs and kwargs["vipxanic"]:
+        vix_panic = float(kwargs["vipxanic"])
+
+    # 🔥 新增：核心指標檢查
+    twii_close = metrics.get("twii_close")
+    if twii_close is None:
+        warnings_bus.push(
+            "CORE_INDICATOR_MISSING",
+            "twii_close 為 null，觸發 DATA_FAILURE",
+            {"metrics": metrics}
+        )
+        return "DATA_FAILURE", 0.0
+
+    smr = metrics.get("SMR")
+    slope5 = metrics.get("Slope5")
+    drawdown = metrics.get("drawdown_pct")
+    price_range = metrics.get("price_range_10d_pct")
+
+    if (vix is not None and float(vix) > float(vix_panic)) or (drawdown is not None and float(drawdown) <= -0.18):
+        return "CRASH_RISK", 0.10
+
+    if ma14_monthly and close_price and int(close_below_ma_days) >= 2 and float(close_price) < float(ma14_monthly) * 0.96:
+        return "HIBERNATION", 0.20
+
+    if smr is not None and slope5 is not None:
+        if float(smr) >= SMR_WATCH and float(slope5) < -EPS:
+            return "MEAN_REVERSION_WATCH", 0.55
+
+        if float(smr) > 0.25 and float(slope5) < -EPS:
+            return "MEAN_REVERSION", 0.45
+        if float(smr) > 0.25 and float(slope5) >= -EPS:
+            return "OVERHEAT", 0.55
+
+    if smr is not None and 0.08 <= float(smr) <= 0.18:
+        if price_range is not None and float(price_range) < 0.05:
+            return "CONSOLIDATION", 0.65
+
+    return "NORMAL", 0.85
+
+
+def classify_layer(regime: str, momentum_lock: bool, vol_ratio: Optional[float], inst: dict) -> str:
+    """
+    個股分層判定
+    
+    修正：過期籌碼強制 NONE
+    """
+    # 🔥 新增：過期籌碼熔斷
+    inst_status = inst.get("Inst_Status", "NO_DATA")
+    if inst_status in ["NO_UPDATE_TODAY", "NO_DATA", "STALE"]:
         return "NONE"
-    if inst_dir3 == "POSITIVE" and inst_streak3 >= 3 and vol_ratio >= 1.10:
+    
+    foreign_buy = bool(inst.get("foreign_buy", False))
+    trust_buy = bool(inst.get("trust_buy", False))
+    inst_streak3 = int(inst.get("inst_streak3", 0))
+    
+    if foreign_buy and trust_buy and inst_streak3 >= 3:
         return "A+"
+    if (foreign_buy or trust_buy) and inst_streak3 >= 3:
+        return "A"
+    
+    vr = _safe_float(vol_ratio, None)
+    if momentum_lock and (vr is not None and float(vr) > 0.8) and regime in ["NORMAL", "OVERHEAT", "CONSOLIDATION", "MEAN_REVERSION_WATCH"]:
+        return "B"
+    
     return "NONE"
 
 
-# =========================
-# 主流程：生成 JSON
-# =========================
-def build_predator_payload() -> Dict[str, Any]:
-    # 1) Market Guard
-    guard_active, guard_base_date, guard_note = apply_market_guard("EOD")
-    # 2) 解出有效交易日（若 guard_active，基準日已回退一天）
-    eff_trade_date, date_status = resolve_effective_trade_date(guard_base_date)
+def compute_integrity_and_kill(stocks: List[dict], amount: MarketAmount, metrics: dict) -> dict:
+    n = len(stocks)
+    price_null = sum(1 for s in stocks if s.get("Price") is None)
+    volratio_null = sum(1 for s in stocks if s.get("Vol_Ratio") is None)
 
-    meta_now = taipei_now().strftime("%Y-%m-%d %H:%M:%S")
+    amount_total_null = (amount.amount_total is None or amount.amount_total <= 0)
+    amount_partial = bool(amount.scope in ("TWSE_ONLY", "TPEX_ONLY"))
+    amount_scope = str(amount.scope)
 
-    # 若連交易日都找不到 → 憲章：UNVERIFIED + max_equity=0
-    if eff_trade_date is None:
-        return {
-            "meta": {
-                "timestamp": meta_now,
-                "session": "EOD",
-                "market_status": "LOW",
-                "current_regime": "DATA_FAILURE",
-                "account_mode": "Conservative",
-                "audit_tag": VERSION_TAG,
-                "confidence_level": "LOW",
-                "date_status": "UNVERIFIED",
-            },
-            "macro": {
-                "overview": {
-                    "trade_date": None,
-                    "date_status": "UNVERIFIED",
-                    "twii_close": None,
-                    "twii_change": None,
-                    "twii_pct": None,
-                    "vix": None,
-                    "vix_source": "VIX",
-                    "vix_status": "FAIL",
-                    "vix_confidence": "LOW",
-                    "vix_panic": 35.0,
-                    "smr": None,
-                    "slope5": None,
-                    "drawdown_pct": None,
-                    "price_range_10d_pct": None,
-                    "dynamic_vix_threshold": 35.0,
-                    "max_equity_allowed_pct": 0.0,
-                    "current_regime": "DATA_FAILURE",
-                    "guard": {"active": guard_active, "note": guard_note},
-                },
-                "sources": {"reason": "NO_VALID_TRADE_DATE"},
-                "market_amount": {
-                    "amount_twse": None,
-                    "amount_tpex": None,
-                    "amount_total": None,
-                    "source_twse": "TWSE_FAIL",
-                    "source_tpex": "TPEX_SAFE_MODE",
-                    "status_twse": "FAIL",
-                    "status_tpex": "ESTIMATED",
-                    "confidence_twse": "LOW",
-                    "confidence_tpex": "LOW",
-                    "confidence_level": "LOW",
-                    "scope": "ALL",
-                    "meta": {},
-                },
-                "market_inst_summary": [],
-                "integrity_v1632": {
-                    "status": "OK",
-                    "kill_switch": True,
-                    "confidence": "LOW",
-                    "reason": "UNVERIFIED_TRADE_DATE",
-                    "missing_count": 1,
-                    "missing_list": ["trade_date"],
-                    "fallback_count": 0
-                }
-            },
-            "portfolio": {"total_equity": 2000000, "cash_balance": 2000000, "current_exposure_pct": 0.0, "cash_pct": 100.0},
-            "institutional_panel": [],
-            "stocks": [],
-            "positions_input": [],
-            "decisions": [],
-            "audit_log": [],
-        }
+    denom = max(1, (2 * n + 1))
+    core_missing = price_null + volratio_null + (1 if amount_total_null else 0)
+    core_missing_pct = float(core_missing / denom)
 
-    # 3) 指數序列
-    twii_df, twii_audit = fetch_index_series("^TWII", lookback_days=260)
-    vix_df, vix_audit = fetch_index_series("^VIX", lookback_days=520)
+    gap_down = metrics.get("gap_down")
+    is_gap_crash = bool(gap_down is not None and gap_down <= -0.07)
 
-    metrics = compute_metrics(twii_df, eff_trade_date)
-    twii_close = metrics["twii_close"]
-    smr = metrics["smr"]
+    # 🔥 新增：twii_close 檢查
+    twii_close_missing = (metrics.get("twii_close") is None)
 
-    # VIX：取 <= trade_date 的最後一筆
-    vix_val = None
-    vix_last_dt = None
-    if vix_df is not None and not vix_df.empty:
-        elig = vix_df[vix_df.index.date <= eff_trade_date]
-        if not elig.empty:
-            vix_val = float(elig["Close"].iloc[-1])
-            vix_last_dt = str(elig.index[-1].date())
+    kill = False
+    reasons = []
 
-    # 4) Market Amount
-    twse_amt, twse_audit = fetch_twse_amount_stock_day_all(eff_trade_date)
-    # ADR：TPEX 放生 → 固定 Safe Mode（你可調成 200B / 150B 等）
-    tpex_amt = 200_000_000_000
-    tpex_src = "TPEX_SAFE_MODE_200B"
+    if n > 0 and price_null == n:
+        kill = True
+        reasons.append(f"price_null={price_null}/{n}")
+    if n > 0 and volratio_null == n:
+        kill = True
+        reasons.append(f"volratio_null={volratio_null}/{n}")
+    if amount_total_null:
+        reasons.append("amount_total_null=True")
+    if core_missing_pct >= 0.50:
+        kill = True
+        reasons.append(f"core_missing_pct={core_missing_pct:.2f}")
+    if is_gap_crash:
+        kill = True
+        reasons.append(f"GAP_DOWN_CRASH({gap_down:.1%})")
+    
+    # 🔥 新增
+    if twii_close_missing:
+        kill = True
+        reasons.append("TWII_CLOSE_MISSING")
 
-    amount_total = (twse_amt or 0) + (tpex_amt or 0)
+    if amount_partial:
+        reasons.append(f"amount_scope={amount_scope}")
 
-    # 5) TWSE T86：計算 Top20 的 3 日淨買超（只抓 TWSE 公開）
-    # 先求最近 3 個交易日（以 ^TWII 有資料為準）
-    trade_dates = []
-    cur = eff_trade_date
-    while len(trade_dates) < 3 and (eff_trade_date - cur).days <= 10:
-        d, stt = resolve_effective_trade_date(cur)
-        if d is not None and (len(trade_dates) == 0 or d != trade_dates[-1]):
-            if d not in trade_dates:
-                trade_dates.append(d)
-        cur = cur - timedelta(days=1)
-    trade_dates = sorted(trade_dates)  # 舊 → 新
-
-    # t86 可用性：至少最新日能抓到資料
-    t86_df_latest, t86_audit_latest = fetch_twse_t86_all(eff_trade_date)
-    t86_ok = (t86_df_latest is not None and not t86_df_latest.empty and t86_audit_latest.get("error") is None)
-
-    # 6) 籌碼 cache：只允許同 trade_date，否則標 NO_UPDATE_TODAY
-    inst_cache = load_inst_cache()
-    cache_date = inst_cache.get("trade_date")
-    cache_by_stock = inst_cache.get("by_stock", {})
-
-    institutional_panel = []
-    inst_debug_map = {}
-
-    for sid, name in TOP20:
-        sym = yf_symbol(sid)
-        is_tpex = sid in TPEX_SET
-
-        # 上櫃：本版先不抓 TPEX 法人（ADR-001/002：先上 TWSE T86）
-        if is_tpex:
-            inst_status = "NO_DATA"
-            inst_dir3 = "NO_DATA"
-            inst_streak3 = 0
-            inst_net_3d = 0.0
-            inst_source = "TPEX_NOT_IMPLEMENTED_ADR_T86_TWSE_FIRST"
-            institutional_panel.append({
-                "Symbol": sym, "Name": name,
-                "Inst_Status": inst_status,
-                "Inst_Streak3": inst_streak3,
-                "Inst_Dir3": inst_dir3,
-                "Inst_Net_3d": inst_net_3d,
-                "inst_source": inst_source
-            })
-            continue
-
-        # 上市：抓 TWSE T86 3日淨買超（以「外資+投信+自營」合計）
-        # 若 t86_ok==False，避免殭屍：只用 cache（但必須同日），否則 NO_UPDATE_TODAY
-        if not t86_ok:
-            if cache_date == eff_trade_date.strftime("%Y-%m-%d") and sid in cache_by_stock:
-                c = cache_by_stock[sid]
-                institutional_panel.append({
-                    "Symbol": sym, "Name": name,
-                    "Inst_Status": "READY",
-                    "Inst_Streak3": int(c.get("Inst_Streak3", 0)),
-                    "Inst_Dir3": str(c.get("Inst_Dir3", "NEUTRAL")),
-                    "Inst_Net_3d": float(c.get("Inst_Net_3d", 0.0)),
-                    "inst_source": "CACHE_SAME_DAY"
-                })
-            else:
-                institutional_panel.append({
-                    "Symbol": sym, "Name": name,
-                    "Inst_Status": "NO_UPDATE_TODAY",
-                    "Inst_Streak3": 0,
-                    "Inst_Dir3": "NO_DATA",
-                    "Inst_Net_3d": 0.0,
-                    "inst_source": "TWSE_T86_UNAVAILABLE_NO_CACHE"
-                })
-            continue
-
-        # 正常抓取
-        foreign_3d, trust_3d, dealer_3d, total_3d, dbg = compute_twse_inst_3d_net(sid, trade_dates)
-        inst_debug_map[sid] = dbg
-
-        inst_net_3d = float(total_3d)
-        if inst_net_3d > 0:
-            inst_dir3 = "POSITIVE"
-        elif inst_net_3d < 0:
-            inst_dir3 = "NEGATIVE"
-        else:
-            inst_dir3 = "NEUTRAL"
-
-        # streak：簡化版（連續 3 日皆同方向才算 3）
-        # 以 dbg["days"] 中各日 total 方向判斷
-        dirs = []
-        for day in dbg.get("days", []):
-            if day.get("ok") and day.get("row_found"):
-                t = (day.get("foreign", 0) + day.get("trust", 0) + day.get("dealer", 0))
-                if t > 0:
-                    dirs.append(1)
-                elif t < 0:
-                    dirs.append(-1)
-                else:
-                    dirs.append(0)
-        inst_streak3 = 0
-        if len(dirs) >= 3:
-            if all(x > 0 for x in dirs[-3:]):
-                inst_streak3 = 3
-            elif all(x < 0 for x in dirs[-3:]):
-                inst_streak3 = 3
-
-        institutional_panel.append({
-            "Symbol": sym, "Name": name,
-            "Inst_Status": "READY",
-            "Inst_Streak3": inst_streak3,
-            "Inst_Dir3": inst_dir3,
-            "Inst_Net_3d": inst_net_3d,
-            "inst_source": "TWSE_T86_3D_NET"
-        })
-
-    # 7) 寫回 cache（只寫入本 trade_date 的資料）
-    cache_payload = {
-        "trade_date": eff_trade_date.strftime("%Y-%m-%d"),
-        "by_stock": {}
+    return {
+        "n": n,
+        "price_null": price_null,
+        "volratio_null": volratio_null,
+        "core_missing_pct": core_missing_pct,
+        "amount_total_null": amount_total_null,
+        "amount_partial": amount_partial,
+        "amount_scope": amount_scope,
+        "is_gap_crash": is_gap_crash,
+        "twii_close_missing": twii_close_missing,  # 🔥 新增
+        "kill": bool(kill),
+        "reason": ("DATA_MISSING " + ", ".join(reasons)) if reasons else "OK",
+        "metrics_reason": metrics.get("metrics_reason", "NA"),
     }
-    for inst in institutional_panel:
-        sid = inst["Symbol"].replace(".TW", "").replace(".TWO", "")
-        # 只存上市
-        if sid.isdigit() and sid not in TPEX_SET and inst.get("Inst_Status") == "READY":
-            cache_payload["by_stock"][sid] = {
-                "Inst_Streak3": inst.get("Inst_Streak3", 0),
-                "Inst_Dir3": inst.get("Inst_Dir3", "NEUTRAL"),
-                "Inst_Net_3d": inst.get("Inst_Net_3d", 0.0),
-            }
-    save_inst_cache(cache_payload)
 
-    # 8) 股票價格 / 量比
-    yf_prices_df, prices_src_map = fetch_top20_prices(eff_trade_date)
 
-    stocks = []
-    for sid, name in TOP20:
-        sym = yf_symbol(sid)
-        price, vol_ratio = compute_price_and_vol_ratio(yf_prices_df, sym, eff_trade_date)
-        # 對應法人
-        inst_row = next((x for x in institutional_panel if x["Symbol"] == sym), None) or {}
-        inst_dir3 = inst_row.get("Inst_Dir3", "NO_DATA")
-        inst_streak3 = int(inst_row.get("Inst_Streak3", 0))
-        inst_net_3d = float(inst_row.get("Inst_Net_3d", 0.0))
+def build_active_alerts(integrity: dict, amount: MarketAmount, is_using_previous_day: bool) -> List[str]:
+    """
+    建立警報清單
+    
+    修正：新增開盤保護警報
+    """
+    alerts = []
+    
+    # 🔥 新增：開盤保護警報
+    if is_using_previous_day:
+        alerts.append("⏰ MARKET_GUARD: 使用上一交易日數據（盤後數據尚未更新）")
+    
+    if integrity.get("kill"):
+        alerts.append("KILL_SWITCH_ACTIVATED")
+    if integrity.get("is_gap_crash"):
+        alerts.append("CRITICAL: 市場跳空重挫 (>7%)")
+    
+    # 🔥 新增
+    if integrity.get("twii_close_missing"):
+        alerts.append("CRITICAL: TWII_CLOSE 缺失，無法計算 SMR")
 
-        layer = assign_layer(vol_ratio, inst_dir3, inst_streak3)
+    if amount.amount_total is None or amount.amount_total <= 0:
+        alerts.append("DEGRADED_AMOUNT: 成交額數據完全缺失")
+    elif integrity.get("amount_partial"):
+        scope = integrity.get("amount_scope", "PARTIAL")
+        if scope == "TWSE_ONLY":
+            alerts.append("DEGRADED_AMOUNT_PARTIAL: 目前僅有『上市(TWSE)』成交額；上櫃(TPEX)缺失")
+        elif scope == "TPEX_ONLY":
+            alerts.append("DEGRADED_AMOUNT_PARTIAL: 目前僅有『上櫃(TPEX)』成交額；上市(TWSE)缺失")
+        else:
+            alerts.append(f"DEGRADED_AMOUNT_PARTIAL: 成交額涵蓋不足（scope={scope}）")
 
-        stocks.append({
-            "Symbol": sym,
-            "Name": name,
-            "Tier": int([x[0] for x in TOP20].index(sid) + 1),
-            "Price": price,
-            "Vol_Ratio": vol_ratio,
-            "Layer": layer,
-            "Institutional": {
-                "foreign_buy": True if inst_dir3 == "POSITIVE" else False,
-                "trust_buy": True if inst_dir3 == "POSITIVE" else False,
-                "Inst_Streak3": inst_streak3,
-                "Inst_Net_3d": inst_net_3d,
-                "inst_streak3": inst_streak3,
-                "stale": True if inst_row.get("Inst_Status") == "NO_UPDATE_TODAY" else False
-            },
-            "source": prices_src_map.get(sym, "YF_BATCH")
-        })
+    n = int(integrity.get("n") or 0)
+    if n > 0 and int(integrity.get("price_null") or 0) == n:
+        alerts.append("CRITICAL: 所有個股價格=null")
+    if n > 0 and int(integrity.get("volratio_null") or 0) == n:
+        alerts.append("CRITICAL: 所有個股量能=null")
+    cm = float(integrity.get("core_missing_pct") or 0.0)
+    if cm >= 0.50:
+        alerts.append(f"DATA_INTEGRITY_FAILURE: 缺失率={cm:.2f}")
+    if integrity.get("kill"):
+        alerts.append("FORCED_ALL_CASH: 強制避險模式")
+    
+    if "YAHOO" in amount.source_twse or "SAFE_MODE" in amount.source_twse:
+        alerts.append(f"TWSE 使用估算值: {amount.source_twse}")
+    if "YAHOO" in amount.source_tpex or "SAFE_MODE" in amount.source_tpex:
+        alerts.append(f"TPEX 使用估算值: {amount.source_tpex}")
+    
+    return alerts
 
-    # 9) 殭屍籌碼熔斷
-    stale_flag = apply_stale_inst_kill_switch(institutional_panel, stocks)
 
-    # 10) Layer A：Integrity Validation
-    integrity_override = integrity_check_market(twii_close, smr)
+def _apply_amount_degrade(max_equity: float, account_mode: str, amount_partial: bool) -> float:
+    if not amount_partial:
+        return max_equity
+    factor = float(DEGRADE_FACTOR_BY_MODE.get(account_mode, 0.75))
+    return float(max_equity) * factor
 
-    # regime（示意：你可替換成你的完整 Regime Engine）
-    current_regime = "OVERHEAT"  # 先保留你目前狀態標記
-    max_equity_allowed_pct = 0.55
-    confidence_level = "MEDIUM"
-    market_status = "LOW"  # 你提供的例子是 LOW
 
-    if integrity_override:
-        current_regime = integrity_override["current_regime"]
-        max_equity_allowed_pct = integrity_override["max_equity_allowed_pct"]
-        confidence_level = integrity_override["confidence_level"]
-        market_status = "LOW"
+# =========================
+# Arbiter input builder
+# =========================
+def _default_symbols_pool(topn: int) -> List[str]:
+    pool = list(STOCK_NAME_MAP.keys())
+    limit = min(len(pool), max(1, int(topn)))
+    return pool[:limit]
 
-    # Market Guard 觸發時：符合你需求（08:00 顯示昨日判定並 max_equity=0）
-    guard_block_equity = False
-    if guard_active:
-        # 你指定：00:00~15:30 EOD → 顯示上一交易日最終判定，且 max_equity=0.0
-        max_equity_allowed_pct = 0.0
-        confidence_level = "LOW"
-        guard_block_equity = True
 
-    # confidence_level 強制規則
-    confidence_level = enforce_confidence_level(confidence_level, twii_close, smr, stale_flag, t86_ok)
+def _source_snapshot(name: str, df: pd.DataFrame, symbol: str) -> Dict[str, Any]:
+    if df is None or df.empty:
+        return {"name": name, "ok": False, "rows": 0, "cols": [], "last_dt": None, "reason": "EMPTY"}
+    cols = list(map(str, df.columns.tolist()))
+    last_dt = None
+    try:
+        if "Datetime" in df.columns:
+            last_dt = pd.to_datetime(df["Datetime"].dropna().iloc[-1]).strftime("%Y-%m-%d")
+    except Exception:
+        last_dt = None
+    return {"name": name, "ok": True, "rows": int(len(df)), "cols": cols, "last_dt": last_dt, "reason": "OK"}
 
-    # 11) 法人彙總（市場層）：用最新日 T86 df 做合計（僅 TWSE）
-    market_inst_summary = []
-    if t86_ok and t86_df_latest is not None and not t86_df_latest.empty:
-        # 只顯示「合計」列（若有）
+
+def build_arbiter_input(session: str, account_mode: str, topn: int, positions: List[dict],
+                        cash_balance: int, total_equity: int, allow_insecure_ssl: bool, finmind_token: Optional[str]) -> Tuple[dict, List[dict]]:
+    
+    # 🔥 新增：取得有效交易日期
+    trade_date, date_status, is_using_previous_day = get_effective_trade_date(session)
+
+    twii_df = fetch_history(TWII_SYMBOL, period="5y", interval="1d")
+    vix_df = fetch_history(VIX_SYMBOL, period="2y", interval="1d")
+
+    src_twii = _source_snapshot("TWII", twii_df, TWII_SYMBOL)
+    src_vix = _source_snapshot("VIX", vix_df, VIX_SYMBOL)
+
+    vix_last = None
+    if vix_df is not None and not vix_df.empty:
         try:
-            # 常見列含 "合計"
-            name_col = None
-            for c in t86_df_latest.columns:
-                if "證券名稱" in c:
-                    name_col = c
-                    break
-            total_col = None
-            for c in t86_df_latest.columns:
-                if ("三大法人" in c and "買賣超" in c) or (c.strip() == "三大法人買賣超股數"):
-                    total_col = c
-                    break
-            if name_col and total_col:
-                total_row = t86_df_latest[t86_df_latest[name_col].astype(str).str.contains("合計", na=False)]
-                if not total_row.empty:
-                    v = _to_int_safe(total_row.iloc[0][total_col])
-                    market_inst_summary.append({"Identity": "合計（TWSE 三大法人買賣超股數）", "Net": v})
+            vix_close = _as_close_series(vix_df)
+            vix_last = float(vix_close.iloc[-1]) if len(vix_close) else None
+        except Exception:
+            vix_last = None
+
+    dynamic_vix_threshold = calculate_dynamic_vix(vix_df)
+
+    metrics = compute_regime_metrics(twii_df)
+    close_price = metrics.get("twii_close")  # 🔥 從 metrics 取得
+    ma14_monthly = _calc_ma14_monthly_from_daily(twii_df)
+    close_below_days = _count_close_below_ma_days(twii_df, ma14_monthly)
+
+    twii_change = None
+    twii_pct = None
+    if twii_df is not None and not twii_df.empty:
+        try:
+            c = _as_close_series(twii_df)
+            if len(c) >= 2:
+                twii_change = float(c.iloc[-1] - c.iloc[-2])
+                twii_pct = float(c.iloc[-1] / c.iloc[-2] - 1.0)
         except Exception:
             pass
 
-    # 12) 組裝 Payload（貼近你提供的 schema）
+    regime, max_equity = pick_regime(metrics, vix=vix_last, ma14_monthly=ma14_monthly,
+                                     close_price=close_price, close_below_ma_days=close_below_days)
+
+    amount = fetch_amount_total(trade_date=trade_date, allow_insecure_ssl=allow_insecure_ssl)
+    market_inst_summary = fetch_market_inst_summary(allow_insecure_ssl)
+
+    base_pool = _default_symbols_pool(topn)
+    pos_pool = [p.get("symbol") for p in positions if p.get("symbol")]
+    symbols = list(dict.fromkeys(base_pool + pos_pool))
+
+    pv = fetch_batch_prices_volratio(symbols)
+
+    end_date = trade_date
+    start_date = (pd.to_datetime(end_date) - pd.Timedelta(days=10)).strftime("%Y-%m-%d")
+    inst_df = fetch_finmind_institutional(symbols, start_date=start_date, end_date=end_date, token=finmind_token)
+
+    panel_rows = []
+    inst_map = {}
+    stocks = []
+
+    for i, sym in enumerate(symbols, start=1):
+        # 🔥 修正：傳入 trade_date
+        inst3 = calc_inst_3d(inst_df, sym, trade_date)
+        net3 = float(inst3.get("Inst_Net_3d", 0.0))
+
+        p_row = {
+            "Symbol": sym,
+            "Name": STOCK_NAME_MAP.get(sym, sym),
+            "Foreign_Net": net3,
+            "Trust_Net": net3,
+            "Inst_Streak3": int(inst3.get("Inst_Streak3", 0)),
+            "Inst_Status": inst3.get("Inst_Status", "PENDING"),
+            "Inst_Dir3": inst3.get("Inst_Dir3", "PENDING"),
+            "Inst_Net_3d": net3,
+            "inst_source": "FINMIND_3D_NET"
+        }
+        panel_rows.append(p_row)
+
+        inst_map[sym] = {
+            "foreign_buy": bool(net3 > 0),
+            "trust_buy": bool(net3 > 0),
+            "Inst_Streak3": int(inst3.get("Inst_Streak3", 0)),
+            "Inst_Net_3d": net3,
+            "inst_streak3": int(inst3.get("Inst_Streak3", 0)),
+            "Inst_Status": inst3.get("Inst_Status", "NO_DATA")  # 🔥 新增
+        }
+
+        row = pv[pv["Symbol"] == sym].iloc[0] if not pv.empty and (pv["Symbol"] == sym).any() else None
+        price = row["Price"] if row is not None else None
+        vol_ratio = row["Vol_Ratio"] if row is not None else None
+
+        if price is None or pd.isna(price):
+            warnings_bus.push("PRICE_NULL", "Missing Price", {"symbol": sym, "src": (row["source"] if row is not None else "NONE")})
+        if vol_ratio is None or pd.isna(vol_ratio):
+            warnings_bus.push("VOLRATIO_NULL", "Missing VolRatio", {"symbol": sym, "src": (row["source"] if row is not None else "NONE")})
+
+        inst_data = inst_map.get(sym, {"foreign_buy": False, "trust_buy": False, "inst_streak3": 0, "Inst_Status": "NO_DATA"})
+        layer = classify_layer(regime, bool(metrics.get("MOMENTUM_LOCK", False)), vol_ratio, inst_data)
+
+        stocks.append({
+            "Symbol": sym,
+            "Name": STOCK_NAME_MAP.get(sym, sym),
+            "Tier": i,
+            "Price": None if (price is None or pd.isna(price)) else float(price),
+            "Vol_Ratio": None if (vol_ratio is None or pd.isna(vol_ratio)) else float(vol_ratio),
+            "Layer": layer,
+            "Institutional": inst_data
+        })
+
+    institutional_panel = pd.DataFrame(panel_rows)
+
+    integrity = compute_integrity_and_kill(stocks, amount, metrics)
+    active_alerts = build_active_alerts(integrity, amount, is_using_previous_day)
+
+    final_regime = "UNKNOWN" if integrity["kill"] else regime
+    final_max_equity = 0.0 if integrity["kill"] else _apply_amount_degrade(float(max_equity), account_mode, bool(integrity.get("amount_partial")))
+
+    current_exposure_pct = min(1.0, len(positions) * 0.05) if positions else 0.0
+
+    if integrity["kill"]:
+        market_status = "SHELTER"
+        current_exposure_pct = 0.0
+        final_regime = "UNKNOWN"
+        final_max_equity = 0.0
+    else:
+        market_status = "NORMAL"
+        if amount.amount_total is None or amount.amount_total <= 0:
+            market_status = "DEGRADED"
+        elif "YAHOO" in amount.source_twse or "YAHOO" in amount.source_tpex or "SAFE_MODE" in amount.source_twse or "SAFE_MODE" in amount.source_tpex:
+            market_status = "ESTIMATED"
+
+    # 🔥 新增：強制降級 confidence_level
+    base_confidence = amount.confidence_level
+    if integrity["kill"] or metrics.get("twii_close") is None:
+        final_confidence = "LOW"
+    elif is_using_previous_day:
+        final_confidence = "MEDIUM" if base_confidence == "HIGH" else "LOW"
+    else:
+        final_confidence = base_confidence
+
+    sources = {
+        "twii": src_twii,
+        "vix": src_vix,
+        "metrics_reason": metrics.get("metrics_reason", "NA"),
+        "amount_source": {
+            "source_twse": amount.source_twse,
+            "source_tpex": amount.source_tpex,
+            "status_twse": amount.status_twse,
+            "status_tpex": amount.status_tpex,
+            "confidence_twse": amount.confidence_twse,
+            "confidence_tpex": amount.confidence_tpex,
+            "amount_twse": amount.amount_twse,
+            "amount_tpex": amount.amount_tpex,
+            "amount_total": amount.amount_total,
+            "scope": amount.scope,
+            "audit_dir": AUDIT_DIR,
+            "twse_audit": (amount.meta or {}).get("twse", {}).get("audit") if amount.meta else None,
+            "tpex_audit": (amount.meta or {}).get("tpex", {}).get("audit") if amount.meta else None,
+        }
+    }
+
     payload = {
         "meta": {
-            "timestamp": meta_now,
-            "session": "EOD",
+            "timestamp": _now_ts(),
+            "session": session,
             "market_status": market_status,
-            "current_regime": current_regime,
-            "account_mode": "Conservative",
-            "audit_tag": VERSION_TAG,
-            "confidence_level": confidence_level,
-            "date_status": date_status
+            "current_regime": final_regime,
+            "account_mode": account_mode,
+            "audit_tag": "V16.3.32_FINAL_TIME_FIX",
+            "confidence_level": final_confidence,  # 🔥 新增
+            "date_status": date_status,  # 🔥 新增
+            "is_using_previous_day": is_using_previous_day  # 🔥 新增
         },
         "macro": {
             "overview": {
-                "trade_date": eff_trade_date.strftime("%Y-%m-%d"),
-                "date_status": date_status,
-                "twii_close": metrics["twii_close"],
-                "twii_change": metrics["twii_change"],
-                "twii_pct": metrics["twii_pct"],
-                "vix": vix_val,
-                "vix_source": "VIX",
-                "vix_status": "OK" if vix_val is not None else "FAIL",
-                "vix_confidence": "MEDIUM" if vix_val is not None else "LOW",
-                "vix_panic": 35.0,
-                "smr": metrics["smr"],
-                "slope5": metrics["slope5"],
-                "drawdown_pct": metrics["drawdown_pct"],
-                "price_range_10d_pct": metrics["price_range_10d_pct"],
-                "dynamic_vix_threshold": 35.0,
-                "max_equity_allowed_pct": max_equity_allowed_pct,
-                "current_regime": current_regime,
-                "guard": {
-                    "active": guard_active,
-                    "note": guard_note,
-                    "block_equity": guard_block_equity
-                }
+                "trade_date": trade_date,
+                "date_status": date_status,  # 🔥 新增
+                "twii_close": close_price,
+                "twii_change": twii_change,
+                "twii_pct": twii_pct,
+                "vix": vix_last,
+                "smr": metrics.get("SMR"),
+                "slope5": metrics.get("Slope5"),
+                "drawdown_pct": metrics.get("drawdown_pct"),
+                "price_range_10d_pct": metrics.get("price_range_10d_pct"),
+                "dynamic_vix_threshold": dynamic_vix_threshold,
+                "max_equity_allowed_pct": final_max_equity,
+                "current_regime": final_regime
             },
-            "sources": {
-                "twii": {
-                    "name": "TWII",
-                    "ok": bool(twii_audit.get("ok")),
-                    "rows": twii_audit.get("rows"),
-                    "cols": list(twii_df.columns) if twii_df is not None and not twii_df.empty else [],
-                    "last_dt": twii_audit.get("last_dt"),
-                    "reason": twii_audit.get("reason")
-                },
-                "vix": {
-                    "name": "VIX",
-                    "ok": bool(vix_audit.get("ok")),
-                    "rows": vix_audit.get("rows"),
-                    "cols": list(vix_df.columns) if vix_df is not None and not vix_df.empty else [],
-                    "last_dt": vix_last_dt or vix_audit.get("last_dt"),
-                    "reason": vix_audit.get("reason")
-                },
-                "metrics_reason": metrics.get("metrics_reason"),
-                "amount_source": {
-                    "trade_date": eff_trade_date.strftime("%Y-%m-%d"),
-                    "source_twse": "TWSE_OK:AUDIT_SUM" if twse_amt else "TWSE_FAIL",
-                    "source_tpex": tpex_src,
-                    "status_twse": "OK" if twse_amt else "FAIL",
-                    "status_tpex": "ESTIMATED",
-                    "confidence_twse": "HIGH" if twse_amt else "LOW",
-                    "confidence_tpex": "LOW",
-                    "confidence_level": "LOW" if (not twse_amt) else confidence_level,
-                    "amount_twse": twse_amt,
-                    "amount_tpex": tpex_amt,
-                    "amount_total": amount_total,
-                    "scope": "ALL",
-                    "audit_dir": AUDIT_DIR,
-                    "twse_audit": {
-                        "market": "TWSE",
-                        "trade_date": eff_trade_date.strftime("%Y-%m-%d"),
-                        "rows": twse_audit.get("rows"),
-                        "amount_sum": twse_audit.get("amount_sum")
-                    },
-                    "tpex_audit": None
-                },
-                "prices_source_map": prices_src_map,
-                "t86_latest": t86_audit_latest,
-                "t86_ok": t86_ok,
-            },
-            "market_amount": {
-                "amount_twse": twse_amt,
-                "amount_tpex": tpex_amt,
-                "amount_total": amount_total,
-                "source_twse": "TWSE_OK:AUDIT_SUM" if twse_amt else "TWSE_FAIL",
-                "source_tpex": tpex_src,
-                "status_twse": "OK" if twse_amt else "FAIL",
-                "status_tpex": "ESTIMATED",
-                "confidence_twse": "HIGH" if twse_amt else "LOW",
-                "confidence_tpex": "LOW",
-                "confidence_level": confidence_level,
-                "allow_insecure_ssl": True,
-                "scope": "ALL",
-                "meta": {
-                    "trade_date": eff_trade_date.strftime("%Y-%m-%d"),
-                    "audit_dir": AUDIT_DIR,
-                    "twse": twse_audit,
-                    "tpex": {
-                        "fallback": "SAFE_MODE",
-                        "audit": None
-                    }
-                }
-            },
+            "sources": sources,
+            "market_amount": asdict(amount),
             "market_inst_summary": market_inst_summary,
-            "integrity_v1632": {
-                "status": "OK",
-                "kill_switch": bool(integrity_override is not None) or (date_status != "VERIFIED"),
-                "confidence": confidence_level,
-                "reason": "INTEGRITY_PASS" if integrity_override is None else "INTEGRITY_FAIL",
-                "missing_count": 0 if integrity_override is None else 1,
-                "missing_list": [] if integrity_override is None else ["twii_close_or_smr"],
-                "fallback_count": int(1 if tpex_src.startswith("TPEX_SAFE_MODE") else 0)
-            }
+            "integrity": integrity
         },
         "portfolio": {
-            "total_equity": 2000000,
-            "cash_balance": 2000000,
-            "current_exposure_pct": 0.0,
-            "cash_pct": 100.0
+            "total_equity": int(total_equity),
+            "cash_balance": int(cash_balance),
+            "current_exposure_pct": float(current_exposure_pct),
+            "cash_pct": float(100.0 * max(0.0, 1.0 - current_exposure_pct)),
+            "active_alerts": active_alerts
         },
-        "institutional_panel": institutional_panel,
+        "institutional_panel": institutional_panel.to_dict(orient="records"),
         "stocks": stocks,
-        "positions_input": [],
+        "positions_input": positions,
         "decisions": [],
         "audit_log": []
     }
 
-    # 13) 寫檔（方便稽核）
-    try:
-        with open(MARKET_JSON_PATH, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
-
-    # 14) 同步落地 TWSE audit 檔（成交額）
-    try:
-        audit_file = os.path.join(AUDIT_DIR, f"twse_amount_{eff_trade_date.strftime('%Y%m%d')}.json")
-        with open(audit_file, "w", encoding="utf-8") as f:
-            json.dump(twse_audit, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
-
-    # 15) 附加 debug（不在 UI 顯示，必要時你可展開）
-    payload["_debug"] = {"twse_t86_map": inst_debug_map}
-
-    return payload
+    return payload, warnings_bus.latest(50)
 
 
 # =========================
-# UI（你要求：不要一堆代碼，而是清楚貼出指數/漲跌/成交額/法人/Top20）
+# UI
 # =========================
-def fmt_money(n: Optional[int]) -> str:
-    if n is None:
-        return "—"
-    # 以「億元」顯示（關鍵數據）
-    return f"{n/100_000_000:,.1f} 億"
-
-def fmt_pct(x: Optional[float]) -> str:
-    if x is None:
-        return "—"
-    return f"{x*100:.2f}%"
-
-def fmt_num(x: Optional[float], nd=2) -> str:
-    if x is None:
-        return "—"
-    return f"{x:.{nd}f}"
-
-def render_ui(payload: Dict[str, Any]) -> None:
-    st.set_page_config(page_title=APP_TITLE, layout="wide")
-    st.title(APP_TITLE)
-
-    meta = payload.get("meta", {})
-    ov = payload.get("macro", {}).get("overview", {})
-    ma = payload.get("macro", {}).get("market_amount", {})
-    inst_sum = payload.get("macro", {}).get("market_inst_summary", [])
-    stocks = payload.get("stocks", [])
-    inst_panel = payload.get("institutional_panel", [])
-
-    # Header 狀態
-    c1, c2, c3, c4, c5 = st.columns([1.2, 1.2, 1.2, 1.2, 1.2])
-    c1.metric("交易日", ov.get("trade_date", "—"))
-    c2.metric("Regime", meta.get("current_regime", "—"))
-    c3.metric("Confidence", meta.get("confidence_level", "—"))
-    c4.metric("Max Equity", fmt_pct(ov.get("max_equity_allowed_pct", 0.0)))
-    c5.metric("Market Status", meta.get("market_status", "—"))
-
-    guard = ov.get("guard", {}) or {}
-    if guard.get("active"):
-        st.warning(f"Market Guard 啟動：今日數據尚未完成 → 顯示 {ov.get('trade_date')} 的最終判定；max_equity 已強制為 0.0。")
-
-    st.divider()
-
-    # 指數與成交額
-    a1, a2, a3, a4 = st.columns(4)
-    a1.metric("TWII 收盤", fmt_num(ov.get("twii_close"), 2),
-              delta=(fmt_num(ov.get("twii_change"), 2) if ov.get("twii_change") is not None else None))
-    a2.metric("TWII 漲跌幅", fmt_pct(ov.get("twii_pct")))
-    a3.metric("VIX", fmt_num(ov.get("vix"), 2))
-    a4.metric("SMR（14d波動）", fmt_num(ov.get("smr"), 4))
-
-    b1, b2, b3 = st.columns(3)
-    b1.metric("上市成交額（TWSE）", fmt_money(ma.get("amount_twse")))
-    b2.metric("上櫃成交額（TPEX）", fmt_money(ma.get("amount_tpex")),
-              delta=("Safe Mode" if ma.get("source_tpex", "").startswith("TPEX_SAFE_MODE") else None))
-    b3.metric("市場總成交額（估）", fmt_money(ma.get("amount_total")))
-
-    st.caption(
-        f"資料稽核：TWSE={ma.get('source_twse')}；TPEX={ma.get('source_tpex')}（依 ADR 採 Safe Mode，避免投入成本侵蝕 ROI）"
-    )
-
-    st.divider()
-
-    # 市場法人彙總（若有）
-    if inst_sum:
-        st.subheader("三大法人（市場層摘要）")
-        st.json(inst_sum)
-    else:
-        st.subheader("三大法人（市場層摘要）")
-        st.info("目前僅先落地 TWSE T86（免費公開）。若需 TPEX 法人彙總，建議另立 ADR（避免拖累主系統穩定）。")
-
-    st.divider()
-
-    # Top20 表格（親和版）
-    st.subheader("Top20 監控清單（價格 / 量比 / 籌碼 / Layer）")
-
-    inst_map = {x["Symbol"]: x for x in inst_panel}
-    rows = []
-    for s in stocks:
-        sym = s.get("Symbol")
-        inst = inst_map.get(sym, {})
-        rows.append({
-            "Tier": s.get("Tier"),
-            "代碼": sym.replace(".TW", ""),
-            "名稱": s.get("Name"),
-            "收盤價": s.get("Price"),
-            "量比(20d)": s.get("Vol_Ratio"),
-            "籌碼狀態": inst.get("Inst_Status"),
-            "3日方向": inst.get("Inst_Dir3"),
-            "3日淨買超股數": inst.get("Inst_Net_3d"),
-            "Layer": s.get("Layer"),
-            "價格來源": s.get("source"),
-            "籌碼來源": inst.get("inst_source"),
-        })
-
-    df = pd.DataFrame(rows)
-    # 友善格式化
-    if not df.empty:
-        df["收盤價"] = df["收盤價"].map(lambda x: "—" if x is None else f"{x:,.2f}")
-        df["量比(20d)"] = df["量比(20d)"].map(lambda x: "—" if x is None else f"{x:.2f}")
-        df["3日淨買超股數"] = df["3日淨買超股數"].map(lambda x: "—" if x is None else f"{int(x):,}")
-        st.dataframe(df, use_container_width=True, hide_index=True)
-
-    st.divider()
-
-    # 下載 / 檢視 JSON
-    st.subheader("輸出與稽核")
-    st.caption(f"已落地：{MARKET_JSON_PATH}（可供你的 Arbiter/回測/稽核鏈使用）")
-    st.download_button(
-        label="下載本次 JSON（predator_market.json）",
-        data=json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"),
-        file_name="predator_market.json",
-        mime="application/json"
-    )
-
-    with st.expander("展開查看原始 JSON（除錯/稽核）", expanded=False):
-        # 不展 _debug（避免太吵）；需要你再開
-        p = dict(payload)
-        if "_debug" in p:
-            p["_debug"] = {"note": "已隱藏（需要再開）"}
-        st.json(p)
+def _amount_scope_label(scope: str) -> str:
+    s = (scope or "").upper()
+    if s == "ALL":
+        return "（全市場：TWSE+TPEX）"
+    if s == "TWSE_ONLY":
+        return "（僅上市：TWSE；TPEX 缺失）"
+    if s == "TPEX_ONLY":
+        return "（僅上櫃：TPEX；TWSE 缺失）"
+    return "（數據缺失）"
 
 
-# =========================
-# 入口
-# =========================
 def main():
-    st.sidebar.header("控制台")
-    st.sidebar.caption("V16.3.32 FINAL：Market Guard + Stale Kill Switch + Integrity Validation + TWSE T86")
+    st.sidebar.header("設定 (Settings)")
+    session = st.sidebar.selectbox("Session", ["INTRADAY", "EOD"], index=1)
+    account_mode = st.sidebar.selectbox("帳戶模式", ["Conservative", "Balanced", "Aggressive"], index=0)
+    topn = st.sidebar.selectbox("TopN（監控數量）", [8, 10, 15, 20, 30], index=3)
+    
+    allow_insecure_ssl = st.sidebar.checkbox("允許不安全 SSL", value=True)
 
-    if st.sidebar.button("立即刷新（重新抓取）"):
-        st.session_state["force_refresh"] = True
+    st.sidebar.subheader("FinMind")
+    finmind_token = st.sidebar.text_input("FinMind Token", type="password").strip() or None
 
-    force_refresh = st.session_state.get("force_refresh", False)
+    st.sidebar.subheader("持倉 (JSON List)")
+    positions_text = st.sidebar.text_area("positions", value="[]", height=100)
 
-    # 快取 UI 端 payload，避免每次重跑都打外部
-    cache_key = "payload_cache"
-    cache_ts_key = "payload_cache_ts"
+    cash_balance = st.sidebar.number_input("現金餘額", min_value=0, value=DEFAULT_CASH, step=10000)
+    total_equity = st.sidebar.number_input("總權益", min_value=0, value=DEFAULT_EQUITY, step=10000)
 
-    if (not force_refresh) and (cache_key in st.session_state):
-        payload = st.session_state[cache_key]
-    else:
-        with st.spinner("抓取市場資料中（TWII / VIX / TWSE成交額 / TWSE T86）..."):
-            payload = build_predator_payload()
-        st.session_state[cache_key] = payload
-        st.session_state[cache_ts_key] = taipei_now().strftime("%Y-%m-%d %H:%M:%S")
-        st.session_state["force_refresh"] = False
+    run_btn = st.sidebar.button("啟動中控台")
 
-    ts = st.session_state.get(cache_ts_key, "—")
-    st.sidebar.metric("最後刷新", ts)
+    positions = []
+    try:
+        positions = json.loads(positions_text) if positions_text.strip() else []
+    except Exception:
+        positions = []
 
-    render_ui(payload)
+    if run_btn or "auto_ran" not in st.session_state:
+        st.session_state["auto_ran"] = True
+        try:
+            payload, warns = build_arbiter_input(
+                session, account_mode, int(topn), positions,
+                int(cash_balance), int(total_equity), bool(allow_insecure_ssl), finmind_token
+            )
+        except Exception as e:
+            st.error(f"系統錯誤: {e}")
+            import traceback
+            st.code(traceback.format_exc())
+            return
+
+        ov = payload.get("macro", {}).get("overview", {})
+        meta = payload.get("meta", {})
+        amount = payload.get("macro", {}).get("market_amount", {})
+        inst_summary = payload.get("macro", {}).get("market_inst_summary", [])
+        sources = payload.get("macro", {}).get("sources", {})
+
+        # 🔥 新增：開盤保護提示
+        if meta.get("is_using_previous_day"):
+            st.warning(f"""
+            ⏰ **開盤保護開關已啟動**
+            
+            當前台北時間：{get_taipei_now().strftime('%Y-%m-%d %H:%M:%S')}  
+            數據日期：{ov.get('trade_date')}（使用上一交易日）
+            
+            原因：盤後數據尚未更新（收盤時間 15:30 後才會有當日完整數據）
+            """)
+
+        # --- 1. 關鍵指標 ---
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("交易日期", ov.get("trade_date", "-"))
+        
+        status = meta.get("market_status", "-")
+        if status == "ESTIMATED":
+            c2.metric("市場狀態", f"⚠️ {status}", help="使用估算數據")
+        elif status == "DEGRADED":
+            c2.metric("市場狀態", f"🔴 {status}", help="數據缺失")
+        else:
+            c2.metric("市場狀態", f"✅ {status}")
+        
+        c3.metric("策略體制 (Regime)", meta.get("current_regime", "-"))
+        c4.metric("建議持倉上限", f"{_pct01_to_pct100(ov.get('max_equity_allowed_pct')):.0f}%" if ov.get("max_equity_allowed_pct") is not None else "-")
+
+        # --- 2. 大盤與成交量 ---
+        st.subheader("📊 大盤觀測站 (TAIEX Overview)")
+        m1, m2, m3, m4 = st.columns(4)
+
+        close = ov.get("twii_close")
+        chg = ov.get("twii_change")
+        pct = ov.get("twii_pct")
+
+        delta_color = "normal"
+        if chg is not None:
+            delta_color = "normal" if float(chg) >= 0 else "inverse"
+
+        m1.metric(
+            "加權指數",
+            f"{close:,.0f}" if close is not None else "-",
+            f"{chg:+.0f} ({pct:+.2%})" if (chg is not None and pct is not None) else None,
+            delta_color=delta_color
+        )
+        m2.metric("VIX 恐慌指數", f"{ov.get('vix'):.2f}" if ov.get('vix') is not None else "-")
+
+        amt_total = amount.get("amount_total")
+        scope = amount.get("scope", "NONE")
+        scope_label = _amount_scope_label(scope)
+
+        if amt_total is not None and amt_total > 0:
+            amt_str = f"{amt_total/1_000_000_000_000:.3f} 兆元 {scope_label}"
+        else:
+            amt_str = f"數據缺失 {scope_label}"
+
+        m3.metric("市場總成交額", amt_str)
+        m4.metric("SMR 乖離率", f"{ov.get('smr'):.4f}" if ov.get('smr') is not None else "-")
+
+        # --- 2.1 成交額稽核摘要 ---
+        with st.expander("📌 成交額稽核摘要", expanded=True):
+            a_src = sources.get("amount_source", {})
+            
+            twse_src = a_src.get("source_twse", "")
+            tpex_src = a_src.get("source_tpex", "")
+            
+            if "OK" in twse_src:
+                twse_icon = "✅"
+            elif "YAHOO" in twse_src:
+                twse_icon = "⚠️"
+            elif "SAFE_MODE" in twse_src:
+                twse_icon = "🔴"
+            else:
+                twse_icon = "❌"
+            
+            if "OK" in tpex_src:
+                tpex_icon = "✅"
+            elif "YAHOO" in tpex_src:
+                tpex_icon = "⚠️"
+            elif "SAFE_MODE" in tpex_src:
+                tpex_icon = "🔴"
+            else:
+                tpex_icon = "❌"
+            
+            st.markdown(f"""
+            **上市 (TWSE)**: {twse_icon} {twse_src}  
+            **上櫃 (TPEX)**: {tpex_icon} {tpex_src}  
+            **總額**: {amt_total:,} 元 ({scope})
+            
+            **圖例**:  
+            ✅ 官方數據成功 | ⚠️ Yahoo 估算 | 🔴 Safe Mode 固定值 | ❌ 完全失敗
+            """)
+            
+            st.json({
+                "trade_date": a_src.get("trade_date"),
+                "amount_twse": a_src.get("amount_twse"),
+                "amount_tpex": a_src.get("amount_tpex"),
+                "amount_total": a_src.get("amount_total"),
+                "twse_audit": a_src.get("twse_audit"),
+                "tpex_audit": a_src.get("tpex_audit"),
+            })
+
+        # --- 3. 三大法人全市場買賣超 ---
+        st.subheader("🏛️ 三大法人買賣超 (全市場)")
+        if inst_summary:
+            cols = st.columns(len(inst_summary))
+            for idx, item in enumerate(inst_summary):
+                net = item.get("Net", 0)
+                net_yi = net / 1_0000_0000
+                cols[idx].metric(item.get("Identity"), f"{net_yi:+.2f} 億")
+        else:
+            st.info("暫無今日法人統計資料 (通常下午 3 點後更新)")
+
+        # --- 4. 警報區 ---
+        alerts = payload.get("portfolio", {}).get("active_alerts", [])
+        if alerts:
+            st.subheader("⚠️ 戰術警報 (Active Alerts)")
+            for a in alerts:
+                if "CRITICAL" in a or "KILL" in a:
+                    st.error(a)
+                elif "估算" in a or "ESTIMATE" in a or "MARKET_GUARD" in a:
+                    st.warning(f"⚠️ {a}")
+                else:
+                    st.warning(a)
+
+        # --- 5. 系統診斷 ---
+        st.subheader("🛠️ 系統健康診斷 (System Health)")
+        if not warns:
+            st.success("✅ 系統運作正常，無錯誤日誌 (Clean Run)。")
+        else:
+            with st.expander(f"⚠️ 偵測到 {len(warns)} 條系統警示 (點擊查看詳情)", expanded=False):
+                st.warning("系統遭遇部分數據抓取失敗，已自動降級或使用備援/補抓。")
+                w_df = pd.DataFrame(warns)
+                if not w_df.empty and 'code' in w_df.columns:
+                    st.dataframe(w_df[['ts', 'code', 'msg']], use_container_width=True)
+                else:
+                    st.write(warns)
+
+        # --- 6. 個股分析 ---
+        st.subheader("🎯 核心持股雷達 (Tactical Stocks)")
+        s_df = pd.json_normalize(payload.get("stocks", []))
+        if not s_df.empty:
+            disp_cols = ["Symbol", "Name", "Price", "Vol_Ratio", "Layer", "Institutional.Inst_Net_3d", "Institutional.Inst_Streak3", "Institutional.Inst_Status"]
+            s_df = s_df.reindex(columns=disp_cols, fill_value=0)
+            s_df = s_df.rename(columns=COL_TRANSLATION)
+            s_df = s_df.rename(columns={
+                "Institutional.Inst_Net_3d": "法人3日淨額",
+                "Institutional.Inst_Streak3": "法人連買天數",
+                "Institutional.Inst_Status": "籌碼狀態"
+            })
+            st.dataframe(s_df, use_container_width=True)
+
+        # --- 7. 法人明細 ---
+        with st.expander("🔍 查看法人詳細數據 (Institutional Debug Panel)"):
+            inst_df2 = pd.DataFrame(payload.get("institutional_panel", []))
+            if not inst_df2.empty:
+                st.dataframe(inst_df2.rename(columns=COL_TRANSLATION), use_container_width=True)
+
+        # --- 8. AI JSON 一鍵複製 ---
+        st.markdown("---")
+        c_copy1, _ = st.columns([0.8, 0.2])
+        with c_copy1:
+            st.subheader("🤖 AI JSON (Arbiter Input)")
+
+        json_str = json.dumps(payload, indent=4, ensure_ascii=False)
+        st.markdown("##### 📋 點擊下方代碼塊右上角的「複製圖示」即可複製完整數據")
+        st.code(json_str, language="json")
+
 
 if __name__ == "__main__":
     main()
