@@ -59,14 +59,18 @@ def get_taipei_now() -> datetime:
     return datetime.now(pytz.timezone('Asia/Taipei'))
 
 def _safe_float(x, default=0.0):
-    try: return float(x) if x is not None and not pd.isna(x) else default
-    except: return default
+    try: 
+        return float(x) if x is not None and not pd.isna(x) else default
+    except: 
+        return default
 
 def _safe_int(x, default=0):
     try: 
-        if isinstance(x, str): x = x.replace(",", "").strip()
+        if isinstance(x, str): 
+            x = x.replace(",", "").strip()
         return int(float(x))
-    except: return default
+    except: 
+        return default
 
 def _to_roc_date(ymd: str) -> str:
     dt = pd.to_datetime(ymd)
@@ -76,8 +80,10 @@ def get_intraday_progress() -> float:
     now = get_taipei_now()
     start = now.replace(hour=9, minute=0, second=0, microsecond=0)
     end = now.replace(hour=13, minute=30, second=0, microsecond=0)
-    if now < start: return 0.01
-    if now > end: return 1.0
+    if now < start: 
+        return 0.01
+    if now > end: 
+        return 1.0
     return max(0.01, (now - start).total_seconds() / (end - start).total_seconds())
 
 # =========================
@@ -127,7 +133,8 @@ def fetch_blended_amount(trade_date: str) -> MarketAmount:
             tpex_amt = _safe_int(js["aaData"][0][2])
             tpex_src = "TPEX_OFFICIAL_OK"
             tpex_sts = "OK"
-    except: pass
+    except: 
+        pass
 
     # 若官方失敗，採用常數備援
     if tpex_sts == "FAIL":
@@ -164,7 +171,8 @@ def _single_fetch_price_vol(sym: str) -> Tuple[Optional[float], Optional[float]]
                 else:
                     vr = 1.0
                 return float(c.iloc[-1]), vr
-        except: continue
+        except: 
+            continue
     return None, None
 
 def fetch_inst_3d(symbols: List[str], target_date: str, token: str) -> pd.DataFrame:
@@ -184,7 +192,8 @@ def fetch_inst_3d(symbols: List[str], target_date: str, token: str) -> pd.DataFr
                 # 確保只取有資料的最後三天
                 net_sum = float(df.tail(3)["net"].sum())
                 rows.append({"symbol": sym, "net_3d": net_sum})
-        except: pass
+        except: 
+            pass
     return pd.DataFrame(rows)
 
 # =========================
