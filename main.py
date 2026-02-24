@@ -1,14 +1,13 @@
 # main.py
 # =========================================================
-# Sunhero｜股市智能超盤中控台（Predator V16.3.39 風控旗艦版）
+# Sunhero｜股市智能超盤中控台（Predator V16.3.40 機構風控版）
 # =========================================================
-# 整合功能：
-#   (1) [NEW] VIX 邊界防護網 (0 < vix <= 100)，異常即觸發 Kill-Switch
-#   (2) 修正 yfinance API MultiIndex (DataFrame) 報錯崩潰問題
-#   (3) TPEX 官方數據修復 (民國年 115/02/24 格式)
-#   (4) 盤中量能歸一化 (Time-Weighted) + 2mo 歷史均量防呆 (修正 3.27 異常)
-#   (5) 雙鴻(3324)等上櫃股 YF 後綴自動切換 (.TW/.TWO)
-#   (6) 籌碼殭屍熔斷：15:00 前強制歸零
+# 核心架構升級：
+#   (1) 動態信心懲罰 (Confidence Penalty): LOW = 資金上限砍半
+#   (2) 盤中籌碼繼承 (T-1 Fallback): 15:00 前自動使用昨日法人數據
+#   (3) VIX 邊界防護網 (0 < vix <= 100)，防禦資料源污染
+#   (4) 修正 yfinance API MultiIndex 報錯崩潰問題
+#   (5) TPEX 官方數據修復 (民國年 115/02/24 格式) + 盤中量能歸一化
 # =========================================================
 
 from __future__ import annotations
@@ -34,12 +33,12 @@ warnings.filterwarnings('ignore')
 # 1. 初始化與常數
 # =========================
 st.set_page_config(
-    page_title="Sunhero｜Predator V16.3.39",
+    page_title="Sunhero｜Predator V16.3.40",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-APP_TITLE = "Sunhero｜股市智能超盤中控台 (Predator V16.3.39 風控旗艦版)"
+APP_TITLE = "Sunhero｜股市智能超盤中控台 (Predator V16.3.40 機構風控版)"
 st.title(APP_TITLE)
 
 EPS = 1e-4
@@ -49,6 +48,9 @@ DEFAULT_TOPN = 20
 DEFAULT_CASH = 2_000_000
 DEFAULT_EQUITY = 2_000_000
 AUDIT_DIR = "data/audit_market_amount"
+FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
+A_NAMES = {"Foreign_Investor", "Investment_Trust", "Dealer_self", "Dealer_Hedging"}
+
 SMR_WATCH = 0.23
 SMR_CRITICAL = 0.30
 
@@ -62,9 +64,8 @@ STOCK_NAME_MAP = {
 
 COL_TRANSLATION = {
     "Symbol": "代號", "Name": "名稱", "Tier": "權重序", "Price": "價格",
-    "Vol_Ratio": "量能比(Vol Ratio)", "Layer": "分級(Layer)", 
-    "Inst_Status": "籌碼狀態", "Inst_Dir3": "籌碼方向",
-    "Inst_Net_3d": "3日合計淨額", "inst_source": "資料來源"
+    "Vol_Ratio": "預估量能比", "Layer": "分級(Layer)", 
+    "Inst_Status": "籌碼狀態", "Inst_Net_3d": "3日合計淨額(張)"
 }
 
 # =========================
@@ -91,7 +92,7 @@ def _to_roc_date(ymd: str) -> str:
     return f"{dt.year - 1911}/{dt.month:02d}/{dt.day:02d}"
 
 def get_intraday_progress() -> float:
-    """計算台股交易進度 (09:00~13:30)"""
+    """計算台股交易進度 (09:00~13:30)，用於預估全天量能"""
     now = get_taipei_now()
     start = now.replace(hour=9, minute=0, second=0, microsecond=0)
     end = now.replace(hour=13, minute=30, second=0, microsecond=0)
@@ -106,7 +107,7 @@ class WarningBus:
 warnings_bus = WarningBus()
 
 # =========================
-# 3. 數據抓取模組
+# 3. 數據抓取模組 (TPEX, Yahoo, FinMind)
 # =========================
 @dataclass
 class MarketAmount:
@@ -171,10 +172,8 @@ def _single_fetch_price_vol(sym: str) -> Tuple[Optional[float], Optional[float]]
     ticker_base = sym.split(".")[0]
     for suffix in [".TW", ".TWO"]:
         try:
-            # 🔥 修正：使用 2mo 確保過年期間也有充足交易日算 MA20
             df = yf.download(f"{ticker_base}{suffix}", period="2mo", progress=False)
             if not df.empty:
-                # 防禦 MultiIndex 崩潰
                 c_s = df["Close"].iloc[:, 0] if isinstance(df["Close"], pd.DataFrame) else df["Close"]
                 v_s = df["Volume"].iloc[:, 0] if isinstance(df["Volume"], pd.DataFrame) else df["Volume"]
                 
@@ -189,6 +188,43 @@ def _single_fetch_price_vol(sym: str) -> Tuple[Optional[float], Optional[float]]
                 return c, vr
         except: continue
     return None, None
+
+def fetch_finmind_institutional(symbols: List[str], start_date: str, end_date: str, token: Optional[str] = None) -> pd.DataFrame:
+    """ 🔥 恢復 FinMind 籌碼爬蟲 (支援 T-1 盤中繼承) """
+    rows = []
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    for sym in symbols:
+        stock_id = sym.replace(".TW", "").replace(".TWO", "").strip()
+        try:
+            params = {"dataset": "TaiwanStockInstitutionalInvestorsBuySell", "data_id": stock_id, "start_date": start_date, "end_date": end_date}
+            r = requests.get(FINMIND_URL, headers=headers, params=params, timeout=5)
+            if r.status_code == 200:
+                data = r.json().get("data", [])
+                if data:
+                    df = pd.DataFrame(data)
+                    df["buy"] = pd.to_numeric(df.get("buy", 0), errors="coerce").fillna(0)
+                    df["sell"] = pd.to_numeric(df.get("sell", 0), errors="coerce").fillna(0)
+                    df = df[df["name"].isin(A_NAMES)]
+                    df["net"] = df["buy"] - df["sell"]
+                    g = df.groupby("date", as_index=False)["net"].sum()
+                    for _, row in g.iterrows():
+                        rows.append({"date": str(row["date"]), "symbol": sym, "net_amount": float(row["net"])})
+        except: pass
+    return pd.DataFrame(rows) if rows else pd.DataFrame(columns=["date", "symbol", "net_amount"])
+
+def calc_inst_3d(inst_df: pd.DataFrame, symbol: str, target_date: str) -> dict:
+    if inst_df.empty: return {"Inst_Status": "NO_DATA", "Inst_Net_3d": 0.0}
+    df = inst_df[inst_df["symbol"] == symbol].sort_values("date")
+    if df.empty: return {"Inst_Status": "NO_DATA", "Inst_Net_3d": 0.0}
+    
+    # 確認資料有到達 target_date
+    has_target = (df["date"] == target_date).any()
+    if not has_target:
+        return {"Inst_Status": "NO_DATA", "Inst_Net_3d": 0.0}
+        
+    df = df.tail(3)
+    net_sum = float(df["net_amount"].sum())
+    return {"Inst_Status": "READY", "Inst_Net_3d": net_sum}
 
 # =========================
 # 4. 戰略判定與風控熔斷
@@ -217,7 +253,6 @@ def compute_regime_metrics(market_df: pd.DataFrame) -> dict:
     }
 
 def compute_integrity_and_kill(metrics: dict, vix_last: float) -> dict:
-    """ 🔥 新增：核心完整性與異常邊界檢查 (Kill-Switch) """
     kill = False
     reasons = []
     
@@ -225,7 +260,7 @@ def compute_integrity_and_kill(metrics: dict, vix_last: float) -> dict:
         kill = True
         reasons.append("TWII_CLOSE_MISSING")
         
-    # 🔥 VIX 異常防護網
+    # 🔥 VIX 異常防護網 (過濾 1940 這種髒數據)
     vix_invalid = (vix_last <= 0 or vix_last > 100)
     if vix_invalid:
         kill = True
@@ -246,21 +281,33 @@ def pick_regime(metrics: dict, vix: float) -> Tuple[str, float]:
     return "NORMAL", 0.85
 
 def classify_layer(regime, momentum_lock, vol_ratio, inst_status):
-    if inst_status == "NO_UPDATE_TODAY": return "NONE"
+    # 🔥 支援盤中繼承模式 (USING_T_MINUS_1) 參與分級
+    if inst_status not in ["READY", "USING_T_MINUS_1"]: return "NONE"
     if regime in ["CRITICAL_OVERHEAT", "CRASH_RISK", "DATA_FAILURE"]: return "NONE"
     if momentum_lock and vol_ratio and vol_ratio > 1.2: return "B"
     return "NONE"
 
 # =========================
-# 5. 主程序邏輯
+# 5. 主程序邏輯 (機構引擎)
 # =========================
-def build_arbiter_input(session, account_mode, topn, positions, cash, total_equity):
+def build_arbiter_input(session, account_mode, topn, positions, cash, total_equity, finmind_token):
     now = get_taipei_now()
     trade_date = now.strftime("%Y-%m-%d")
     is_using_prev = False
+    
+    # 宏觀時間守衛
     if session == "EOD" and now.hour < 15:
         trade_date = (now - timedelta(days=1)).strftime("%Y-%m-%d")
         is_using_prev = True
+
+    # 🔥 籌碼專屬時間守衛 (T-1 繼承邏輯)
+    inst_date = now.strftime("%Y-%m-%d")
+    is_inst_stale = False
+    if now.hour < 15:
+        prev = now - timedelta(days=1)
+        while prev.weekday() >= 5: prev -= timedelta(days=1)
+        inst_date = prev.strftime("%Y-%m-%d")
+        is_inst_stale = True
 
     # 1. 市場指標與 VIX 防護
     twii_df = yf.download(TWII_SYMBOL, period="2y", progress=False)
@@ -273,33 +320,45 @@ def build_arbiter_input(session, account_mode, topn, positions, cash, total_equi
     else:
         vix_last = 20.0
 
-    # 執行 Kill-Switch 檢查
     integrity = compute_integrity_and_kill(metrics, vix_last)
-    
-    if integrity["kill"]:
-        regime = "DATA_FAILURE"
-        max_eq = 0.0
-        final_confidence = "LOW"
-    else:
-        regime, max_eq = pick_regime(metrics, vix_last)
-        
     amount = fetch_amount_total(trade_date)
     
-    # 若被 Kill-Switch 觸發，覆寫信心等級
-    if not integrity["kill"]:
-        final_confidence = amount.confidence_level
+    # 🔥 動態信心懲罰 (Confidence Penalty) 計算
+    final_confidence = "LOW" if integrity["kill"] else amount.confidence_level
+    confidence_multiplier = 1.0
+    if final_confidence == "MEDIUM": confidence_multiplier = 0.8
+    elif final_confidence == "LOW": confidence_multiplier = 0.5
 
-    # 2. 個股分析
+    if integrity["kill"]:
+        regime = "DATA_FAILURE"
+        final_max_eq = 0.0
+    else:
+        regime, base_max_eq = pick_regime(metrics, vix_last)
+        final_max_eq = base_max_eq * confidence_multiplier # 懲罰打折
+
+    # 2. 個股分析與法人繼承
+    symbols = list(STOCK_NAME_MAP.keys())[:topn]
+    
+    # 執行 FinMind 爬蟲
+    start_date = (pd.to_datetime(inst_date) - pd.Timedelta(days=10)).strftime("%Y-%m-%d")
+    inst_df = fetch_finmind_institutional(symbols, start_date, inst_date, finmind_token)
+    
     progress = get_intraday_progress() if session == "INTRADAY" else 1.0
     stocks = []
-    symbols = list(STOCK_NAME_MAP.keys())[:topn]
     
     for i, sym in enumerate(symbols, start=1):
         price, vr_raw = _single_fetch_price_vol(sym)
         vr_projected = (vr_raw / progress) if vr_raw else None
         
-        inst_status = "READY" if now.hour >= 15 else "NO_UPDATE_TODAY"
-        inst_net = 0.0
+        # 籌碼提取 (T-1 繼承)
+        inst_data_3d = calc_inst_3d(inst_df, sym, inst_date)
+        inst_net = inst_data_3d.get("Inst_Net_3d", 0.0)
+        
+        # 如果是 15:00 前，狀態標記為 USING_T_MINUS_1
+        if is_inst_stale and inst_data_3d.get("Inst_Status") == "READY":
+            inst_status = "USING_T_MINUS_1"
+        else:
+            inst_status = inst_data_3d.get("Inst_Status", "NO_DATA")
         
         layer = classify_layer(regime, metrics.get("MOMENTUM_LOCK"), vr_projected, inst_status)
         
@@ -313,15 +372,20 @@ def build_arbiter_input(session, account_mode, topn, positions, cash, total_equi
     alerts = []
     if integrity["vix_invalid"]:
         alerts.append(f"🚨 CRITICAL: VIX 數值異常 ({vix_last})，已觸發風控強制熔斷！")
+    if final_confidence != "HIGH":
+        alerts.append(f"⚠️ RISK: 數據信心等級為 {final_confidence}，資金上限已自動套用 {confidence_multiplier}x 懲罰折扣。")
+    if is_inst_stale:
+        alerts.append("ℹ️ INFO: 盤中模式啟動，法人籌碼自動繼承 T-1 日 (昨日) 數據做為參考。")
 
     payload = {
         "meta": {
             "timestamp": _now_ts(), "session": session, "market_status": "NORMAL" if not integrity["kill"] else "SHELTER",
             "current_regime": regime, "confidence_level": final_confidence,
+            "confidence_multiplier": confidence_multiplier,
             "is_using_previous_day": is_using_prev, "account_mode": account_mode
         },
         "macro": {
-            "overview": {**metrics, "vix": vix_last, "max_equity_allowed_pct": max_eq, "trade_date": trade_date},
+            "overview": {**metrics, "vix": vix_last, "max_equity_allowed_pct": final_max_eq, "trade_date": trade_date},
             "market_amount": asdict(amount),
             "integrity": integrity
         },
@@ -342,9 +406,12 @@ def main():
     cash = st.sidebar.number_input("現金餘額", value=DEFAULT_CASH)
     equity = st.sidebar.number_input("總權益", value=DEFAULT_EQUITY)
     
+    st.sidebar.subheader("API 授權")
+    finmind_token = st.sidebar.text_input("FinMind Token (盤中籌碼必填)", type="password")
+    
     if st.sidebar.button("🚀 啟動 Predator 引擎") or "payload" not in st.session_state:
-        with st.spinner("正在同步全球數據與執行風控稽核..."):
-            payload, warns = build_arbiter_input(session, mode, topn, [], cash, equity)
+        with st.spinner("正在同步全球數據與執行機構風控稽核..."):
+            payload, warns = build_arbiter_input(session, mode, topn, [], cash, equity, finmind_token)
             st.session_state.payload = payload
             st.session_state.warns = warns
 
@@ -354,10 +421,12 @@ def main():
     # 警報區
     alerts = p["portfolio"].get("active_alerts", [])
     for alert in alerts:
-        st.error(alert)
+        if "CRITICAL" in alert: st.error(alert)
+        elif "RISK" in alert: st.warning(alert)
+        else: st.info(alert)
 
     if p["meta"]["is_using_previous_day"]:
-        st.warning(f"⏰ 開盤保護啟動：盤後數據未更新，目前使用 {ov['trade_date']} 歷史數據。")
+        st.warning(f"⏰ 盤後數據未更新，大盤目前使用 {ov['trade_date']} 歷史數據。")
 
     # 頂部儀表板
     c1, c2, c3, c4 = st.columns(4)
@@ -367,7 +436,10 @@ def main():
     regime_color = "🔴" if "OVERHEAT" in regime or "FAILURE" in regime else ("⚠️" if "REVERSION" in regime else "🟢")
     c2.metric("策略體制 (Regime)", f"{regime_color} {regime}")
     
-    c3.metric("建議持倉上限", f"{ov['max_equity_allowed_pct']*100:.0f}%")
+    # 顯示打折後的上限與折扣係數
+    discount = p["meta"]["confidence_multiplier"]
+    discount_txt = f" (已打 {discount} 折)" if discount < 1.0 else ""
+    c3.metric("建議持倉上限", f"{ov['max_equity_allowed_pct']*100:.1f}%", discount_txt, delta_color="off")
     c4.metric("信心等級", p["meta"]["confidence_level"])
 
     # 大盤詳細數據
@@ -388,8 +460,8 @@ def main():
     df = pd.DataFrame(p["stocks"])
     if not df.empty:
         df['籌碼狀態'] = df['Institutional'].apply(lambda x: x.get('Inst_Status', 'N/A'))
-        df['3日合計淨額'] = df['Institutional'].apply(lambda x: x.get('Inst_Net_3d', 0.0))
-        disp_cols = ["Symbol", "Name", "Price", "Vol_Ratio", "Layer", "籌碼狀態", "3日合計淨額"]
+        df['3日合計淨額(張)'] = df['Institutional'].apply(lambda x: x.get('Inst_Net_3d', 0.0))
+        disp_cols = ["Symbol", "Name", "Price", "Vol_Ratio", "Layer", "籌碼狀態", "3日合計淨額(張)"]
         st.dataframe(df[disp_cols].rename(columns=COL_TRANSLATION), use_container_width=True)
 
     # JSON 複製區
