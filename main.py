@@ -1,13 +1,15 @@
 # main.py
 # =========================================================
-# Sunhero｜股市智能超盤中控台（Predator V16.3.40 機構風控版）
+# Sunhero｜股市智能超盤中控台（Predator V16.3.41 動能雷達版）
 # =========================================================
 # 核心架構升級：
-#   (1) 動態信心懲罰 (Confidence Penalty): LOW = 資金上限砍半
-#   (2) 盤中籌碼繼承 (T-1 Fallback): 15:00 前自動使用昨日法人數據
-#   (3) VIX 邊界防護網 (0 < vix <= 100)，防禦資料源污染
-#   (4) 修正 yfinance API MultiIndex 報錯崩潰問題
-#   (5) TPEX 官方數據修復 (民國年 115/02/24 格式) + 盤中量能歸一化
+#   (1) [NEW] 動能加速度 (Acceleration) 計算與二階導數監控
+#   (2) [NEW] 📡 動能轉折雷達 UI：高檔動能背離 (Top Divergence) 預警
+#   (3) 動態信心懲罰 (Confidence Penalty): LOW = 資金上限砍半
+#   (4) 盤中籌碼繼承 (T-1 Fallback): 15:00 前自動使用昨日法人數據
+#   (5) VIX 邊界防護網 (0 < vix <= 100)，防禦資料源污染
+#   (6) 修正 yfinance API MultiIndex 報錯崩潰問題
+#   (7) TPEX 官方數據修復 (民國年 115/02/24 格式) + 盤中量能歸一化
 # =========================================================
 
 from __future__ import annotations
@@ -33,12 +35,12 @@ warnings.filterwarnings('ignore')
 # 1. 初始化與常數
 # =========================
 st.set_page_config(
-    page_title="Sunhero｜Predator V16.3.40",
+    page_title="Sunhero｜Predator V16.3.41",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-APP_TITLE = "Sunhero｜股市智能超盤中控台 (Predator V16.3.40 機構風控版)"
+APP_TITLE = "Sunhero｜股市智能超盤中控台 (Predator V16.3.41 動能雷達版)"
 st.title(APP_TITLE)
 
 EPS = 1e-4
@@ -107,7 +109,7 @@ class WarningBus:
 warnings_bus = WarningBus()
 
 # =========================
-# 3. 數據抓取模組 (TPEX, Yahoo, FinMind)
+# 3. 數據抓取模組
 # =========================
 @dataclass
 class MarketAmount:
@@ -190,7 +192,6 @@ def _single_fetch_price_vol(sym: str) -> Tuple[Optional[float], Optional[float]]
     return None, None
 
 def fetch_finmind_institutional(symbols: List[str], start_date: str, end_date: str, token: Optional[str] = None) -> pd.DataFrame:
-    """ 🔥 恢復 FinMind 籌碼爬蟲 (支援 T-1 盤中繼承) """
     rows = []
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     for sym in symbols:
@@ -217,7 +218,6 @@ def calc_inst_3d(inst_df: pd.DataFrame, symbol: str, target_date: str) -> dict:
     df = inst_df[inst_df["symbol"] == symbol].sort_values("date")
     if df.empty: return {"Inst_Status": "NO_DATA", "Inst_Net_3d": 0.0}
     
-    # 確認資料有到達 target_date
     has_target = (df["date"] == target_date).any()
     if not has_target:
         return {"Inst_Status": "NO_DATA", "Inst_Net_3d": 0.0}
@@ -227,28 +227,40 @@ def calc_inst_3d(inst_df: pd.DataFrame, symbol: str, target_date: str) -> dict:
     return {"Inst_Status": "READY", "Inst_Net_3d": net_sum}
 
 # =========================
-# 4. 戰略判定與風控熔斷
+# 4. 戰略判定、風控與二階動能
 # =========================
 def compute_regime_metrics(market_df: pd.DataFrame) -> dict:
     if market_df is None or market_df.empty or len(market_df) < 200:
-        return {"twii_close": None, "SMR": None, "Slope5": None}
+        return {"twii_close": None, "SMR": None, "Slope5": None, "Acceleration": 0.0, "Top_Divergence": False}
     
+    # 確保資料降維，防禦 yfinance MultiIndex
     close = market_df["Close"]
     if isinstance(close, pd.DataFrame):
         close = close.iloc[:, 0]
         
     twii_close = float(close.iloc[-1])
+    
+    # 計算乖離率 (SMR)
     ma200 = close.rolling(200).mean()
     smr = (close - ma200) / ma200
-    slope5_raw = smr.diff(5).iloc[-1]
     
-    slope5_val = float(slope5_raw.iloc[0]) if isinstance(slope5_raw, pd.Series) else float(slope5_raw)
-    smr_val = float(smr.iloc[-1].iloc[0]) if isinstance(smr.iloc[-1], pd.Series) else float(smr.iloc[-1])
+    # 🌟 新增：計算二階動能 (Acceleration)
+    slope5_series = smr.diff(5)
+    accel_series = slope5_series.diff(2) # 過去兩天的斜率變化
+    
+    smr_val = float(smr.iloc[-1])
+    slope5_val = float(slope5_series.iloc[-1]) if not pd.isna(slope5_series.iloc[-1]) else 0.0
+    accel_val = float(accel_series.iloc[-1]) if not pd.isna(accel_series.iloc[-1]) else 0.0
+    
+    # 🌟 新增：高檔動能背離判定 (SMR處於高檔，仍在漲，但加速度急遽轉負)
+    top_divergence = bool(smr_val > 0.15 and slope5_val > 0 and accel_val < -0.01)
     
     return {
         "twii_close": twii_close,
         "SMR": smr_val,
-        "Slope5": slope5_val if not pd.isna(slope5_val) else 0.0,
+        "Slope5": slope5_val,
+        "Acceleration": accel_val,
+        "Top_Divergence": top_divergence,
         "MOMENTUM_LOCK": bool(slope5_val > 0)
     }
 
@@ -260,7 +272,7 @@ def compute_integrity_and_kill(metrics: dict, vix_last: float) -> dict:
         kill = True
         reasons.append("TWII_CLOSE_MISSING")
         
-    # 🔥 VIX 異常防護網 (過濾 1940 這種髒數據)
+    # VIX 異常防護網 (過濾 1940 等髒數據)
     vix_invalid = (vix_last <= 0 or vix_last > 100)
     if vix_invalid:
         kill = True
@@ -281,7 +293,7 @@ def pick_regime(metrics: dict, vix: float) -> Tuple[str, float]:
     return "NORMAL", 0.85
 
 def classify_layer(regime, momentum_lock, vol_ratio, inst_status):
-    # 🔥 支援盤中繼承模式 (USING_T_MINUS_1) 參與分級
+    # 支援盤中繼承模式參與分級
     if inst_status not in ["READY", "USING_T_MINUS_1"]: return "NONE"
     if regime in ["CRITICAL_OVERHEAT", "CRASH_RISK", "DATA_FAILURE"]: return "NONE"
     if momentum_lock and vol_ratio and vol_ratio > 1.2: return "B"
@@ -295,12 +307,11 @@ def build_arbiter_input(session, account_mode, topn, positions, cash, total_equi
     trade_date = now.strftime("%Y-%m-%d")
     is_using_prev = False
     
-    # 宏觀時間守衛
     if session == "EOD" and now.hour < 15:
         trade_date = (now - timedelta(days=1)).strftime("%Y-%m-%d")
         is_using_prev = True
 
-    # 🔥 籌碼專屬時間守衛 (T-1 繼承邏輯)
+    # 籌碼專屬時間守衛 (T-1 繼承邏輯)
     inst_date = now.strftime("%Y-%m-%d")
     is_inst_stale = False
     if now.hour < 15:
@@ -323,7 +334,7 @@ def build_arbiter_input(session, account_mode, topn, positions, cash, total_equi
     integrity = compute_integrity_and_kill(metrics, vix_last)
     amount = fetch_amount_total(trade_date)
     
-    # 🔥 動態信心懲罰 (Confidence Penalty) 計算
+    # 動態信心懲罰
     final_confidence = "LOW" if integrity["kill"] else amount.confidence_level
     confidence_multiplier = 1.0
     if final_confidence == "MEDIUM": confidence_multiplier = 0.8
@@ -334,12 +345,11 @@ def build_arbiter_input(session, account_mode, topn, positions, cash, total_equi
         final_max_eq = 0.0
     else:
         regime, base_max_eq = pick_regime(metrics, vix_last)
-        final_max_eq = base_max_eq * confidence_multiplier # 懲罰打折
+        final_max_eq = base_max_eq * confidence_multiplier
 
     # 2. 個股分析與法人繼承
     symbols = list(STOCK_NAME_MAP.keys())[:topn]
     
-    # 執行 FinMind 爬蟲
     start_date = (pd.to_datetime(inst_date) - pd.Timedelta(days=10)).strftime("%Y-%m-%d")
     inst_df = fetch_finmind_institutional(symbols, start_date, inst_date, finmind_token)
     
@@ -350,11 +360,9 @@ def build_arbiter_input(session, account_mode, topn, positions, cash, total_equi
         price, vr_raw = _single_fetch_price_vol(sym)
         vr_projected = (vr_raw / progress) if vr_raw else None
         
-        # 籌碼提取 (T-1 繼承)
         inst_data_3d = calc_inst_3d(inst_df, sym, inst_date)
         inst_net = inst_data_3d.get("Inst_Net_3d", 0.0)
         
-        # 如果是 15:00 前，狀態標記為 USING_T_MINUS_1
         if is_inst_stale and inst_data_3d.get("Inst_Status") == "READY":
             inst_status = "USING_T_MINUS_1"
         else:
@@ -372,6 +380,8 @@ def build_arbiter_input(session, account_mode, topn, positions, cash, total_equi
     alerts = []
     if integrity["vix_invalid"]:
         alerts.append(f"🚨 CRITICAL: VIX 數值異常 ({vix_last})，已觸發風控強制熔斷！")
+    if metrics.get("Top_Divergence"):
+        alerts.append("🚨 預警: 大盤高檔動能背離 (Top Divergence)！加速度已急遽轉負，留意暴跌風險。")
     if final_confidence != "HIGH":
         alerts.append(f"⚠️ RISK: 數據信心等級為 {final_confidence}，資金上限已自動套用 {confidence_multiplier}x 懲罰折扣。")
     if is_inst_stale:
@@ -421,8 +431,8 @@ def main():
     # 警報區
     alerts = p["portfolio"].get("active_alerts", [])
     for alert in alerts:
-        if "CRITICAL" in alert: st.error(alert)
-        elif "RISK" in alert: st.warning(alert)
+        if "CRITICAL" in alert or "🚨" in alert: st.error(alert)
+        elif "RISK" in alert or "⚠️" in alert: st.warning(alert)
         else: st.info(alert)
 
     if p["meta"]["is_using_previous_day"]:
@@ -436,20 +446,35 @@ def main():
     regime_color = "🔴" if "OVERHEAT" in regime or "FAILURE" in regime else ("⚠️" if "REVERSION" in regime else "🟢")
     c2.metric("策略體制 (Regime)", f"{regime_color} {regime}")
     
-    # 顯示打折後的上限與折扣係數
     discount = p["meta"]["confidence_multiplier"]
     discount_txt = f" (已打 {discount} 折)" if discount < 1.0 else ""
     c3.metric("建議持倉上限", f"{ov['max_equity_allowed_pct']*100:.1f}%", discount_txt, delta_color="off")
     c4.metric("信心等級", p["meta"]["confidence_level"])
 
+    # 📡 動能轉折雷達 (新增)
+    st.subheader("📡 動能轉折雷達 (Momentum Radar)")
+    r1, r2, r3, r4 = st.columns(4)
+    r1.metric("SMR 乖離率", f"{ov.get('SMR', 0):.4f}")
+    r2.metric("5日斜率 (Slope5)", f"{ov.get('Slope5', 0):.4f}")
+    
+    accel = ov.get('Acceleration', 0)
+    accel_color = "normal" if accel >= 0 else "inverse"
+    r3.metric("二階加速度 (Accel)", f"{accel:.4f}", delta=f"{accel:.4f}", delta_color=accel_color)
+    
+    if ov.get("Top_Divergence"):
+        r4.error("🚨 高檔動能背離！")
+    else:
+        if accel > 0: r4.success("🚀 動能加速中")
+        elif accel < 0 and ov.get("Slope5", 0) > 0: r4.warning("⚠️ 動能減緩中")
+        else: r4.info("穩定或築底")
+
     # 大盤詳細數據
     st.subheader("📊 大盤觀測站 (TAIEX Overview)")
-    m1, m2, m3, m4 = st.columns(4)
+    m1, m2, m3 = st.columns(3)
     m1.metric("加權指數", f"{ov['twii_close']:,.0f}" if ov['twii_close'] else "N/A")
     m2.metric("VIX 恐慌指數", f"{ov['vix']:.2f}")
-    m3.metric("SMR 乖離率", f"{ov['SMR']:.4f}" if ov['SMR'] else "N/A")
     amt = p["macro"]["market_amount"]["amount_total"]
-    m4.metric("市場總成交額", f"{amt/1e12:.3f} 兆" if amt else "N/A")
+    m3.metric("市場總成交額", f"{amt/1e12:.3f} 兆" if amt else "N/A")
 
     # 成交額稽核
     with st.expander("📌 數據源稽核明細"):
