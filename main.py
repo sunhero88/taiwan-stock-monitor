@@ -1,13 +1,14 @@
 # main.py
 # =========================================================
-# Sunhero｜股市智能超盤中控台（Predator V16.3.38 旗艦合憲版）
+# Sunhero｜股市智能超盤中控台（Predator V16.3.38.1 旗艦合憲版）
 # =========================================================
 # 整合功能：
-#   (1) TPEX 官方數據修復 (民國年 115/02/24 格式)
-#   (2) 盤中量能預估歸一化 (Time-Weighted Volume)
-#   (3) 雙鴻(3324)等上櫃股 YF 後綴自動切換 (.TW/.TWO)
-#   (4) 籌碼殭屍熔斷：15:00 前強制歸零
-#   (5) 全功能 UI：儀表板、警報區、法人明細、AI JSON 複製
+#   (1) 修正 yfinance API 改版造成的 MultiIndex (DataFrame) 報錯崩潰問題
+#   (2) TPEX 官方數據修復 (民國年 115/02/24 格式)
+#   (3) 盤中量能預估歸一化 (Time-Weighted Volume)
+#   (4) 雙鴻(3324)等上櫃股 YF 後綴自動切換 (.TW/.TWO)
+#   (5) 籌碼殭屍熔斷：15:00 前強制歸零
+#   (6) 全功能 UI：儀表板、警報區、法人明細、AI JSON 複製
 # =========================================================
 
 from __future__ import annotations
@@ -33,12 +34,12 @@ warnings.filterwarnings('ignore')
 # 1. 初始化與常數
 # =========================
 st.set_page_config(
-    page_title="Sunhero｜Predator V16.3.38",
+    page_title="Sunhero｜Predator V16.3.38.1",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-APP_TITLE = "Sunhero｜股市智能超盤中控台 (Predator V16.3.38 最終修復版)"
+APP_TITLE = "Sunhero｜股市智能超盤中控台 (Predator V16.3.38.1 最終修復版)"
 st.title(APP_TITLE)
 
 EPS = 1e-4
@@ -105,7 +106,7 @@ class WarningBus:
 warnings_bus = WarningBus()
 
 # =========================
-# 3. 數據抓取模組 (TPEX 核心修正)
+# 3. 數據抓取模組 (TPEX & Yahoo API 修復)
 # =========================
 @dataclass
 class MarketAmount:
@@ -145,6 +146,18 @@ def fetch_amount_total(trade_date: str) -> MarketAmount:
     tpex_amt, tpex_src, tpex_sts = _fetch_tpex_official(trade_date)
     
     if not tpex_amt:
+        try:
+            url = "https://histock.tw/index/TWO"
+            r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
+            soup = BeautifulSoup(r.text, 'html.parser')
+            for li in soup.find_all("li"):
+                if "成交金額" in li.text:
+                    num = re.search(r'([\d,]+\.?\d*)', li.text).group(1).replace(",", "")
+                    tpex_amt, tpex_src, tpex_sts = int(float(num) * 100_000_000), "HISTOCK_WEB", "OK"
+                    break
+        except: pass
+
+    if not tpex_amt:
         tpex_amt = 200_000_000_000
         tpex_src = "TPEX_SAFE_MODE_200B"
         tpex_sts = "ESTIMATED"
@@ -161,29 +174,43 @@ def _single_fetch_price_vol(sym: str) -> Tuple[Optional[float], Optional[float]]
         try:
             df = yf.download(f"{ticker_base}{suffix}", period="1mo", progress=False)
             if not df.empty:
-                c = df["Close"].iloc[-1]
-                v = df["Volume"].iloc[-1]
-                ma20 = df["Volume"].rolling(20).mean().iloc[-1]
-                return float(c), float(v/ma20) if ma20 > 0 else 1.0
+                # 🔥 修復 yfinance MultiIndex 問題
+                c_s = df["Close"].iloc[:, 0] if isinstance(df["Close"], pd.DataFrame) else df["Close"]
+                v_s = df["Volume"].iloc[:, 0] if isinstance(df["Volume"], pd.DataFrame) else df["Volume"]
+                
+                c = float(c_s.iloc[-1])
+                v = float(v_s.iloc[-1])
+                ma20 = float(v_s.rolling(20).mean().iloc[-1])
+                return c, float(v/ma20) if ma20 > 0 else 1.0
         except: continue
     return None, None
 
 # =========================
-# 4. 戰略判定 (Layer A/B/C)
+# 4. 戰略判定 (Layer A/B/C) 降維防禦版
 # =========================
 def compute_regime_metrics(market_df: pd.DataFrame) -> dict:
     if market_df is None or market_df.empty or len(market_df) < 200:
         return {"twii_close": None, "SMR": None, "Slope5": None}
+    
+    # 🔥 修復 yfinance 新版 MultiIndex 問題：強制降維成 1D Series
     close = market_df["Close"]
+    if isinstance(close, pd.DataFrame):
+        close = close.iloc[:, 0]
+        
     twii_close = float(close.iloc[-1])
     ma200 = close.rolling(200).mean()
     smr = (close - ma200) / ma200
-    slope5 = smr.diff(5).iloc[-1]
+    slope5_raw = smr.diff(5).iloc[-1]
+    
+    # 確保提煉出純淨的標量數值 (Scalar float)
+    slope5_val = float(slope5_raw.iloc[0]) if isinstance(slope5_raw, pd.Series) else float(slope5_raw)
+    smr_val = float(smr.iloc[-1].iloc[0]) if isinstance(smr.iloc[-1], pd.Series) else float(smr.iloc[-1])
+    
     return {
         "twii_close": twii_close,
-        "SMR": float(smr.iloc[-1]),
-        "Slope5": float(slope5) if not pd.isna(slope5) else 0,
-        "MOMENTUM_LOCK": bool(slope5 > 0)
+        "SMR": smr_val,
+        "Slope5": slope5_val if not pd.isna(slope5_val) else 0.0,
+        "MOMENTUM_LOCK": bool(slope5_val > 0)
     }
 
 def pick_regime(metrics: dict, vix: float) -> Tuple[str, float]:
@@ -218,7 +245,13 @@ def build_arbiter_input(session, account_mode, topn, positions, cash, total_equi
     twii_df = yf.download(TWII_SYMBOL, period="2y", progress=False)
     metrics = compute_regime_metrics(twii_df)
     vix_df = yf.download(VIX_SYMBOL, period="1mo", progress=False)
-    vix_last = vix_df["Close"].iloc[-1] if not vix_df.empty else 20.0
+    
+    # 🔥 VIX 同樣需要防禦 MultiIndex
+    if not vix_df.empty:
+        v_close = vix_df["Close"].iloc[:, 0] if isinstance(vix_df["Close"], pd.DataFrame) else vix_df["Close"]
+        vix_last = float(v_close.iloc[-1])
+    else:
+        vix_last = 20.0
     
     regime, max_eq = pick_regime(metrics, vix_last)
     amount = fetch_amount_total(trade_date)
@@ -256,13 +289,13 @@ def build_arbiter_input(session, account_mode, topn, positions, cash, total_equi
             "integrity": {"kill": (metrics["twii_close"] is None), "reason": "OK"}
         },
         "stocks": stocks,
-        "institutional_panel": [s for s in stocks], # 簡化面版
+        "institutional_panel": [{"Symbol": s["Symbol"], "Inst_Status": s["Institutional"]["Inst_Status"], "Inst_Net_3d": s["Institutional"]["Inst_Net_3d"]} for s in stocks],
         "portfolio": {"total_equity": total_equity, "cash_balance": cash, "active_alerts": []}
     }
     return payload, warnings_bus.latest()
 
 # =========================
-# 6. UI 美化部分 (恢復完整版)
+# 6. UI 美化儀表板
 # =========================
 def main():
     st.sidebar.header("⚙️ 設定")
@@ -289,7 +322,7 @@ def main():
     c1.metric("交易日期", ov["trade_date"])
     
     regime = p["meta"]["current_regime"]
-    regime_color = "🔴" if "OVERHEAT" in regime else "🟢"
+    regime_color = "🔴" if "OVERHEAT" in regime else ("⚠️" if "REVERSION" in regime else "🟢")
     c2.metric("策略體制 (Regime)", f"{regime_color} {regime}")
     
     c3.metric("建議持倉上限", f"{ov['max_equity_allowed_pct']*100:.0f}%")
@@ -311,11 +344,10 @@ def main():
     # 個股清單
     st.subheader("🎯 核心持股雷達 (Tactical Stocks)")
     df = pd.DataFrame(p["stocks"])
-    # 美化表格顯示
     if not df.empty:
         # 展開 Institutional 字典
-        df['籌碼狀態'] = df['Institutional'].apply(lambda x: x['Inst_Status'])
-        df['3日合計淨額'] = df['Institutional'].apply(lambda x: x['Inst_Net_3d'])
+        df['籌碼狀態'] = df['Institutional'].apply(lambda x: x.get('Inst_Status', 'N/A'))
+        df['3日合計淨額'] = df['Institutional'].apply(lambda x: x.get('Inst_Net_3d', 0.0))
         disp_cols = ["Symbol", "Name", "Price", "Vol_Ratio", "Layer", "籌碼狀態", "3日合計淨額"]
         st.dataframe(df[disp_cols].rename(columns=COL_TRANSLATION), use_container_width=True)
 
