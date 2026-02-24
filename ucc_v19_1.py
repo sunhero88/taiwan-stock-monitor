@@ -1,799 +1,641 @@
 # main.py
 # =========================================================
 # Sunhero｜股市智能超盤中控台（Predator + UCC V19.1）
-# FINAL HARDENED BUILD (一次到位：避免反覆改來改去)
+# SINGLE-FILE FINAL HARDENED BUILD (避免循環 import / 反覆改)
 # Date: 2026-02-24
 #
-# ✅ 目標：
-# - SMR 計算穩健：抓不到就明確 reason，不用假數據
-# - 價格抓取防污染：不沿用殘值 + 重試 + 同價群偵測
-# - 成交金額估算留痕：TWSE/TPEX ESTIMATED 透明稽核 + 風險懲罰
-# - UI：
-#   (1) RUN L1/L2/L3 切換 + 顯示 UCC 輸出
-#   (2) 盤中是否允許當日法人資料（以及 Token 強制）
-#   (3) 嚴格價格污染模式（同價群>=3且價>50）
-#   (4) DATA_FAILURE 軟鎖 5%（可選）
+# ✅ 功能
+# - Streamlit UI：RUN L1/L2/L3 切換
+# - UI 開關：「盤中是否允許當日法人資料」
+# - Payload 補齊：max_equity_allowed_pct、market_status_reason、confidence 多維欄位、policy 欄位
+# - UCC 引擎：L1 / L2 / L3 單次只輸出一個模式結果
+#
+# ✅ 設計原則（對齊你的鐵律）
+# - JSON 是唯一資料來源（UCC 只讀 payload，不猜、不補）
+# - path=value 證據輸出
+# - 不確定就降級（NO TRADE / 高風險）
 # =========================================================
 
+from __future__ import annotations
+
 import json
-import time
-import warnings
-from dataclasses import dataclass, asdict
+import re
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
-import numpy as np
-import pandas as pd
-import pytz
-import requests
 import streamlit as st
-import yfinance as yf
 
-from ucc_v19_1 import UCCv19_1
-
-warnings.filterwarnings("ignore")
-
-st.set_page_config(page_title="Sunhero｜Predator + UCC", layout="wide", initial_sidebar_state="expanded")
-APP_TITLE = "Sunhero｜股市智能超盤中控台 (Predator + UCC V19.1)"
-
-TWII_SYMBOL = "^TWII"
-VIX_SYMBOL = "^VIX"
-FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
-
-SMR_OVERHEAT = 0.30
-SMR_BLOW_OFF = 0.33
-
-SYMBOLS_TOP20 = [
-    "2330.TW", "2317.TW", "2454.TW", "2308.TW", "2382.TW",
-    "3231.TW", "2376.TW", "3017.TW", "3324.TW", "3661.TW",
-    "2881.TW", "2882.TW", "2891.TW", "2886.TW", "2603.TW",
-    "2609.TW", "1605.TW", "1513.TW", "1519.TW", "2002.TW"
-]
-
-STOCK_NAME_MAP = {
-    "2330.TW": "台積電", "2317.TW": "鴻海", "2454.TW": "聯發科", "2308.TW": "台達電",
-    "2382.TW": "廣達", "3231.TW": "緯創", "2376.TW": "技嘉", "3017.TW": "奇鋐",
-    "3324.TW": "雙鴻", "3661.TW": "世芯-KY", "2881.TW": "富邦金", "2882.TW": "國泰金",
-    "2891.TW": "中信金", "2886.TW": "兆豐金", "2603.TW": "長榮", "2609.TW": "陽明",
-    "1605.TW": "華新", "1513.TW": "中興電", "1519.TW": "華城", "2002.TW": "中鋼"
-}
+Json = Dict[str, Any]
 
 
 # -----------------------------
-# Time helpers
+# 小工具：安全取值 + path=value
 # -----------------------------
-def get_taipei_now() -> datetime:
-    return datetime.now(pytz.timezone("Asia/Taipei"))
-
-
-def last_trading_day(d: datetime) -> str:
-    x = d
-    while x.weekday() >= 5:
-        x -= timedelta(days=1)
-    return x.strftime("%Y-%m-%d")
-
-
-def get_intraday_progress() -> float:
+def jget(d: Any, path: str, default=None):
     """
-    用於盤中 vol_ratio 粗略校正（避免盤中量能比率被低估/高估太離譜）
+    支援 dot path：a.b.c
+    不支援 [*] 語法（迭代請在外層做）
     """
-    now = get_taipei_now()
-    start = now.replace(hour=9, minute=0, second=0, microsecond=0)
-    end = now.replace(hour=13, minute=30, second=0, microsecond=0)
-    if now < start:
-        return 0.01
-    if now > end:
-        return 1.0
-    return max(0.01, (now - start).total_seconds() / (end - start).total_seconds())
+    cur = d
+    for k in path.split("."):
+        if isinstance(cur, dict) and k in cur:
+            cur = cur[k]
+        else:
+            return default
+    return cur
+
+
+def jhas(d: Any, path: str) -> bool:
+    sentinel = object()
+    return jget(d, path, sentinel) is not sentinel
+
+
+def pv(d: Any, path: str) -> str:
+    """path=value 字串（value 以 json 風格顯示）"""
+    val = jget(d, path, None)
+    return f"{path}={json.dumps(val, ensure_ascii=False)}"
+
+
+def safe_parse_date(s: Any) -> Optional[datetime]:
+    if not isinstance(s, str) or not s.strip():
+        return None
+    for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(s, fmt)
+        except Exception:
+            continue
+    return None
+
+
+def clamp01(x: float) -> float:
+    return max(0.0, min(1.0, x))
 
 
 # -----------------------------
-# Safe cast
+# Payload Patch（UI用：明示補齊）
 # -----------------------------
-def _safe_float(x, default=None):
-    try:
-        if x is None:
-            return default
-        v = float(x)
-        if np.isnan(v):
-            return default
-        return v
-    except:
-        return default
-
-
-def _safe_int(x, default=0):
-    try:
-        if isinstance(x, str):
-            x = x.replace(",", "").strip()
-        return int(float(x))
-    except:
-        return default
-
-
-def _to_roc_date(ymd: str) -> str:
-    dt = pd.to_datetime(ymd)
-    return f"{dt.year - 1911}/{dt.month:02d}/{dt.day:02d}"
-
-
-# =========================================================
-# 1) HARDENED: Index fetch + validation
-# =========================================================
-def validate_vix(v: Optional[float]) -> Optional[float]:
-    # 合理範圍護欄：0 < VIX <= 100
-    if v is None:
-        return None
-    try:
-        v = float(v)
-        if v <= 0 or v > 100:
-            return None
-        return v
-    except:
-        return None
-
-
-def validate_twii_close(x: Optional[float]) -> Optional[float]:
-    # 防污染：避免 0 / NaN / 明顯怪值
+def ensure_list(x) -> List[Any]:
     if x is None:
-        return None
-    try:
-        x = float(x)
-        if x < 5000 or x > 100000:
-            return None
+        return []
+    if isinstance(x, list):
         return x
-    except:
-        return None
+    return [x]
 
 
-def _yf_download_df(symbol: str, period: str) -> Optional[pd.DataFrame]:
-    try:
-        df = yf.download(symbol, period=period, progress=False)
-        if df is None or df.empty:
-            return None
-        return df
-    except:
-        return None
-
-
-def _yf_history_df(symbol: str, period: str) -> Optional[pd.DataFrame]:
-    try:
-        t = yf.Ticker(symbol)
-        df = t.history(period=period, interval="1d", auto_adjust=False)
-        if df is None or df.empty:
-            return None
-        df = df.reset_index(drop=False)
-        if "Close" not in df.columns:
-            return None
-        df = df.set_index(df.columns[0])  # Date / Datetime
-        return df
-    except:
-        return None
-
-
-def _last_close(df: Optional[pd.DataFrame]) -> Optional[float]:
-    if df is None or df.empty:
-        return None
-    try:
-        c = df["Close"]
-        if isinstance(c, pd.DataFrame):
-            c = c.iloc[:, 0]
-        c = pd.to_numeric(c, errors="coerce").dropna()
-        if c.empty:
-            return None
-        return float(c.iloc[-1])
-    except:
-        return None
-
-
-def fetch_twii_df_and_vix_hardened(retry: int = 3) -> Tuple[Optional[pd.DataFrame], Optional[float], List[str]]:
+def patch_payload_for_ui(payload: Json, allow_same_day_inst: bool, enforce_token_when_same_day: bool) -> Tuple[Json, List[str]]:
     """
-    回 (twii_df, vix, reasons)
-    reasons 用於 meta.market_status_reason
+    這個 patch 是「UI 幫你補齊欄位/治理欄位」用。
+    注意：這不是 UCC 引擎補資料；是你在產生/整理 payload 的前處理。
     """
-    reasons: List[str] = []
-    twii_df = None
-    vix_val = None
+    p = json.loads(json.dumps(payload, ensure_ascii=False))  # deep copy
+    notes: List[str] = []
 
-    for k in range(retry):
-        if twii_df is None:
-            df = _yf_download_df(TWII_SYMBOL, period="5y")
-            if df is None:
-                df = _yf_history_df(TWII_SYMBOL, period="5y")
-            if df is not None:
-                c = pd.to_numeric(
-                    df["Close"] if not isinstance(df["Close"], pd.DataFrame) else df["Close"].iloc[:, 0],
-                    errors="coerce"
-                ).dropna()
-                if len(c) >= 260:
-                    twii_df = df
-                else:
-                    twii_df = None
+    # meta 基礎欄位
+    p.setdefault("meta", {})
+    p["meta"].setdefault("market_status_reason", [])
+    p["meta"]["market_status_reason"] = ensure_list(p["meta"].get("market_status_reason"))
 
-        if vix_val is None:
-            vix_df = _yf_download_df(VIX_SYMBOL, period="3mo")
-            if vix_df is None:
-                vix_df = _yf_history_df(VIX_SYMBOL, period="3mo")
-            vix_raw = _last_close(vix_df)
-            vix_val = validate_vix(vix_raw)
+    p["meta"].setdefault("confidence", {"price": "LOW", "volume": "LOW", "institutional": "LOW"})
+    if not isinstance(p["meta"]["confidence"], dict):
+        p["meta"]["confidence"] = {"price": "LOW", "volume": "LOW", "institutional": "LOW"}
+        notes.append("meta.confidence 非 dict → 已重置為預設 dict")
 
-        if twii_df is not None and vix_val is not None:
-            break
+    p["meta"].setdefault("max_equity_lock_reason", [])
+    p["meta"]["max_equity_lock_reason"] = ensure_list(p["meta"].get("max_equity_lock_reason"))
 
-        time.sleep(0.25 * (k + 1))
+    # macro.overview.max_equity_allowed_pct
+    p.setdefault("macro", {})
+    p["macro"].setdefault("overview", {})
+    if not jhas(p, "macro.overview.max_equity_allowed_pct"):
+        # 保守：缺就補 0.0（等同 NO TRADE）
+        p["macro"]["overview"]["max_equity_allowed_pct"] = 0.0
+        p["meta"]["max_equity_lock_reason"].append("MAX_EQUITY_MISSING_DEFAULT_0")
+        notes.append("缺少 macro.overview.max_equity_allowed_pct → UI 保守補 0.0 並鎖倉")
 
-    twii_close = validate_twii_close(_last_close(twii_df))
-    if twii_df is None or twii_close is None:
-        reasons.append("TWII_SERIES_TOO_SHORT_OR_INVALID")
-        twii_df = None
+    # policy（盤中法人資料）
+    p["meta"].setdefault("intraday_institutional_policy", {})
+    pol = p["meta"]["intraday_institutional_policy"]
+    if not isinstance(pol, dict):
+        pol = {}
+        p["meta"]["intraday_institutional_policy"] = pol
 
-    if vix_val is None:
-        reasons.append("VIX_MISSING_OR_INVALID")
+    # 以 UI 開關覆寫治理欄位（明確可稽核）
+    pol["allow_same_day"] = bool(allow_same_day_inst)
+    pol["enforce_token_when_same_day"] = bool(enforce_token_when_same_day)
 
-    return twii_df, vix_val, reasons
+    eff_trade = p["meta"].get("effective_trade_date")
+    eff_dt = safe_parse_date(eff_trade)
 
+    # resolved_use_same_day：只有當 session=INTRADAY 且 allow_same_day 才可能 true
+    session = p["meta"].get("session", "")
+    if session == "INTRADAY" and allow_same_day_inst:
+        # 若要求 token 且偵測到「空 token」來源標記，則強制 resolved false
+        token_problem = False
+        if enforce_token_when_same_day:
+            for i, s in enumerate(p.get("stocks", []) or []):
+                src = jget(s, "Institutional.inst_source", "")
+                if isinstance(src, str) and "EMPTY_TOKEN" in src:
+                    token_problem = True
+                    notes.append(f"stocks[{i}].Institutional.inst_source={src} → SAME_DAY 需要 token，resolved_use_same_day 將被關閉")
+                    break
+        pol["resolved_use_same_day"] = False if token_problem else True
+    else:
+        pol["resolved_use_same_day"] = False
 
-# =========================================================
-# 2) HARDENED: Regime metrics (SMR)
-# =========================================================
-def compute_regime_metrics_hardened(twii_df: Optional[pd.DataFrame]) -> Tuple[dict, List[str]]:
-    reasons: List[str] = []
+    # inst_effective_date：僅做治理欄位補齊（不改 stocks 內容）
+    # 若 is_using_previous_day=true → 預設 inst_effective_date = effective_trade_date（你本來就設為前一日）
+    if isinstance(eff_dt, datetime):
+        pol.setdefault("inst_effective_date", eff_dt.strftime("%Y-%m-%d"))
+    else:
+        pol.setdefault("inst_effective_date", None)
 
-    if twii_df is None or twii_df.empty:
-        reasons.append("SMR_INPUT_TWII_DF_MISSING")
-        return {
-            "twii_close": None, "SMR": None, "Slope5": None, "Acceleration": None,
-            "Top_Divergence": False, "Blow_Off_Phase": False, "MOMENTUM_LOCK": False
-        }, reasons
-
-    try:
-        c = twii_df["Close"]
-        if isinstance(c, pd.DataFrame):
-            c = c.iloc[:, 0]
-        c = pd.to_numeric(c, errors="coerce").dropna()
-
-        if len(c) < 260:
-            reasons.append("TWII_SERIES_TOO_SHORT_FOR_SMR")
-            twii_close = validate_twii_close(float(c.iloc[-1])) if len(c) else None
-            return {
-                "twii_close": twii_close, "SMR": None, "Slope5": None, "Acceleration": None,
-                "Top_Divergence": False, "Blow_Off_Phase": False, "MOMENTUM_LOCK": False
-            }, reasons
-
-        twii_close = validate_twii_close(float(c.iloc[-1]))
-        if twii_close is None:
-            reasons.append("TWII_CLOSE_INVALID")
-            return {
-                "twii_close": None, "SMR": None, "Slope5": None, "Acceleration": None,
-                "Top_Divergence": False, "Blow_Off_Phase": False, "MOMENTUM_LOCK": False
-            }, reasons
-
-        ma200 = c.rolling(200).mean()
-        smr_series = (c - ma200) / ma200
-        slope5_series = smr_series.diff(5)
-        accel_series = slope5_series.diff(2)
-
-        smr_valid = pd.to_numeric(smr_series, errors="coerce").dropna()
-        slope5_valid = pd.to_numeric(slope5_series, errors="coerce").dropna()
-        accel_valid = pd.to_numeric(accel_series, errors="coerce").dropna()
-
-        smr = float(smr_valid.iloc[-1]) if not smr_valid.empty else None
-        slope5 = float(slope5_valid.iloc[-1]) if not slope5_valid.empty else None
-        accel = float(accel_valid.iloc[-1]) if not accel_valid.empty else None
-
-        if smr is None:
-            reasons.append("SMR_CALC_RESULT_NA")
-
-        bop = bool(smr is not None and slope5 is not None and (smr >= SMR_BLOW_OFF) and (slope5 >= 0.08))
-        top_div = bool(smr is not None and slope5 is not None and accel is not None and
-                       (smr > 0.15) and (slope5 > 0) and (accel < -0.01))
-        mom_lock = bool(slope5 is not None and slope5 > 0)
-
-        return {
-            "twii_close": twii_close,
-            "SMR": smr,
-            "Slope5": slope5,
-            "Acceleration": accel,
-            "Top_Divergence": top_div,
-            "Blow_Off_Phase": bop,
-            "MOMENTUM_LOCK": mom_lock
-        }, reasons
-
-    except:
-        reasons.append("SMR_EXCEPTION")
-        return {
-            "twii_close": None, "SMR": None, "Slope5": None, "Acceleration": None,
-            "Top_Divergence": False, "Blow_Off_Phase": False, "MOMENTUM_LOCK": False
-        }, reasons
+    return p, notes
 
 
-# =========================================================
-# 3) Market amount (TWSE/TPEX) - with audit trail
-# =========================================================
+# -----------------------------
+# UCC V19.1 引擎（單檔內嵌）
+# -----------------------------
 @dataclass
-class MarketAmount:
-    amount_twse: int
-    amount_tpex: int
-    amount_total_raw: int
-    amount_total_blended: int
-    source_twse: str
-    source_tpex: str
-    status_twse: str
-    status_tpex: str
-    confidence_level: str
+class L1Result:
+    mode: str
+    verdict: str
+    risk_level: str
+    fatal_issues: List[str]
+    structural_warnings: List[str]
+    audit_confidence: str
 
 
-def fetch_blended_amount(trade_date: str) -> Tuple[MarketAmount, List[str]]:
-    reasons: List[str] = []
-    ymd = trade_date.replace("-", "")
-
-    # TWSE
-    twse_amt = 0
-    twse_src = "TWSE_FAIL"
-    twse_sts = "FAIL"
-    try:
-        url_twse = f"https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL?response=json&date={ymd}"
-        r = requests.get(url_twse, timeout=5, verify=False, headers={"User-Agent": "Mozilla/5.0"})
-        js = r.json()
-        if "data" in js and js["data"]:
-            twse_amt = sum(_safe_int(row[3], 0) for row in js["data"])
-            twse_src = "TWSE_OK:AUDIT_SUM"
-            twse_sts = "OK"
-        else:
-            raise RuntimeError("TWSE_EMPTY")
-    except:
-        twse_amt = 950_000_000_000
-        twse_src = "TWSE_SAFE_MODE"
-        twse_sts = "ESTIMATED"
-        reasons.append("TWSE_ESTIMATED")
-
-    # TPEX
-    tpex_amt = 0
-    tpex_src = "TPEX_FAIL"
-    tpex_sts = "FAIL"
-    try:
-        roc = _to_roc_date(trade_date)
-        url_tpex = f"https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw&d={roc}&se=EW"
-        r = requests.get(url_tpex, timeout=5, verify=False, headers={"User-Agent": "Mozilla/5.0"})
-        js = r.json()
-        if "aaData" in js and js["aaData"]:
-            tpex_amt = _safe_int(js["aaData"][0][2], 0)
-            tpex_src = "TPEX_OFFICIAL_OK"
-            tpex_sts = "OK"
-        else:
-            raise RuntimeError("TPEX_EMPTY")
-    except:
-        tpex_amt = 200_000_000_000
-        tpex_src = "TPEX_SAFE_MODE_200B"
-        tpex_sts = "ESTIMATED"
-        reasons.append("TPEX_ESTIMATED")
-
-    conf = "HIGH" if (twse_sts == "OK" and tpex_sts == "OK") else "LOW"
-    if conf == "LOW":
-        reasons.append("AMOUNT_CONF_LOW")
-
-    raw_total = twse_amt
-    blended_total = twse_amt + tpex_amt
-
-    return MarketAmount(
-        amount_twse=twse_amt,
-        amount_tpex=tpex_amt,
-        amount_total_raw=raw_total,
-        amount_total_blended=blended_total,
-        source_twse=twse_src,
-        source_tpex=tpex_src,
-        status_twse=twse_sts,
-        status_tpex=tpex_sts,
-        confidence_level=conf
-    ), reasons
-
-
-# =========================================================
-# 4) Stock price & vol ratio (anti-drift)
-# =========================================================
-def fetch_stock_price_vol_hardened(sym: str, retry: int = 2) -> Tuple[Optional[float], Optional[float], bool]:
+class UCCv19_1:
     """
-    回 (price, vol_ratio, success)
-    - success=True 表示抓到合理 price
+    Predator UCC V19.1 Hardened Final Lockdown
+    - JSON-only
+    - path=value evidence
+    - single-mode output
     """
-    for k in range(retry + 1):
-        df = _yf_download_df(sym, period="3mo")
-        if df is None or df.empty:
-            df = _yf_history_df(sym, period="3mo")
 
-        if df is not None and not df.empty and "Close" in df.columns and "Volume" in df.columns:
-            try:
-                c = df["Close"]
-                v = df["Volume"]
-                if isinstance(c, pd.DataFrame):
-                    c = c.iloc[:, 0]
-                if isinstance(v, pd.DataFrame):
-                    v = v.iloc[:, 0]
+    def __init__(self) -> None:
+        pass
 
-                c = pd.to_numeric(c, errors="coerce").dropna()
-                v = pd.to_numeric(v, errors="coerce").dropna()
+    # --------------- V17 / V18 / V19 ---------------
+    def _v17_wartime_triggered(self, payload: Json) -> Tuple[bool, List[str]]:
+        reasons = []
+        if jget(payload, "meta.war_time_override", False) is True:
+            reasons.append(pv(payload, "meta.war_time_override"))
+        regime = str(jget(payload, "meta.current_regime", "") or "")
+        if re.search(r"\b(WAR|CRISIS)\b", regime, re.IGNORECASE):
+            reasons.append(pv(payload, "meta.current_regime"))
+        return (len(reasons) > 0), reasons
 
-                if c.empty:
-                    raise RuntimeError("EMPTY_CLOSE")
+    def _v19_constitution_guard(self, requested_mode: str, l1_verdict: Optional[str]) -> Tuple[bool, List[str]]:
+        """
+        只做「流程違憲」檢查（不能跳過 L1）
+        """
+        issues = []
+        if requested_mode in ("L2", "L3") and l1_verdict != "PASS":
+            issues.append(f"流程違憲：requested={requested_mode} 但 L1.verdict={l1_verdict}（不得跳過 L1）")
+        return (len(issues) > 0), issues
 
-                price = float(c.iloc[-1])
-                if not np.isfinite(price) or price <= 0:
-                    raise RuntimeError("BAD_PRICE")
+    # --------------- L1：資料審計 ---------------
+    def run_l1(self, payload: Json) -> L1Result:
+        fatal: List[str] = []
+        warn: List[str] = []
 
-                if len(v) >= 20:
-                    v20 = v.tail(20)
-                    ma20 = float(v20.mean()) if float(v20.mean()) > 0 else None
-                    vr = float(v.iloc[-1] / ma20) if ma20 else 1.0
-                else:
-                    vr = 1.0
+        # 3.1 致命條件
+        if not jhas(payload, "macro.overview.twii_close") or jget(payload, "macro.overview.twii_close") is None:
+            fatal.append(f"致命：大盤收盤價缺失/為 null → {pv(payload, 'macro.overview.twii_close')}")
+        if jget(payload, "macro.integrity.kill", False) is True:
+            fatal.append(f"致命：kill=true → {pv(payload, 'macro.integrity.kill')}")
 
-                return price, vr, True
-            except:
-                pass
+        # NO_UPDATE_TODAY 但 Inst_Net_3d 仍有數值（0.0 也算）
+        stocks = payload.get("stocks") or []
+        for i, s in enumerate(stocks):
+            inst_status = jget(s, "Institutional.Inst_Status", None)
+            inst_net_3d = jget(s, "Institutional.Inst_Net_3d", None)
+            if inst_status == "NO_UPDATE_TODAY" and inst_net_3d is not None:
+                fatal.append(
+                    f"致命：法人狀態 NO_UPDATE_TODAY 但仍有 Inst_Net_3d → "
+                    f"stocks[{i}].Institutional.Inst_Status={json.dumps(inst_status, ensure_ascii=False)}; "
+                    f"stocks[{i}].Institutional.Inst_Net_3d={json.dumps(inst_net_3d, ensure_ascii=False)}"
+                )
 
-        time.sleep(0.15 * (k + 1))
-
-    return None, None, False
-
-
-def detect_price_duplicate_cluster(
-    stocks: List[Dict[str, Any]],
-    min_cluster: int = 3,
-    min_price: float = 50.0
-) -> Dict[float, List[str]]:
-    """
-    找出同價群（價格完全相同）且群聚 >= min_cluster，且 price >= min_price
-    回 {price: [symbols]}
-    """
-    bucket: Dict[float, List[str]] = {}
-    for s in stocks:
-        p = s.get("Price")
-        sym = s.get("Symbol")
-        if p is None or sym is None:
-            continue
-        try:
-            p = float(p)
-            if p < min_price:
-                continue
-            bucket.setdefault(p, []).append(sym)
-        except:
-            continue
-
-    return {p: syms for p, syms in bucket.items() if len(syms) >= min_cluster}
-
-
-# =========================================================
-# 5) FinMind Institutional
-# =========================================================
-def fetch_inst_3d(symbols: List[str], target_date: str, token: str) -> pd.DataFrame:
-    rows = []
-    headers = {"Authorization": f"Bearer {token}"} if token else {}
-    start_date = (pd.to_datetime(target_date) - pd.Timedelta(days=10)).strftime("%Y-%m-%d")
-
-    for sym in symbols:
-        stock_id = sym.replace(".TW", "").replace(".TWO", "")
-        try:
-            params = {
-                "dataset": "TaiwanStockInstitutionalInvestorsBuySell",
-                "data_id": stock_id,
-                "start_date": start_date,
-                "end_date": target_date
-            }
-            r = requests.get(FINMIND_URL, headers=headers, params=params, timeout=4)
-            js = r.json()
-            data = js.get("data", [])
-            if not data:
-                continue
-            df = pd.DataFrame(data)
-
-            buy = pd.to_numeric(df.get("buy", 0), errors="coerce").fillna(0)
-            sell = pd.to_numeric(df.get("sell", 0), errors="coerce").fillna(0)
-            df["net"] = buy - sell
-            net_sum = float(df.tail(3)["net"].sum())
-            rows.append({"symbol": sym, "net_3d": net_sum})
-        except:
-            continue
-
-    return pd.DataFrame(rows)
-
-
-# =========================================================
-# 6) Regime + max equity
-# =========================================================
-def pick_regime_and_limit(m: dict, vix_last: Optional[float]) -> Tuple[str, float, List[str]]:
-    lock_reason: List[str] = []
-
-    # 核心缺失：先判 DATA_FAILURE
-    if m.get("SMR") is None or vix_last is None:
-        lock_reason.append("DATA_FAILURE_CORE_METRIC_MISSING")
-        return "DATA_FAILURE", 0.0, lock_reason
-
-    smr = float(m["SMR"])
-    bop = bool(m.get("Blow_Off_Phase"))
-
-    if vix_last > 35:
-        return "CRASH_RISK", 0.10, []
-    if bop or smr >= SMR_BLOW_OFF or smr >= SMR_OVERHEAT:
-        return "CRITICAL_OVERHEAT", 0.10, []
-    if smr >= 0.25:
-        return "OVERHEAT", 0.40, []
-    return "NORMAL", 0.85, []
-
-
-def price_conf_level(missing_cnt: int, total: int) -> str:
-    if total <= 0:
-        return "LOW"
-    if missing_cnt == 0:
-        return "HIGH"
-    if missing_cnt <= max(1, total // 10):
-        return "MEDIUM"
-    return "LOW"
-
-
-# =========================================================
-# MAIN
-# =========================================================
-def main():
-    st.title(APP_TITLE)
-
-    with st.sidebar:
-        st.header("⚙️ 系統參數")
-        session = st.selectbox("時段", ["INTRADAY", "EOD"])
-        topn = st.slider("監控 TopN", 5, 20, 20)
-        token = st.text_input("FinMind Token（選填）", type="password")
-
-        st.divider()
-        st.header("🧾 盤中法人資料策略")
-        allow_intraday_same_day_inst = st.toggle(
-            "盤中允許當日法人資料（Inst=READY）",
-            value=False
-        )
-        enforce_token_when_same_day = st.toggle(
-            "盤中當日法人必須有 Token（否則退回 T-1）",
-            value=True
-        )
-
-        st.divider()
-        st.header("🧯 防污染護欄")
-        strict_price_duplicate_guard = st.toggle(
-            "嚴格模式：同價群（≥3 檔且價>50）視為疑似污染，除第一檔外改為 None",
-            value=True
-        )
-
-        st.divider()
-        st.header("🧱 DATA_FAILURE 行為")
-        data_failure_softcap_5pct = st.toggle(
-            "DATA_FAILURE 軟鎖：若 twii_close 有但 SMR 缺失，允許 max_equity=5%（仍保守）",
-            value=False,
-            help="關閉＝缺核心指標就 0%。開啟＝盤中避免永遠卡死，但仍保守 5%。"
-        )
-
-        st.divider()
-        st.header("🧠 UCC 裁決模式")
-        run_mode = st.radio("RUN", ["L1", "L2", "L3"], index=0, horizontal=True)
-
-        if st.button("🚀 啟動 / 更新"):
-            st.session_state.run_trigger = True
-
-    if not st.session_state.get("run_trigger", False):
-        st.info("👈 請在左側設定參數並點擊「啟動 / 更新」。")
-        return
-
-    now = get_taipei_now()
-    trade_date = now.strftime("%Y-%m-%d")
-    progress = get_intraday_progress() if session == "INTRADAY" else 1.0
-
-    market_status_reason: List[str] = []
-
-    with st.spinner("資料抓取 + 稽核中..."):
-        # 1) index hardened
-        twii_df, vix_last, idx_reasons = fetch_twii_df_and_vix_hardened(retry=3)
-        market_status_reason.extend(idx_reasons)
-
-        # 2) SMR hardened
-        m, smr_reasons = compute_regime_metrics_hardened(twii_df)
-        for r in smr_reasons:
-            if r not in market_status_reason:
-                market_status_reason.append(r)
-
-        # 3) amount
-        amt, amt_reasons = fetch_blended_amount(trade_date)
-        for r in amt_reasons:
-            if r not in market_status_reason:
-                market_status_reason.append(r)
-
-        # 4) regime + max equity
-        regime, base_limit, lock_reason = pick_regime_and_limit(m, vix_last)
-
-        # DATA_FAILURE 軟鎖（可選）：twii_close 有但 SMR 缺失 → 5%
-        if regime == "DATA_FAILURE" and data_failure_softcap_5pct:
-            if m.get("twii_close") is not None and m.get("SMR") is None:
-                base_limit = 0.05
-                lock_reason = ["DATA_FAILURE_SMR_MISSING_SOFTCAP_5PCT"]
-
-        # 成交金額信心懲罰（保守）：LOW → 砍半
-        conf_penalty = 0.5 if amt.confidence_level == "LOW" else 1.0
-        final_limit = float(base_limit * conf_penalty)
-
-        # 5) 盤中法人策略
-        if session == "EOD":
-            use_same_day_inst = True
-        else:
-            use_same_day_inst = bool(allow_intraday_same_day_inst)
-            if enforce_token_when_same_day and use_same_day_inst and (not token):
-                use_same_day_inst = False
-
-        if use_same_day_inst:
-            inst_effective_date = trade_date
-            is_using_previous_day = False
-        else:
-            inst_effective_date = last_trading_day(now - timedelta(days=1))
-            is_using_previous_day = True
-
-        inst_source = "FinMind" if token else "FinMind_PUBLIC_OR_EMPTY_TOKEN"
-
-        # 6) inst fetch
-        symbols = SYMBOLS_TOP20[:topn]
-        inst_df = fetch_inst_3d(symbols, inst_effective_date, token)
-
-        # 7) stocks fetch hardened
-        stocks_output: List[Dict[str, Any]] = []
-        missing_price_cnt = 0
-        no_inst_cnt = 0
-
-        for i, sym in enumerate(symbols, 1):
-            price, vr_raw, ok = fetch_stock_price_vol_hardened(sym, retry=2)
-            if not ok:
-                missing_price_cnt += 1
-
-            vr = None
-            if vr_raw is not None:
-                vr = (vr_raw / progress) if session == "INTRADAY" else vr_raw
-
-            has_inst = (not inst_df.empty) and (sym in inst_df["symbol"].values)
-            net_val = float(inst_df[inst_df["symbol"] == sym]["net_3d"].iloc[0]) if has_inst else None
-
-            # 法人狀態（嚴格一致）
-            if use_same_day_inst:
-                if has_inst:
-                    inst_status = "READY"
-                    inst_fresh = True
-                else:
-                    inst_status = "NO_UPDATE_TODAY"
-                    inst_fresh = False
-                    no_inst_cnt += 1
-            else:
-                inst_status = "USING_T_MINUS_1"
-                inst_fresh = False
-
-            # tier_level（示例）：過熱強制弱化（目前固定 2）
-            tier_level = 2
-
-            stocks_output.append({
-                "Symbol": sym,
-                "Name": STOCK_NAME_MAP.get(sym, sym),
-                "rank": i,
-                "tier_level": tier_level,
-                "Price": price,
-                "Vol_Ratio": vr,
-                "Institutional": {
-                    "Inst_Status": inst_status,
-                    "Inst_Net_3d": net_val,
-                    "inst_unit": "shares",
-                    "inst_data_fresh": inst_fresh,
-                    "inst_effective_date": inst_effective_date,
-                    "inst_source": inst_source
-                }
-            })
-
-        # 8) 價格缺失 reason
-        if missing_price_cnt > 0:
-            market_status_reason.append(f"PRICE_MISSING_{missing_price_cnt}_OF_{len(stocks_output)}")
-
-        # 9) 同價群污染偵測（可選嚴格）
-        dup_clusters = detect_price_duplicate_cluster(stocks_output, min_cluster=3, min_price=50.0)
-        if dup_clusters:
-            for p, syms in dup_clusters.items():
-                market_status_reason.append(f"PRICE_DUPLICATE_CLUSTER_{len(syms)}@{p}")
-                if strict_price_duplicate_guard:
-                    keep = syms[0]
-                    for s in stocks_output:
-                        if s["Symbol"] in syms and s["Symbol"] != keep:
-                            s["Price"] = None
-                            s["Vol_Ratio"] = None
-
-        # 10) confidence 多維欄位
-        price_conf = price_conf_level(missing_price_cnt, len(stocks_output))
-        volume_conf = "MEDIUM" if session == "INTRADAY" else "HIGH"
-        if session == "EOD":
-            inst_conf = "HIGH" if no_inst_cnt == 0 else "MEDIUM"
-        else:
-            inst_conf = "LOW" if not use_same_day_inst else (
-                "MEDIUM" if no_inst_cnt <= max(1, len(stocks_output) // 5) else "LOW"
+        # meta.confidence_level=LOW 但 meta.market_status=NORMAL
+        if jget(payload, "meta.confidence_level") == "LOW" and jget(payload, "meta.market_status") == "NORMAL":
+            fatal.append(
+                "致命：confidence_level=LOW 但 market_status=NORMAL（矛盾） → "
+                f"{pv(payload, 'meta.confidence_level')}, {pv(payload, 'meta.market_status')}"
             )
 
-        # 11) market_status
-        market_status = "DEGRADED" if len(market_status_reason) > 0 else "NORMAL"
+        # amount_total_blended < amount_total_raw
+        raw_amt = jget(payload, "macro.market_amount.amount_total_raw", None)
+        blend_amt = jget(payload, "macro.market_amount.amount_total_blended", None)
+        if isinstance(raw_amt, (int, float)) and isinstance(blend_amt, (int, float)) and blend_amt < raw_amt:
+            fatal.append(
+                f"致命：blended < raw（不可能） → {pv(payload, 'macro.market_amount.amount_total_blended')}, {pv(payload, 'macro.market_amount.amount_total_raw')}"
+            )
 
-        # 12) macro overview
-        macro_overview = dict(m)
-        macro_overview["vix"] = vix_last
-        macro_overview["max_equity_allowed_pct"] = float(final_limit)
-        macro_overview["calc_version"] = "V16.3.x+UCC_PATCH_2026-02-24_FINAL"
-        macro_overview["slope5_def"] = "diff5_of_SMR"
+        # is_using_previous_day=true 但缺 effective_trade_date
+        if jget(payload, "meta.is_using_previous_day", False) is True and not jhas(payload, "meta.effective_trade_date"):
+            fatal.append(f"致命：is_using_previous_day=true 但缺 effective_trade_date → {pv(payload, 'meta.is_using_previous_day')}")
 
-        payload: Dict[str, Any] = {
-            "meta": {
-                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "session": session,
-                "market_status": market_status,
-                "market_status_reason": market_status_reason,
-                "current_regime": regime,
-                "confidence_level": amt.confidence_level,
-                "is_using_previous_day": bool(is_using_previous_day),
-                "effective_trade_date": inst_effective_date if is_using_previous_day else trade_date,
-                "max_equity_lock_reason": lock_reason if lock_reason else [],
-                "confidence": {
-                    "price": price_conf,
-                    "volume": volume_conf,
-                    "institutional": inst_conf
+        # Symbol–Price 跨量級錯位（簡化版：2330 <200 視為錯）
+        for i, s in enumerate(stocks):
+            sym = str(s.get("Symbol", "") or "")
+            price = s.get("Price", None)
+            if sym == "2330.TW" and isinstance(price, (int, float)) and price < 200:
+                fatal.append(f"致命：2330.TW 價格 <200（跨量級） → stocks[{i}].Symbol={json.dumps(sym)}, stocks[{i}].Price={json.dumps(price)}")
+
+        # --------------- 結構性警告（不直接 FAIL，但會拉高風險/降低信心） ---------------
+
+        # 核心指標缺失（會導致 L2 不可判定）
+        for k in ["SMR", "Slope5", "Acceleration"]:
+            if not jhas(payload, f"macro.overview.{k}") or jget(payload, f"macro.overview.{k}") is None:
+                warn.append(f"警告：核心指標缺失 → {pv(payload, f'macro.overview.{k}')}（L2 可能 NO TRADE）")
+
+        # 股票價格缺失比例
+        missing_price = 0
+        for s in stocks:
+            if s.get("Price", None) is None:
+                missing_price += 1
+        if len(stocks) > 0 and missing_price > 0:
+            ratio = missing_price / max(1, len(stocks))
+            warn.append(f"警告：stocks Price 缺失 {missing_price}/{len(stocks)} = {ratio:.1%}")
+
+        # 盤中法人政策一致性警告（不做外推，只做一致性）
+        session = jget(payload, "meta.session", "")
+        pol = jget(payload, "meta.intraday_institutional_policy", {}) if isinstance(jget(payload, "meta.intraday_institutional_policy", {}), dict) else {}
+        allow_same_day = pol.get("allow_same_day", None)
+        resolved_use_same_day = pol.get("resolved_use_same_day", None)
+        if session == "INTRADAY" and allow_same_day is False and resolved_use_same_day is True:
+            warn.append(
+                "警告：INTRADAY 且 allow_same_day=false 但 resolved_use_same_day=true（治理矛盾） → "
+                f"{pv(payload, 'meta.intraday_institutional_policy.allow_same_day')}, {pv(payload, 'meta.intraday_institutional_policy.resolved_use_same_day')}"
+            )
+
+        # L1 verdict / risk / confidence
+        if fatal:
+            verdict = "FAIL"
+            risk = "CRITICAL"
+            conf = "HIGH" if len(fatal) >= 2 else "MEDIUM"
+        else:
+            # 有警告 → PARTIAL_PASS
+            verdict = "PASS" if not warn else "PARTIAL_PASS"
+
+            # 風險以市場狀態 & 缺失程度保守估
+            market_status = str(jget(payload, "meta.market_status", "") or "")
+            conf_lvl = str(jget(payload, "meta.confidence_level", "") or "")
+            if verdict == "PASS" and market_status == "NORMAL" and conf_lvl != "LOW":
+                risk = "LOW"
+                conf = "HIGH"
+            else:
+                risk = "HIGH" if conf_lvl == "LOW" or market_status == "DEGRADED" else "MEDIUM"
+                conf = "LOW" if conf_lvl == "LOW" else "MEDIUM"
+
+        return L1Result(
+            mode="L1_AUDIT",
+            verdict=verdict,
+            risk_level=risk,
+            fatal_issues=fatal,
+            structural_warnings=warn,
+            audit_confidence=conf,
+        )
+
+    # --------------- L2：交易裁決 ---------------
+    def run_l2(self, payload: Json, l1: L1Result) -> str:
+        # V19：不能跳過 L1
+        violated, issues = self._v19_constitution_guard("L2", l1.verdict)
+        if violated:
+            # 立即回退 L1 FAIL（規格：違憲 → L1 FAIL）
+            return json.dumps(
+                {
+                    "mode": "L1_AUDIT",
+                    "verdict": "FAIL",
+                    "risk_level": "CRITICAL",
+                    "fatal_issues": issues,
+                    "structural_warnings": [],
+                    "audit_confidence": "HIGH",
                 },
-                "intraday_institutional_policy": {
-                    "allow_same_day": bool(allow_intraday_same_day_inst),
-                    "enforce_token_when_same_day": bool(enforce_token_when_same_day),
-                    "resolved_use_same_day": bool(use_same_day_inst),
-                    "inst_effective_date": inst_effective_date
-                }
+                ensure_ascii=False,
+                indent=2,
+            )
+
+        # 啟動條件
+        if l1.verdict != "PASS" or jget(payload, "macro.integrity.kill", False) is True:
+            return "\n".join(
+                [
+                    "MODE: L2_EXECUTE",
+                    "MARKET_STATE: NORMAL",
+                    "MAX_EQUITY_ALLOWED: 0.0%",
+                    "DECISION:",
+                    "NO TRADE",
+                    "",
+                    f"RISK_REASON: L1.verdict={l1.verdict} OR macro.integrity.kill={json.dumps(jget(payload,'macro.integrity.kill',None), ensure_ascii=False)} → rule_triggered",
+                    "CONFIDENCE: LOW",
+                ]
+            )
+
+        # MAX_EQUITY 唯一合法來源
+        max_eq = jget(payload, "macro.overview.max_equity_allowed_pct", None)
+        if not isinstance(max_eq, (int, float)):
+            return "\n".join(
+                [
+                    "MODE: L2_EXECUTE",
+                    "MARKET_STATE: NORMAL",
+                    "MAX_EQUITY_ALLOWED: 0.0%",
+                    "DECISION:",
+                    "NO TRADE",
+                    "",
+                    f"RISK_REASON: {pv(payload,'macro.overview.max_equity_allowed_pct')} → missing/invalid",
+                    "CONFIDENCE: LOW",
+                ]
+            )
+
+        # V17 戰時模式（若觸發，強制 max<=5% 且禁 OPEN/ADD）
+        wartime, wt_reasons = self._v17_wartime_triggered(payload)
+        if wartime:
+            max_eq = min(float(max_eq), 0.05)
+
+        # MARKET_STATE 判定（只用 JSON）
+        smr = jget(payload, "macro.overview.SMR", None)
+        blow = jget(payload, "macro.overview.Blow_Off_Phase", None)
+
+        if not isinstance(smr, (int, float)) and not isinstance(blow, bool):
+            # 核心判定資料不足 → NO TRADE
+            return "\n".join(
+                [
+                    "MODE: L2_EXECUTE",
+                    "MARKET_STATE: NORMAL",
+                    f"MAX_EQUITY_ALLOWED: {max_eq*100:.1f}%",
+                    "DECISION:",
+                    "NO TRADE",
+                    "",
+                    f"RISK_REASON: {pv(payload,'macro.overview.SMR')} & {pv(payload,'macro.overview.Blow_Off_Phase')} → core metric missing",
+                    "CONFIDENCE: LOW",
+                ]
+            )
+
+        market_state = "NORMAL"
+        if isinstance(smr, (int, float)) and (smr >= 0.33):
+            market_state = "OVERHEAT"
+        elif isinstance(blow, bool) and blow is True:
+            market_state = "OVERHEAT"
+        elif isinstance(smr, (int, float)) and (smr >= 0.30):
+            market_state = "OVERHEAT"
+        elif isinstance(smr, (int, float)) and (smr < 0):
+            market_state = "DEFENSIVE"
+
+        # LOW 信心規則：allocation ×0.5（以 0.5% 階梯）
+        conf_lvl = str(jget(payload, "meta.confidence_level", "") or "")
+        alloc_multiplier = 0.5 if conf_lvl == "LOW" else 1.0
+        rounding_rule = "0.5% step"
+
+        # 這版 L2 不做選股（你規格寫：你不選股/不預測；此處只示範裁決框架）
+        # 因此：不開倉，僅輸出 NO TRADE / 或戰時限制
+        lines = [
+            "MODE: L2_EXECUTE",
+            f"MARKET_STATE: {market_state}",
+            f"MAX_EQUITY_ALLOWED: {max_eq*100:.1f}%",
+            "DECISION:",
+        ]
+
+        if wartime:
+            lines += [
+                "NO TRADE",
+                "",
+                f"RISK_REASON: {'; '.join(wt_reasons)} → V17_WAR_TIME_OVERRIDE (禁止 OPEN/ADD)",
+                "CONFIDENCE: LOW",
+            ]
+            return "\n".join(lines)
+
+        # 若 max_eq=0 → 明確 NO TRADE
+        if float(max_eq) <= 0.0:
+            lines += [
+                "NO TRADE",
+                "",
+                f"RISK_REASON: {pv(payload,'macro.overview.max_equity_allowed_pct')} → MAX_EQUITY=0",
+                "CONFIDENCE: LOW" if conf_lvl == "LOW" else "MEDIUM",
+            ]
+            return "\n".join(lines)
+
+        # 保守：若 OVERHEAT 且 LOW → 不開倉
+        if market_state == "OVERHEAT" and conf_lvl == "LOW":
+            lines += [
+                "NO TRADE",
+                "",
+                f"RISK_REASON: {pv(payload,'macro.overview.SMR')} / {pv(payload,'meta.confidence_level')} → OVERHEAT + LOW",
+                "CONFIDENCE: LOW",
+            ]
+            return "\n".join(lines)
+
+        # 否則仍不主動選股，僅框架輸出
+        lines += [
+            "NO TRADE",
+            "",
+            f"RISK_REASON: policy(no stock selection) + alloc_multiplier={alloc_multiplier} ({rounding_rule})",
+            "CONFIDENCE: LOW" if conf_lvl == "LOW" else "MEDIUM",
+        ]
+        return "\n".join(lines)
+
+    # --------------- L3：回撤壓測 ---------------
+    def run_l3(self, payload: Json, l1: L1Result) -> str:
+        violated, issues = self._v19_constitution_guard("L3", l1.verdict)
+        if violated:
+            return json.dumps(
+                {
+                    "mode": "L1_AUDIT",
+                    "verdict": "FAIL",
+                    "risk_level": "CRITICAL",
+                    "fatal_issues": issues,
+                    "structural_warnings": [],
+                    "audit_confidence": "HIGH",
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+
+        smr = jget(payload, "macro.overview.SMR", None)
+        # 觸發條件（依你規格：SMR<0 或 MARKET_STATE=DEFENSIVE 或連敗>=3 或回撤>=0.08）
+        # portfolio.* 若不存在不得推算
+        portfolio = payload.get("portfolio", {}) if isinstance(payload.get("portfolio", {}), dict) else {}
+        perf = portfolio.get("performance", {}) if isinstance(portfolio.get("performance", {}), dict) else {}
+
+        consecutive_losses = perf.get("consecutive_losses", None)
+        drawdown_pct = perf.get("drawdown_pct", None)
+
+        activated = False
+        triggers = []
+
+        if isinstance(smr, (int, float)) and smr < 0:
+            activated = True
+            triggers.append(pv(payload, "macro.overview.SMR") + " → SMR<0")
+
+        # 若沒有 portfolio，就不推算
+        if isinstance(consecutive_losses, int) and consecutive_losses >= 3:
+            activated = True
+            triggers.append(f"portfolio.performance.consecutive_losses={consecutive_losses} → >=3")
+        if isinstance(drawdown_pct, (int, float)) and drawdown_pct >= 0.08:
+            activated = True
+            triggers.append(f"portfolio.performance.drawdown_pct={drawdown_pct} → >=0.08")
+
+        if not activated:
+            return "\n".join(
+                [
+                    "MODE: L3_STRESS",
+                    "STRESS_TEST: NOT_ACTIVATED",
+                    "STRUCTURAL_BREACH: FALSE",
+                    "5%_SCENARIO: SAFE",
+                    "10%_SCENARIO: SAFE",
+                    "15%_SCENARIO: SAFE",
+                    "PSYCHOLOGICAL_RISK: LOW",
+                    "SURVIVAL_SCORE: 100",
+                    "SYSTEM_STATUS: STABLE",
+                    "FINAL_VERDICT: SYSTEM_SURVIVES",
+                    "",
+                    "RISK_REASON: no_trigger → " + ("; ".join(triggers) if triggers else "none"),
+                ]
+            )
+
+        # 這裡給「系統層級」壓測（不推算倉位，只做保守等級）
+        # 若資料 degraded/low → 分數降低
+        conf_lvl = str(jget(payload, "meta.confidence_level", "") or "")
+        market_status = str(jget(payload, "meta.market_status", "") or "")
+
+        base = 80
+        if conf_lvl == "LOW":
+            base -= 20
+        if market_status == "DEGRADED":
+            base -= 15
+
+        score = int(max(0, min(100, base)))
+        system_status = "STABLE" if score >= 75 else ("FRAGILE" if score >= 50 else "CRITICAL")
+        final = "SYSTEM_SURVIVES" if score >= 75 else ("SYSTEM_AT_RISK" if score >= 50 else "SYSTEM_FAILURE")
+
+        # 情境等級（保守）
+        s5 = "WARNING" if system_status != "STABLE" else "SAFE"
+        s10 = "FAILURE" if system_status == "CRITICAL" else ("WARNING" if system_status == "FRAGILE" else "SAFE")
+        s15 = "FAILURE" if system_status != "STABLE" else "WARNING"
+
+        psycho = "HIGH" if system_status == "CRITICAL" else ("MEDIUM" if system_status == "FRAGILE" else "LOW")
+        breach = "TRUE" if system_status == "CRITICAL" else "FALSE"
+
+        return "\n".join(
+            [
+                "MODE: L3_STRESS",
+                "STRESS_TEST: ACTIVATED",
+                f"STRUCTURAL_BREACH: {breach}",
+                f"5%_SCENARIO: {s5}",
+                f"10%_SCENARIO: {s10}",
+                f"15%_SCENARIO: {s15}",
+                f"PSYCHOLOGICAL_RISK: {psycho}",
+                f"SURVIVAL_SCORE: {score}",
+                f"SYSTEM_STATUS: {system_status}",
+                f"FINAL_VERDICT: {final}",
+                "",
+                "RISK_REASON: " + "; ".join(triggers),
+            ]
+        )
+
+    # --------------- 入口：只輸出一個模式 ---------------
+    def run(self, payload: Json, run_mode: str) -> str:
+        l1 = self.run_l1(payload)
+
+        if run_mode == "L1":
+            return json.dumps(
+                {
+                    "mode": l1.mode,
+                    "verdict": l1.verdict,
+                    "risk_level": l1.risk_level,
+                    "fatal_issues": l1.fatal_issues,
+                    "structural_warnings": l1.structural_warnings,
+                    "audit_confidence": l1.audit_confidence,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+
+        if run_mode == "L2":
+            return self.run_l2(payload, l1)
+
+        if run_mode == "L3":
+            return self.run_l3(payload, l1)
+
+        # fallback
+        return json.dumps(
+            {
+                "mode": "L1_AUDIT",
+                "verdict": "FAIL",
+                "risk_level": "CRITICAL",
+                "fatal_issues": [f"未知 run_mode={run_mode}"],
+                "structural_warnings": [],
+                "audit_confidence": "HIGH",
             },
-            "macro": {
-                "overview": macro_overview,
-                "market_amount": asdict(amt),
-                "integrity": {
-                    "kill": False,
-                    "vix_invalid": True if vix_last is None else False,
-                    "reason": "OK" if vix_last is not None else "VIX_INVALID_OR_MISSING"
-                }
-            },
-            "stocks": stocks_output
-        }
-
-    # =======================
-    # UI: Summary
-    # =======================
-    st.subheader("📡 宏觀 / 風控摘要")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("market_status", payload["meta"]["market_status"],
-              delta=";".join(payload["meta"]["market_status_reason"]) or "OK", delta_color="off")
-    c2.metric("current_regime", payload["meta"]["current_regime"])
-    c3.metric("max_equity_allowed_pct", f"{payload['macro']['overview']['max_equity_allowed_pct']*100:.1f}%")
-    c4.metric("SMR", str(payload["macro"]["overview"]["SMR"]),
-              delta=f"VIX={payload['macro']['overview']['vix']}", delta_color="off")
-
-    st.caption(
-        f"盤中法人策略：allow_same_day={allow_intraday_same_day_inst}, enforce_token={enforce_token_when_same_day}, "
-        f"resolved_use_same_day={payload['meta']['intraday_institutional_policy']['resolved_use_same_day']}, "
-        f"inst_effective_date={payload['meta']['intraday_institutional_policy']['inst_effective_date']}"
-    )
-
-    # =======================
-    # UI: UCC
-    # =======================
-    st.markdown("---")
-    st.subheader("🧠 UCC V19.1 輸出（RUN 單一層級）")
-    ucc = UCCv19_1()
-    ucc_out = ucc.run(payload, run_mode=run_mode)
-
-    if isinstance(ucc_out, dict):
-        st.json(ucc_out)
-    else:
-        st.code(str(ucc_out), language="text")
-
-    # =======================
-    # UI: Payload
-    # =======================
-    st.markdown("---")
-    st.subheader("📦 最終 Payload（稽核可回放）")
-    st.code(json.dumps(payload, ensure_ascii=False, indent=2), language="json")
+            ensure_ascii=False,
+            indent=2,
+        )
 
 
-if __name__ == "__main__":
-    main()
+# -----------------------------
+# Streamlit UI
+# -----------------------------
+st.set_page_config(page_title="Sunhero｜股市智能超盤（Predator + UCC V19.1）", layout="wide")
+
+st.title("Sunhero｜股市智能超盤（Predator + UCC V19.1）")
+
+with st.sidebar:
+    st.header("控制面板")
+
+    run_mode = st.selectbox("RUN 模式（只輸出一個結果）", ["L1", "L2", "L3"], index=0)
+
+    st.subheader("盤中法人資料政策（UI 開關）")
+    allow_same_day_inst = st.checkbox("盤中是否允許當日法人資料", value=False)
+    enforce_token_when_same_day = st.checkbox("若允許當日法人資料，是否強制 Token", value=True)
+
+    st.caption("說明：此開關只會寫入 meta.intraday_institutional_policy，並讓 L1/L2 依一致性做審計/降級。")
+
+st.subheader("輸入 Payload（JSON）")
+default_payload = {
+    "meta": {"timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "session": "INTRADAY", "market_status": "DEGRADED", "confidence_level": "LOW"},
+    "macro": {"overview": {"twii_close": None, "SMR": None, "max_equity_allowed_pct": 0.0}, "market_amount": {}, "integrity": {"kill": False, "reason": "OK"}},
+    "stocks": [],
+}
+payload_text = st.text_area("貼上你的 JSON（可直接貼你上面那包）", value=json.dumps(default_payload, ensure_ascii=False, indent=2), height=380)
+
+colA, colB = st.columns([1, 1])
+
+with colA:
+    st.subheader("Patch（補齊欄位 / 治理欄位）")
+    if st.button("✅ 套用 Patch 並顯示修補後 JSON", use_container_width=True):
+        try:
+            raw = json.loads(payload_text)
+            patched, notes = patch_payload_for_ui(raw, allow_same_day_inst, enforce_token_when_same_day)
+            st.success("Patch 完成")
+            if notes:
+                st.info("Patch 註記（可稽核）：" + "；".join(notes))
+            st.code(json.dumps(patched, ensure_ascii=False, indent=2), language="json")
+        except Exception as e:
+            st.error(f"JSON 解析失敗：{e}")
+
+with colB:
+    st.subheader("執行 UCC")
+    if st.button("🚀 RUN（依左側模式）", use_container_width=True):
+        try:
+            raw = json.loads(payload_text)
+            # 先 patch（你要求：payload 補齊 + UI 政策）
+            patched, notes = patch_payload_for_ui(raw, allow_same_day_inst, enforce_token_when_same_day)
+
+            ucc = UCCv19_1()
+            out = ucc.run(patched, run_mode)
+
+            st.success(f"UCC 輸出完成（MODE={run_mode}）")
+            if notes:
+                st.info("Patch 註記（可稽核）：" + "；".join(notes))
+
+            # 顯示輸出（可能是 JSON 或多行文字）
+            if out.strip().startswith("{"):
+                st.code(out, language="json")
+            else:
+                st.code(out, language="text")
+
+            # 額外顯示：L1 審計摘要（不算第二個模式輸出；只是 UI 顯示）
+            l1 = ucc.run_l1(patched)
+            st.caption("（UI 附加顯示）L1 審計摘要
