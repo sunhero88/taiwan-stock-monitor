@@ -1,17 +1,14 @@
 # main.py
 # =========================================================
 # Sunhero｜股市智能超盤中控台（Predator + UCC V19.1）
-# FINAL PATCH 2026-02-24
+# FINAL HARDENED BUILD (避免反覆改來改去)
+# Date: 2026-02-24
 #
-# ✅ 已完成：
-# 1) UI：RUN L1/L2/L3 切換（顯示 UCC 單層輸出）
-# 2) UI：盤中是否允許當日法人資料（allow_same_day_inst）
-#    - 可選：盤中當日法人必須有 Token（enforce_token）
-# 3) Payload：補齊 max_equity_allowed_pct + market_status_reason + confidence 多維欄位
-# 4) 資料抓取層 Harden：
-#    - 避免 VIX 被股票價格污染（vix 合理性驗證 0~100）
-#    - 避免股票 Price 沿用上一檔殘值（失敗即 None）
-#    - 自動補 market_status_reason：TWII_MISSING / VIX_INVALID / PRICE_MISSING_n
+# ✅ 目標：
+# - SMR 計算穩健：抓不到就明確 reason，不用假數據
+# - 價格抓取防污染：不沿用殘值 + 重試 + 同價群偵測
+# - 成交金額估算留痕：TWSE/TPEX ESTIMATED 透明稽核
+# - UI：RUN L1/L2/L3、盤中法人策略、嚴格價格污染模式、DATA_FAILURE 軟鎖 5%（可選）
 # =========================================================
 
 import json
@@ -39,11 +36,9 @@ TWII_SYMBOL = "^TWII"
 VIX_SYMBOL = "^VIX"
 FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
 
-# 依你的體制定義
 SMR_OVERHEAT = 0.30
 SMR_BLOW_OFF = 0.33
 
-# 你自己的 Top20（例）
 SYMBOLS_TOP20 = [
     "2330.TW", "2317.TW", "2454.TW", "2308.TW", "2382.TW",
     "3231.TW", "2376.TW", "3017.TW", "3324.TW", "3661.TW",
@@ -60,15 +55,42 @@ STOCK_NAME_MAP = {
 }
 
 
+# -----------------------------
+# Time helpers
+# -----------------------------
 def get_taipei_now() -> datetime:
     return datetime.now(pytz.timezone("Asia/Taipei"))
 
 
+def last_trading_day(d: datetime) -> str:
+    x = d
+    while x.weekday() >= 5:
+        x -= timedelta(days=1)
+    return x.strftime("%Y-%m-%d")
+
+
+def get_intraday_progress() -> float:
+    now = get_taipei_now()
+    start = now.replace(hour=9, minute=0, second=0, microsecond=0)
+    end = now.replace(hour=13, minute=30, second=0, microsecond=0)
+    if now < start:
+        return 0.01
+    if now > end:
+        return 1.0
+    return max(0.01, (now - start).total_seconds() / (end - start).total_seconds())
+
+
+# -----------------------------
+# Safe cast
+# -----------------------------
 def _safe_float(x, default=None):
     try:
-        if x is None or (isinstance(x, float) and np.isnan(x)):
+        if x is None:
             return default
-        return float(x)
+        v = float(x)
+        if np.isnan(v):
+            return default
+        return v
     except:
         return default
 
@@ -87,53 +109,11 @@ def _to_roc_date(ymd: str) -> str:
     return f"{dt.year - 1911}/{dt.month:02d}/{dt.day:02d}"
 
 
-def get_intraday_progress() -> float:
-    now = get_taipei_now()
-    start = now.replace(hour=9, minute=0, second=0, microsecond=0)
-    end = now.replace(hour=13, minute=30, second=0, microsecond=0)
-    if now < start:
-        return 0.01
-    if now > end:
-        return 1.0
-    return max(0.01, (now - start).total_seconds() / (end - start).total_seconds())
-
-
-def last_trading_day(d: datetime) -> str:
-    x = d
-    while x.weekday() >= 5:  # Sat/Sun
-        x -= timedelta(days=1)
-    return x.strftime("%Y-%m-%d")
-
-
-# =========================
-# HARDENED DATA FETCH (PATCH)
-# =========================
-
-def yf_download_df(symbol: str, period: str) -> Optional[pd.DataFrame]:
-    try:
-        df = yf.download(symbol, period=period, progress=False)
-        if df is None or df.empty:
-            return None
-        return df
-    except:
-        return None
-
-
-def yf_last_close_from_df(df: pd.DataFrame) -> Optional[float]:
-    try:
-        close = df["Close"]
-        if isinstance(close, pd.DataFrame):
-            close = close.iloc[:, 0]
-        v = float(close.iloc[-1])
-        if np.isnan(v):
-            return None
-        return v
-    except:
-        return None
-
-
+# =========================================================
+# 1) HARDENED: Index fetch + validation
+# =========================================================
 def validate_vix(v: Optional[float]) -> Optional[float]:
-    # 合理範圍：0 < VIX <= 100（超出多半是錯欄位/污染）
+    # 合理範圍護欄：0 < VIX <= 100
     if v is None:
         return None
     try:
@@ -146,7 +126,7 @@ def validate_vix(v: Optional[float]) -> Optional[float]:
 
 
 def validate_twii_close(x: Optional[float]) -> Optional[float]:
-    # 只做防污染，不做預測：避免 0 / NaN / 明顯錯值
+    # 防污染：避免 0 / NaN / 明顯怪值
     if x is None:
         return None
     try:
@@ -158,63 +138,175 @@ def validate_twii_close(x: Optional[float]) -> Optional[float]:
         return None
 
 
-def safe_fetch_twii_df_and_vix() -> Tuple[Optional[pd.DataFrame], Optional[float], List[str]]:
+def _yf_download_df(symbol: str, period: str) -> Optional[pd.DataFrame]:
+    try:
+        df = yf.download(symbol, period=period, progress=False)
+        if df is None or df.empty:
+            return None
+        return df
+    except:
+        return None
+
+
+def _yf_history_df(symbol: str, period: str) -> Optional[pd.DataFrame]:
+    try:
+        t = yf.Ticker(symbol)
+        df = t.history(period=period, interval="1d", auto_adjust=False)
+        if df is None or df.empty:
+            return None
+        # history 回傳 index 可能含 tz，統一
+        df = df.reset_index(drop=False)
+        # 重新整理成 download 類型的欄位結構
+        if "Close" not in df.columns:
+            return None
+        df = df.set_index(df.columns[0])  # Date / Datetime
+        return df
+    except:
+        return None
+
+
+def _last_close(df: Optional[pd.DataFrame]) -> Optional[float]:
+    if df is None or df.empty:
+        return None
+    try:
+        c = df["Close"]
+        if isinstance(c, pd.DataFrame):
+            c = c.iloc[:, 0]
+        c = pd.to_numeric(c, errors="coerce").dropna()
+        if c.empty:
+            return None
+        return float(c.iloc[-1])
+    except:
+        return None
+
+
+def fetch_twii_df_and_vix_hardened(retry: int = 3) -> Tuple[Optional[pd.DataFrame], Optional[float], List[str]]:
     """
-    回 (twii_df, vix, reasons[])
-    reasons：給 market_status_reason（稽核痕跡）
+    回 (twii_df, vix, reasons)
+    reasons 用於 meta.market_status_reason
     """
     reasons: List[str] = []
 
-    twii_df = yf_download_df(TWII_SYMBOL, period="2y")
-    twii_close = validate_twii_close(yf_last_close_from_df(twii_df) if twii_df is not None else None)
-    if twii_close is None:
-        reasons.append("TWII_MISSING_OR_INVALID")
-        twii_df = None  # 直接當失效，避免後續用空 df 算 SMR
+    twii_df = None
+    vix_val = None
 
-    vix_df = yf_download_df(VIX_SYMBOL, period="1mo")
-    vix_raw = yf_last_close_from_df(vix_df) if vix_df is not None else None
-    vix = validate_vix(vix_raw)
-    if vix is None:
+    for k in range(retry):
+        # TWII
+        if twii_df is None:
+            df = _yf_download_df(TWII_SYMBOL, period="5y")
+            if df is None:
+                df = _yf_history_df(TWII_SYMBOL, period="5y")
+            # 確認可用性：Close 有效且筆數夠
+            if df is not None:
+                c = pd.to_numeric(df["Close"] if not isinstance(df["Close"], pd.DataFrame) else df["Close"].iloc[:, 0],
+                                  errors="coerce").dropna()
+                if len(c) >= 260:
+                    twii_df = df
+                else:
+                    # 筆數不足，先保留 None，等下一次 retry
+                    twii_df = None
+
+        # VIX
+        if vix_val is None:
+            vix_df = _yf_download_df(VIX_SYMBOL, period="3mo")
+            if vix_df is None:
+                vix_df = _yf_history_df(VIX_SYMBOL, period="3mo")
+            vix_raw = _last_close(vix_df)
+            vix_val = validate_vix(vix_raw)
+
+        if twii_df is not None and vix_val is not None:
+            break
+
+        time.sleep(0.25 * (k + 1))
+
+    # reason 結案
+    twii_close = validate_twii_close(_last_close(twii_df))
+    if twii_df is None or twii_close is None:
+        reasons.append("TWII_SERIES_TOO_SHORT_OR_INVALID")
+        twii_df = None  # 直接視為失效
+
+    if vix_val is None:
         reasons.append("VIX_MISSING_OR_INVALID")
 
-    return twii_df, vix, reasons
+    return twii_df, vix_val, reasons
 
 
-def safe_fetch_stock_price_vol(sym: str) -> Tuple[Optional[float], Optional[float]]:
-    """
-    嚴格：失敗就 (None, None)，不允許沿用上一檔殘值
-    """
+# =========================================================
+# 2) HARDENED: Regime metrics (SMR)
+# =========================================================
+def compute_regime_metrics_hardened(twii_df: Optional[pd.DataFrame]) -> Tuple[dict, List[str]]:
+    reasons: List[str] = []
+
+    if twii_df is None or twii_df.empty:
+        reasons.append("SMR_INPUT_TWII_DF_MISSING")
+        return {
+            "twii_close": None, "SMR": None, "Slope5": None, "Acceleration": None,
+            "Top_Divergence": False, "Blow_Off_Phase": False, "MOMENTUM_LOCK": False
+        }, reasons
+
     try:
-        df = yf.download(sym, period="2mo", progress=False)
-        if df is None or df.empty:
-            return None, None
-
-        c = df["Close"]
-        v = df["Volume"]
+        c = twii_df["Close"]
         if isinstance(c, pd.DataFrame):
             c = c.iloc[:, 0]
-        if isinstance(v, pd.DataFrame):
-            v = v.iloc[:, 0]
+        c = pd.to_numeric(c, errors="coerce").dropna()
 
-        px = float(c.iloc[-1])
-        if np.isnan(px):
-            return None, None
+        if len(c) < 260:
+            reasons.append("TWII_SERIES_TOO_SHORT_FOR_SMR")
+            twii_close = validate_twii_close(float(c.iloc[-1])) if len(c) else None
+            return {
+                "twii_close": twii_close, "SMR": None, "Slope5": None, "Acceleration": None,
+                "Top_Divergence": False, "Blow_Off_Phase": False, "MOMENTUM_LOCK": False
+            }, reasons
 
-        if len(v) >= 20:
-            ma20 = float(v.rolling(20).mean().iloc[-1])
-            vr = float(v.iloc[-1] / ma20) if ma20 and ma20 > 0 else 1.0
-        else:
-            vr = 1.0
+        twii_close = validate_twii_close(float(c.iloc[-1]))
+        if twii_close is None:
+            reasons.append("TWII_CLOSE_INVALID")
+            return {
+                "twii_close": None, "SMR": None, "Slope5": None, "Acceleration": None,
+                "Top_Divergence": False, "Blow_Off_Phase": False, "MOMENTUM_LOCK": False
+            }, reasons
 
-        return px, vr
+        ma200 = c.rolling(200).mean()
+        smr_series = (c - ma200) / ma200
+        slope5_series = smr_series.diff(5)
+        accel_series = slope5_series.diff(2)
+
+        smr_valid = pd.to_numeric(smr_series, errors="coerce").dropna()
+        slope5_valid = pd.to_numeric(slope5_series, errors="coerce").dropna()
+        accel_valid = pd.to_numeric(accel_series, errors="coerce").dropna()
+
+        smr = float(smr_valid.iloc[-1]) if not smr_valid.empty else None
+        slope5 = float(slope5_valid.iloc[-1]) if not slope5_valid.empty else None
+        accel = float(accel_valid.iloc[-1]) if not accel_valid.empty else None
+
+        if smr is None:
+            reasons.append("SMR_CALC_RESULT_NA")
+
+        bop = bool(smr is not None and slope5 is not None and (smr >= SMR_BLOW_OFF) and (slope5 >= 0.08))
+        top_div = bool(smr is not None and slope5 is not None and accel is not None and (smr > 0.15) and (slope5 > 0) and (accel < -0.01))
+        mom_lock = bool(slope5 is not None and slope5 > 0)
+
+        return {
+            "twii_close": twii_close,
+            "SMR": smr,
+            "Slope5": slope5,
+            "Acceleration": accel,
+            "Top_Divergence": top_div,
+            "Blow_Off_Phase": bop,
+            "MOMENTUM_LOCK": mom_lock
+        }, reasons
+
     except:
-        return None, None
+        reasons.append("SMR_EXCEPTION")
+        return {
+            "twii_close": None, "SMR": None, "Slope5": None, "Acceleration": None,
+            "Top_Divergence": False, "Blow_Off_Phase": False, "MOMENTUM_LOCK": False
+        }, reasons
 
 
-# =========================
-# Market amount
-# =========================
-
+# =========================================================
+# 3) Market amount (TWSE/TPEX)
+# =========================================================
 @dataclass
 class MarketAmount:
     amount_twse: int
@@ -228,46 +320,57 @@ class MarketAmount:
     confidence_level: str
 
 
-def fetch_blended_amount(trade_date: str) -> MarketAmount:
+def fetch_blended_amount(trade_date: str) -> Tuple[MarketAmount, List[str]]:
+    reasons: List[str] = []
     ymd = trade_date.replace("-", "")
-    url_twse = f"https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL?response=json&date={ymd}"
+
+    # TWSE：可能 timeout/SSL，被擋就 safe mode
     twse_amt = 0
     twse_src = "TWSE_FAIL"
     twse_sts = "FAIL"
     try:
-        r = requests.get(url_twse, timeout=5, verify=False)
+        url_twse = f"https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL?response=json&date={ymd}"
+        r = requests.get(url_twse, timeout=5, verify=False, headers={"User-Agent": "Mozilla/5.0"})
         js = r.json()
-        if "data" in js:
+        if "data" in js and js["data"]:
             twse_amt = sum(_safe_int(row[3], 0) for row in js["data"])
             twse_src = "TWSE_OK:AUDIT_SUM"
             twse_sts = "OK"
+        else:
+            raise RuntimeError("TWSE_EMPTY")
     except:
         twse_amt = 950_000_000_000
         twse_src = "TWSE_SAFE_MODE"
         twse_sts = "ESTIMATED"
+        reasons.append("TWSE_ESTIMATED")
 
-    roc = _to_roc_date(trade_date)
-    url_tpex = f"https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw&d={roc}&se=EW"
+    # TPEX：常見 fail → safe mode 200B
     tpex_amt = 0
     tpex_src = "TPEX_FAIL"
     tpex_sts = "FAIL"
     try:
-        r = requests.get(url_tpex, headers={"User-Agent": "Mozilla/5.0"}, timeout=5, verify=False)
+        roc = _to_roc_date(trade_date)
+        url_tpex = f"https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw&d={roc}&se=EW"
+        r = requests.get(url_tpex, timeout=5, verify=False, headers={"User-Agent": "Mozilla/5.0"})
         js = r.json()
-        if "aaData" in js and len(js["aaData"]) > 0:
-            tpex_amt = _safe_int(js["aaData"][0][2])
+        if "aaData" in js and js["aaData"]:
+            tpex_amt = _safe_int(js["aaData"][0][2], 0)
             tpex_src = "TPEX_OFFICIAL_OK"
             tpex_sts = "OK"
+        else:
+            raise RuntimeError("TPEX_EMPTY")
     except:
-        pass
-
-    if tpex_sts == "FAIL":
         tpex_amt = 200_000_000_000
         tpex_src = "TPEX_SAFE_MODE_200B"
         tpex_sts = "ESTIMATED"
+        reasons.append("TPEX_ESTIMATED")
 
     conf = "HIGH" if (twse_sts == "OK" and tpex_sts == "OK") else "LOW"
-    raw_total = twse_amt if tpex_sts != "OK" else (twse_amt + tpex_amt)
+    if conf == "LOW":
+        reasons.append("AMOUNT_CONF_LOW")
+
+    # raw_total：若任一市場估算，用「可稽核的保守定義」：raw=twse(官方或估算)，blended=twse+tpex(官方或估算)
+    raw_total = twse_amt
     blended_total = twse_amt + tpex_amt
 
     return MarketAmount(
@@ -280,86 +383,86 @@ def fetch_blended_amount(trade_date: str) -> MarketAmount:
         status_twse=twse_sts,
         status_tpex=tpex_sts,
         confidence_level=conf
-    )
+    ), reasons
 
 
-# =========================
-# Regime metrics (SMR)
-# =========================
+# =========================================================
+# 4) Stock price & vol ratio (anti-drift)
+# =========================================================
+def fetch_stock_price_vol_hardened(sym: str, retry: int = 2) -> Tuple[Optional[float], Optional[float], bool]:
+    """
+    回 (price, vol_ratio, success)
+    - success=True 表示抓到合理 price
+    """
+    for k in range(retry + 1):
+        # 方法 1：download
+        df = _yf_download_df(sym, period="3mo")
+        if df is None or df.empty:
+            # 方法 2：history
+            df = _yf_history_df(sym, period="3mo")
 
-def compute_regime_metrics(twii_df: Optional[pd.DataFrame]) -> dict:
-    if twii_df is None or twii_df.empty or len(twii_df) < 210:
-        return {
-            "twii_close": None, "SMR": None, "Slope5": None, "Acceleration": None,
-            "Top_Divergence": False, "Blow_Off_Phase": False, "MOMENTUM_LOCK": False
-        }
+        if df is not None and not df.empty and "Close" in df.columns and "Volume" in df.columns:
+            try:
+                c = df["Close"]
+                v = df["Volume"]
+                if isinstance(c, pd.DataFrame):
+                    c = c.iloc[:, 0]
+                if isinstance(v, pd.DataFrame):
+                    v = v.iloc[:, 0]
 
-    close = twii_df["Close"]
-    if isinstance(close, pd.DataFrame):
-        close = close.iloc[:, 0]
-    close = close.astype(float)
+                c = pd.to_numeric(c, errors="coerce").dropna()
+                v = pd.to_numeric(v, errors="coerce").dropna()
 
-    twii_close = validate_twii_close(float(close.iloc[-1]))
-    if twii_close is None:
-        return {
-            "twii_close": None, "SMR": None, "Slope5": None, "Acceleration": None,
-            "Top_Divergence": False, "Blow_Off_Phase": False, "MOMENTUM_LOCK": False
-        }
+                if c.empty:
+                    raise RuntimeError("EMPTY_CLOSE")
 
-    ma200 = close.rolling(200).mean()
-    smr_series = (close - ma200) / ma200
-    slope5_series = smr_series.diff(5)
-    accel_series = slope5_series.diff(2)
+                price = float(c.iloc[-1])
+                if not np.isfinite(price) or price <= 0:
+                    raise RuntimeError("BAD_PRICE")
 
-    smr = _safe_float(smr_series.iloc[-1], default=None)
-    slope5 = _safe_float(slope5_series.iloc[-1], default=None)
-    accel = _safe_float(accel_series.iloc[-1], default=None)
+                # vol ratio：最後 20 筆有效值
+                if len(v) >= 20:
+                    v20 = v.tail(20)
+                    ma20 = float(v20.mean()) if float(v20.mean()) > 0 else None
+                    vr = float(v.iloc[-1] / ma20) if ma20 else 1.0
+                else:
+                    vr = 1.0
 
-    bop = bool(smr is not None and smr >= SMR_BLOW_OFF and (slope5 is not None and slope5 >= 0.08))
-    top_div = bool(smr is not None and smr > 0.15 and (slope5 is not None and slope5 > 0) and (accel is not None and accel < -0.01))
-    mom_lock = bool(slope5 is not None and slope5 > 0)
+                return price, vr, True
+            except:
+                pass
 
-    return {
-        "twii_close": twii_close,
-        "SMR": smr,
-        "Slope5": slope5,
-        "Acceleration": accel,
-        "Top_Divergence": top_div,
-        "Blow_Off_Phase": bop,
-        "MOMENTUM_LOCK": mom_lock
-    }
+        time.sleep(0.15 * (k + 1))
 
-
-def pick_regime_and_limit(m: dict, vix_last: Optional[float]) -> Tuple[str, float, List[str]]:
-    lock_reason: List[str] = []
-
-    # 核心指標缺失 -> DATA_FAILURE -> max_equity=0
-    if m.get("twii_close") is None or m.get("SMR") is None or vix_last is None:
-        lock_reason.append("DATA_FAILURE_CORE_METRIC_MISSING")
-        return "DATA_FAILURE", 0.0, lock_reason
-
-    smr = float(m["SMR"])
-    bop = bool(m.get("Blow_Off_Phase"))
-
-    # 示例：可依你自己的版本調整
-    if vix_last > 35:
-        return "CRASH_RISK", 0.10, []
-    if bop or smr >= SMR_BLOW_OFF or smr >= SMR_OVERHEAT:
-        return "CRITICAL_OVERHEAT", 0.10, []
-    if smr >= 0.25:
-        return "OVERHEAT", 0.40, []
-    return "NORMAL", 0.85, []
+    return None, None, False
 
 
-# =========================
-# FinMind Institutional
-# =========================
+def detect_price_duplicate_cluster(stocks: List[Dict[str, Any]], min_cluster: int = 3, min_price: float = 50.0) -> Dict[float, List[str]]:
+    """
+    找出同價群（價格完全相同）且群聚 >= min_cluster，且 price >= min_price
+    回 {price: [symbols]}
+    """
+    bucket: Dict[float, List[str]] = {}
+    for s in stocks:
+        p = s.get("Price")
+        sym = s.get("Symbol")
+        if p is None or sym is None:
+            continue
+        try:
+            p = float(p)
+            if p < min_price:
+                continue
+            bucket.setdefault(p, []).append(sym)
+        except:
+            continue
 
+    return {p: syms for p, syms in bucket.items() if len(syms) >= min_cluster}
+
+
+# =========================================================
+# 5) FinMind Institutional
+# =========================================================
 def fetch_inst_3d(symbols: List[str], target_date: str, token: str) -> pd.DataFrame:
-    """
-    回傳 columns: symbol, net_3d
-    若抓不到 -> empty df
-    """
     rows = []
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     start_date = (pd.to_datetime(target_date) - pd.Timedelta(days=10)).strftime("%Y-%m-%d")
@@ -379,7 +482,7 @@ def fetch_inst_3d(symbols: List[str], target_date: str, token: str) -> pd.DataFr
             if not data:
                 continue
             df = pd.DataFrame(data)
-            # 有些資料集欄位不同，這裡保守處理
+
             buy = pd.to_numeric(df.get("buy", 0), errors="coerce").fillna(0)
             sell = pd.to_numeric(df.get("sell", 0), errors="coerce").fillna(0)
             df["net"] = buy - sell
@@ -391,9 +494,28 @@ def fetch_inst_3d(symbols: List[str], target_date: str, token: str) -> pd.DataFr
     return pd.DataFrame(rows)
 
 
-# =========================
-# Confidence helper
-# =========================
+# =========================================================
+# 6) Regime + max equity
+# =========================================================
+def pick_regime_and_limit(m: dict, vix_last: Optional[float]) -> Tuple[str, float, List[str]]:
+    lock_reason: List[str] = []
+
+    # 核心缺失：先判 DATA_FAILURE
+    if m.get("SMR") is None or vix_last is None:
+        lock_reason.append("DATA_FAILURE_CORE_METRIC_MISSING")
+        return "DATA_FAILURE", 0.0, lock_reason
+
+    smr = float(m["SMR"])
+    bop = bool(m.get("Blow_Off_Phase"))
+
+    if vix_last > 35:
+        return "CRASH_RISK", 0.10, []
+    if bop or smr >= SMR_BLOW_OFF or smr >= SMR_OVERHEAT:
+        return "CRITICAL_OVERHEAT", 0.10, []
+    if smr >= 0.25:
+        return "OVERHEAT", 0.40, []
+    return "NORMAL", 0.85, []
+
 
 def price_conf_level(missing_cnt: int, total: int) -> str:
     if total <= 0:
@@ -405,6 +527,9 @@ def price_conf_level(missing_cnt: int, total: int) -> str:
     return "LOW"
 
 
+# =========================================================
+# MAIN
+# =========================================================
 def main():
     st.title(APP_TITLE)
 
@@ -418,14 +543,26 @@ def main():
         st.header("🧾 盤中法人資料策略")
         allow_intraday_same_day_inst = st.toggle(
             "盤中允許當日法人資料（Inst=READY）",
-            value=False,
-            help="關閉：盤中預設使用 T-1（USING_T_MINUS_1 / inst_data_fresh=false）。\n"
-                 "開啟：盤中嘗試當日法人（READY / inst_data_fresh=true）。"
+            value=False
         )
         enforce_token_when_same_day = st.toggle(
-            "（建議）盤中當日法人必須有 Token（否則退回 T-1）",
-            value=True,
-            help="開啟：若未填 Token，會自動退回使用 T-1，避免 READY 假新鮮。"
+            "盤中當日法人必須有 Token（否則退回 T-1）",
+            value=True
+        )
+
+        st.divider()
+        st.header("🧯 防污染護欄")
+        strict_price_duplicate_guard = st.toggle(
+            "嚴格模式：同價群（≥3 檔且價>50）視為疑似污染，除第一檔外改為 None",
+            value=True
+        )
+
+        st.divider()
+        st.header("🧱 DATA_FAILURE 行為")
+        data_failure_softcap_5pct = st.toggle(
+            "DATA_FAILURE 軟鎖：若 twii_close 有但 SMR 缺失，允許 max_equity=5%（仍保守）",
+            value=False,
+            help="關閉＝完全合憲『缺核心指標就 0%』。開啟＝盤中避免永遠卡死，但仍保守 5%。"
         )
 
         st.divider()
@@ -446,44 +583,41 @@ def main():
     market_status_reason: List[str] = []
 
     with st.spinner("資料抓取 + 稽核中..."):
-        # 1) Hardened fetch: TWII df + VIX
-        twii_df, vix_last, idx_reasons = safe_fetch_twii_df_and_vix()
+        # 1) index hardened
+        twii_df, vix_last, idx_reasons = fetch_twii_df_and_vix_hardened(retry=3)
         market_status_reason.extend(idx_reasons)
 
-        # 2) Regime metrics
-        m = compute_regime_metrics(twii_df)
+        # 2) SMR hardened
+        m, smr_reasons = compute_regime_metrics_hardened(twii_df)
+        # 若 SMR 仍缺，留下原因碼
+        for r in smr_reasons:
+            if r not in market_status_reason:
+                market_status_reason.append(r)
 
-        # 3) Amount
-        amt = fetch_blended_amount(trade_date)
-        if amt.status_tpex != "OK":
-            market_status_reason.append("TPEX_ESTIMATED")
-        if amt.status_twse != "OK":
-            market_status_reason.append("TWSE_ESTIMATED")
-        if amt.confidence_level == "LOW":
-            market_status_reason.append("AMOUNT_CONF_LOW")
+        # 3) amount
+        amt, amt_reasons = fetch_blended_amount(trade_date)
+        market_status_reason.extend([r for r in amt_reasons if r not in market_status_reason])
 
-        market_status = "DEGRADED" if len(market_status_reason) > 0 else "NORMAL"
-        conf_penalty = 0.5 if amt.confidence_level == "LOW" else 1.0
-
-        # 4) regime + max_equity
+        # 4) regime + max equity
         regime, base_limit, lock_reason = pick_regime_and_limit(m, vix_last)
 
-        final_limit = base_limit * conf_penalty
+        # DATA_FAILURE 軟鎖（可選）：twii_close 有但 SMR 缺失 → 5%
+        if regime == "DATA_FAILURE" and data_failure_softcap_5pct:
+            if m.get("twii_close") is not None and m.get("SMR") is None:
+                base_limit = 0.05
+                lock_reason = ["DATA_FAILURE_SMR_MISSING_SOFTCAP_5PCT"]
 
-        # 如果 DATA_FAILURE -> final_limit=0
-        # 若非 DATA_FAILURE，但 final_limit==0（不合理），保守給 5% 但留下 lock_reason
-        if regime != "DATA_FAILURE" and final_limit == 0.0:
-            lock_reason.append("UNEXPECTED_ZERO_LIMIT_GUARD")
-            final_limit = 0.05
+        # 成交金額信心懲罰（保守）
+        conf_penalty = 0.5 if amt.confidence_level == "LOW" else 1.0
+        final_limit = float(base_limit * conf_penalty)
 
-        # 5) 盤中法人策略（UI 開關決定）
-        use_same_day_inst = False
+        # 5) 盤中法人策略
         if session == "EOD":
             use_same_day_inst = True
         else:
             use_same_day_inst = bool(allow_intraday_same_day_inst)
             if enforce_token_when_same_day and use_same_day_inst and (not token):
-                use_same_day_inst = False  # 沒 token 退回 T-1
+                use_same_day_inst = False
 
         if use_same_day_inst:
             inst_effective_date = trade_date
@@ -494,46 +628,47 @@ def main():
 
         inst_source = "FinMind" if token else "FinMind_PUBLIC_OR_EMPTY_TOKEN"
 
-        # 6) 拉法人（用 inst_effective_date）
+        # 6) inst fetch
         symbols = SYMBOLS_TOP20[:topn]
         inst_df = fetch_inst_3d(symbols, inst_effective_date, token)
 
-        # 7) 個股：嚴格抓價/量比（不允許沿用殘值）
+        # 7) stocks fetch hardened
         stocks_output: List[Dict[str, Any]] = []
         missing_price_cnt = 0
         no_inst_cnt = 0
 
-        smr_val = m.get("SMR") if m.get("SMR") is not None else None
-
         for i, sym in enumerate(symbols, 1):
-            price, vr_raw = safe_fetch_stock_price_vol(sym)
-            if price is None:
+            price, vr_raw, ok = fetch_stock_price_vol_hardened(sym, retry=2)
+            if not ok:
                 missing_price_cnt += 1
 
             vr = None
             if vr_raw is not None:
-                vr = (vr_raw / progress) if (session == "INTRADAY") else vr_raw
+                vr = (vr_raw / progress) if session == "INTRADAY" else vr_raw
 
             has_inst = (not inst_df.empty) and (sym in inst_df["symbol"].values)
             net_val = float(inst_df[inst_df["symbol"] == sym]["net_3d"].iloc[0]) if has_inst else None
 
-            if has_inst:
-                if use_same_day_inst:
+            # 法人狀態（嚴格一致）
+            if use_same_day_inst:
+                if has_inst:
                     inst_status = "READY"
                     inst_fresh = True
                 else:
-                    inst_status = "USING_T_MINUS_1"
+                    inst_status = "NO_UPDATE_TODAY"
                     inst_fresh = False
+                    no_inst_cnt += 1
             else:
-                inst_status = "NO_UPDATE_TODAY"
+                # T-1 模式：一律 USING_T_MINUS_1（即使抓到值，也標示非新鮮）
+                inst_status = "USING_T_MINUS_1"
                 inst_fresh = False
-                no_inst_cnt += 1
 
-            # tier_level（示例）：你可換回自己版本的 tier 判斷
-            if smr_val is not None and smr_val >= SMR_OVERHEAT:
-                tier_level = 2  # 過熱強制弱化
+            # tier_level（示例）：SMR 過熱強制弱化
+            smr_val = m.get("SMR")
+            if smr_val is not None and float(smr_val) >= SMR_OVERHEAT:
+                tier_level = 2
             else:
-                tier_level = 1 if (vr is not None and vr >= 1.2 and inst_fresh) else 2
+                tier_level = 2
 
             stocks_output.append({
                 "Symbol": sym,
@@ -552,33 +687,41 @@ def main():
                 }
             })
 
-        # 8) 補充 market_status_reason：價格缺失
+        # 8) 價格缺失 reason
         if missing_price_cnt > 0:
             market_status_reason.append(f"PRICE_MISSING_{missing_price_cnt}_OF_{len(stocks_output)}")
 
-        # 9) confidence 多維欄位（稽核可回放）
+        # 9) 同價群污染偵測（可選嚴格）
+        dup_clusters = detect_price_duplicate_cluster(stocks_output, min_cluster=3, min_price=50.0)
+        if dup_clusters:
+            for p, syms in dup_clusters.items():
+                market_status_reason.append(f"PRICE_DUPLICATE_CLUSTER_{len(syms)}@{p}")
+                if strict_price_duplicate_guard:
+                    # 除第一個外都置 None（避免錯檔價帶入決策）
+                    keep = syms[0]
+                    for s in stocks_output:
+                        if s["Symbol"] in syms and s["Symbol"] != keep:
+                            s["Price"] = None
+                            s["Vol_Ratio"] = None
+
+        # 10) confidence 多維欄位
         price_conf = price_conf_level(missing_price_cnt, len(stocks_output))
         volume_conf = "MEDIUM" if session == "INTRADAY" else "HIGH"
-        # 法人信心：盤中用 T-1 => LOW；若盤中當日但缺很多 => MEDIUM/LOW
         if session == "EOD":
             inst_conf = "HIGH" if no_inst_cnt == 0 else "MEDIUM"
         else:
-            if use_same_day_inst:
-                inst_conf = "MEDIUM" if no_inst_cnt <= max(1, len(stocks_output) // 5) else "LOW"
-            else:
-                inst_conf = "LOW"
+            inst_conf = "LOW" if not use_same_day_inst else ("MEDIUM" if no_inst_cnt <= max(1, len(stocks_output)//5) else "LOW")
 
-        # 10) 若有任何原因 -> market_status 至少 DEGRADED
+        # 11) market_status
         market_status = "DEGRADED" if len(market_status_reason) > 0 else "NORMAL"
 
-        # 11) macro.overview 組裝（保留 None 不硬補）
+        # 12) macro overview
         macro_overview = dict(m)
         macro_overview["vix"] = vix_last
         macro_overview["max_equity_allowed_pct"] = float(final_limit)
-        macro_overview["calc_version"] = "V16.3.x+UCC_PATCH_2026-02-24"
+        macro_overview["calc_version"] = "V16.3.x+UCC_PATCH_2026-02-24_FINAL"
         macro_overview["slope5_def"] = "diff5_of_SMR"
 
-        # 12) payload（最終一致版）
         payload: Dict[str, Any] = {
             "meta": {
                 "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -615,14 +758,14 @@ def main():
         }
 
     # =======================
-    # UI: 摘要
+    # UI: Summary
     # =======================
     st.subheader("📡 宏觀 / 風控摘要")
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("market_status", payload["meta"]["market_status"], delta=";".join(payload["meta"]["market_status_reason"]) or "OK", delta_color="off")
     c2.metric("current_regime", payload["meta"]["current_regime"])
     c3.metric("max_equity_allowed_pct", f"{payload['macro']['overview']['max_equity_allowed_pct']*100:.1f}%")
-    c4.metric("SMR", str(payload["macro"]["overview"]["SMR"]), delta=f"BlowOff={payload['macro']['overview']['Blow_Off_Phase']}", delta_color="off")
+    c4.metric("SMR", str(payload["macro"]["overview"]["SMR"]), delta=f"VIX={payload['macro']['overview']['vix']}", delta_color="off")
 
     st.caption(
         f"盤中法人策略：allow_same_day={allow_intraday_same_day_inst}, enforce_token={enforce_token_when_same_day}, "
@@ -631,7 +774,7 @@ def main():
     )
 
     # =======================
-    # UI: UCC 輸出
+    # UI: UCC
     # =======================
     st.markdown("---")
     st.subheader("🧠 UCC V19.1 輸出（RUN 單一層級）")
