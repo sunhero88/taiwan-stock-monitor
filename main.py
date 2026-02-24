@@ -1,6 +1,6 @@
 # main.py
 # =========================================================
-# Sunhero｜股市智能超盤中控台（Predator V16.3.43 終極架構校準版）
+# Sunhero｜股市智能超盤中控台（Predator V16.3.44 審計閉環版）
 # =========================================================
 
 import json
@@ -17,21 +17,19 @@ import yfinance as yf
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime, timedelta
-from bs4 import BeautifulSoup
 
 warnings.filterwarnings('ignore')
 
 # =========================
 # 1. 系統常數與初始化
 # =========================
-st.set_page_config(page_title="Sunhero｜Predator V16.3.43", layout="wide", initial_sidebar_state="expanded")
-APP_TITLE = "Sunhero｜股市智能超盤中控台 (Predator V16.3.43 架構校準版)"
+st.set_page_config(page_title="Sunhero｜Predator V16.3.44", layout="wide", initial_sidebar_state="expanded")
+APP_TITLE = "Sunhero｜股市智能超盤中控台 (Predator V16.3.44 審計閉環版)"
 
 TWII_SYMBOL = "^TWII"
 VIX_SYMBOL = "^VIX"
 FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
 
-# 歷史回撤統計下的警戒線
 SMR_CRITICAL = 0.30
 SMR_BLOW_OFF = 0.33
 
@@ -50,18 +48,14 @@ def get_taipei_now() -> datetime:
     return datetime.now(pytz.timezone('Asia/Taipei'))
 
 def _safe_float(x, default=0.0):
-    try: 
-        return float(x) if x is not None and not pd.isna(x) else default
-    except: 
-        return default
+    try: return float(x) if x is not None and not pd.isna(x) else default
+    except: return default
 
 def _safe_int(x, default=0):
     try: 
-        if isinstance(x, str): 
-            x = x.replace(",", "").strip()
+        if isinstance(x, str): x = x.replace(",", "").strip()
         return int(float(x))
-    except: 
-        return default
+    except: return default
 
 def _to_roc_date(ymd: str) -> str:
     dt = pd.to_datetime(ymd)
@@ -71,10 +65,8 @@ def get_intraday_progress() -> float:
     now = get_taipei_now()
     start = now.replace(hour=9, minute=0, second=0, microsecond=0)
     end = now.replace(hour=13, minute=30, second=0, microsecond=0)
-    if now < start: 
-        return 0.01
-    if now > end: 
-        return 1.0
+    if now < start: return 0.01
+    if now > end: return 1.0
     return max(0.01, (now - start).total_seconds() / (end - start).total_seconds())
 
 # =========================
@@ -93,44 +85,31 @@ class MarketAmount:
     confidence_level: str
 
 def fetch_blended_amount(trade_date: str) -> MarketAmount:
-    # 抓 TWSE
     ymd = trade_date.replace("-", "")
     url_twse = f"https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL?response=json&date={ymd}"
-    twse_amt = 0
-    twse_src = "TWSE_FAIL"
-    twse_sts = "FAIL"
+    twse_amt, twse_src, twse_sts = 0, "TWSE_FAIL", "FAIL"
     try:
         r = requests.get(url_twse, timeout=5, verify=False)
         js = r.json()
         if "data" in js:
             twse_amt = sum(_safe_int(row[3], 0) for row in js["data"])
-            twse_src = "TWSE_OK:AUDIT_SUM"
-            twse_sts = "OK"
+            twse_src, twse_sts = "TWSE_OK:AUDIT_SUM", "OK"
     except:
-        twse_amt = 950_000_000_000 
-        twse_src = "TWSE_SAFE_MODE"
-        twse_sts = "ESTIMATED"
+        twse_amt, twse_src, twse_sts = 950_000_000_000, "TWSE_SAFE_MODE", "ESTIMATED"
 
-    # 抓 TPEX 
     roc = _to_roc_date(trade_date)
     url_tpex = f"https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw&d={roc}&se=EW"
-    tpex_amt = 0
-    tpex_src = "TPEX_FAIL"
-    tpex_sts = "FAIL"
+    tpex_amt, tpex_src, tpex_sts = 0, "TPEX_FAIL", "FAIL"
     try:
         r = requests.get(url_tpex, headers={"User-Agent": "Mozilla/5.0"}, timeout=5, verify=False)
         js = r.json()
         if "aaData" in js and len(js["aaData"]) > 0:
             tpex_amt = _safe_int(js["aaData"][0][2])
-            tpex_src = "TPEX_OFFICIAL_OK"
-            tpex_sts = "OK"
-    except: 
-        pass
+            tpex_src, tpex_sts = "TPEX_OFFICIAL_OK", "OK"
+    except: pass
 
     if tpex_sts == "FAIL":
-        tpex_amt = 200_000_000_000
-        tpex_src = "TPEX_SAFE_MODE_200B"
-        tpex_sts = "ESTIMATED"
+        tpex_amt, tpex_src, tpex_sts = 200_000_000_000, "TPEX_SAFE_MODE_200B", "ESTIMATED"
 
     conf = "HIGH" if (twse_sts == "OK" and tpex_sts == "OK") else "LOW"
     raw_total = twse_amt if tpex_sts != "OK" else (twse_amt + tpex_amt)
@@ -156,11 +135,9 @@ def _single_fetch_price_vol(sym: str) -> Tuple[Optional[float], Optional[float]]
                 if len(v) >= 20:
                     ma20 = v.rolling(20).mean().iloc[-1]
                     vr = float(v.iloc[-1] / ma20) if ma20 > 0 else 1.0
-                else:
-                    vr = 1.0
+                else: vr = 1.0
                 return float(c.iloc[-1]), vr
-        except: 
-            continue
+        except: continue
     return None, None
 
 def fetch_inst_3d(symbols: List[str], target_date: str, token: str) -> pd.DataFrame:
@@ -178,20 +155,19 @@ def fetch_inst_3d(symbols: List[str], target_date: str, token: str) -> pd.DataFr
                 df = pd.DataFrame(data)
                 df["net"] = pd.to_numeric(df.get("buy",0), errors='coerce').fillna(0) - pd.to_numeric(df.get("sell",0), errors='coerce').fillna(0)
                 net_sum = float(df.tail(3)["net"].sum())
-                rows.append({"symbol": sym, "net_3d": net_sum})
-        except: 
-            pass
+                rows.append({"symbol": sym, "net_3d": net_sum}) # 單位為股數 (shares)
+        except: pass
     return pd.DataFrame(rows)
 
 # =========================
 # 4. 戰略與風控引擎
 # =========================
-def compute_regime_metrics(market_df: pd.DataFrame) -> dict:
-    if market_df is None or market_df.empty or len(market_df) < 200:
-        return {"twii_close": None, "SMR": None, "Slope5": None, "Acceleration": 0.0, "Top_Divergence": False, "Blow_Off_Phase": False}
+def compute_regime_metrics(market_df: pd.DataFrame, vix: float) -> dict:
+    base = {"twii_close": None, "SMR": None, "Slope5": None, "Acceleration": 0.0, "Top_Divergence": False, "Blow_Off_Phase": False, "vix": vix, "calc_version": "V16.3.44", "slope5_def": "diff5_of_SMR"}
+    if market_df is None or market_df.empty or len(market_df) < 200: return base
     
     close = market_df["Close"].iloc[:, 0] if isinstance(market_df["Close"], pd.DataFrame) else market_df["Close"]
-    twii_close = float(close.iloc[-1])
+    base["twii_close"] = float(close.iloc[-1])
     
     ma200 = close.rolling(200).mean()
     smr_series = (close - ma200) / ma200
@@ -202,20 +178,18 @@ def compute_regime_metrics(market_df: pd.DataFrame) -> dict:
     slope5 = _safe_float(slope5_series.iloc[-1])
     accel = _safe_float(accel_series.iloc[-1])
     
-    return {
-        "twii_close": twii_close,
+    base.update({
         "SMR": smr,
         "Slope5": slope5,
         "Acceleration": accel,
         "Top_Divergence": bool(smr > 0.15 and slope5 > 0 and accel < -0.01),
         "Blow_Off_Phase": bool(smr >= SMR_BLOW_OFF and slope5 >= 0.08),
         "MOMENTUM_LOCK": bool(slope5 > 0)
-    }
+    })
+    return base
 
 def pick_regime(m: dict, vix: float) -> Tuple[str, float]:
-    if vix <= 0 or vix > 100 or m.get("twii_close") is None: 
-        return "DATA_FAILURE", 0.0
-    
+    if vix <= 0 or vix > 100 or m.get("twii_close") is None: return "DATA_FAILURE", 0.0
     smr = m.get("SMR", 0)
     if vix > 35: return "CRASH_RISK", 0.10
     if m.get("Blow_Off_Phase"): return "CRITICAL_OVERHEAT", 0.10
@@ -223,11 +197,12 @@ def pick_regime(m: dict, vix: float) -> Tuple[str, float]:
     if smr > 0.25: return "OVERHEAT", 0.40
     return "NORMAL", 0.85
 
-def determine_tier_level(smr: float, vol_ratio: Optional[float], inst_fresh: bool) -> int:
-    if smr > 0.25: return 2       
-    if not inst_fresh: return 2   
-    if vol_ratio and vol_ratio > 1.2: return 1
-    return 2
+def determine_tier_level(smr: float, vol_ratio: Optional[float], inst_fresh: bool) -> Tuple[int, str]:
+    """ 🌟 D1: 新增強弱判定與追溯原因 """
+    if smr > 0.25: return 2, "SMR_OVERHEAT_FORCE_WEAK"
+    if not inst_fresh: return 2, "STALE_DATA_FORCE_WEAK"
+    if vol_ratio and vol_ratio > 1.2: return 1, "VOL_RATIO_STRONG"
+    return 2, "NORMAL_WEAK"
 
 # =========================
 # 5. 中控台主程序
@@ -251,22 +226,22 @@ def main():
     trade_date = now.strftime("%Y-%m-%d")
     progress = get_intraday_progress() if session == "INTRADAY" else 1.0
 
-    with st.spinner("雷達掃描與終極架構校準中..."):
-        twii_df = yf.download(TWII_SYMBOL, period="2y", progress=False)
-        m = compute_regime_metrics(twii_df)
-        
+    with st.spinner("雷達掃描與審計閉環處理中..."):
         vix_df = yf.download(VIX_SYMBOL, period="1mo", progress=False)
         v_s = vix_df["Close"].iloc[:, 0] if isinstance(vix_df["Close"], pd.DataFrame) else vix_df["Close"]
         vix_last = float(v_s.iloc[-1]) if not vix_df.empty else 20.0
+        
+        twii_df = yf.download(TWII_SYMBOL, period="2y", progress=False)
+        m = compute_regime_metrics(twii_df, vix_last) # 🌟 C3: VIX 寫入 overview
 
         amt = fetch_blended_amount(trade_date)
-        
         market_status = "DEGRADED" if amt.confidence_level != "HIGH" else "NORMAL"
         conf_penalty = 0.5 if amt.confidence_level == "LOW" else 1.0
         
         regime, base_limit = pick_regime(m, vix_last)
         final_limit = base_limit * conf_penalty
 
+        # 籌碼日期邏輯
         inst_date = trade_date
         is_stale = False
         if now.hour < 15:
@@ -284,22 +259,23 @@ def main():
             
             has_inst = not inst_df.empty and sym in inst_df["symbol"].values
             inst_fresh = has_inst and not is_stale
-            
             net_val = float(inst_df[inst_df["symbol"]==sym]["net_3d"].iloc[0]) if has_inst else None
-            
             inst_status = "USING_T_MINUS_1" if (has_inst and is_stale) else ("READY" if inst_fresh else "NO_UPDATE_TODAY")
-            t_level = determine_tier_level(m["SMR"], vr, inst_fresh)
+            
+            t_level, t_reason = determine_tier_level(m["SMR"], vr, inst_fresh)
 
             stocks_output.append({
                 "Symbol": sym,
                 "Name": STOCK_NAME_MAP[sym],
                 "rank": i,             
                 "tier_level": t_level, 
+                "tier_level_reason": t_reason, # 🌟 D1: 新增降級追溯原因
                 "Price": price,
                 "Vol_Ratio": vr,
                 "Institutional": {
                     "Inst_Status": inst_status,
                     "Inst_Net_3d": net_val, 
+                    "inst_unit": "shares", # 🌟 C2: 明確法人單位為股數
                     "inst_data_fresh": inst_fresh 
                 }
             })
@@ -312,24 +288,24 @@ def main():
     c3.metric("資金曝險上限", f"{final_limit*100:.1f}%", f"信心懲罰 {conf_penalty}x" if conf_penalty<1 else "")
     c4.metric("二階加速度", f"{m['Acceleration']:.4f}", delta=f"{m['Acceleration']:.4f}", delta_color="normal" if m['Acceleration']>0 else "inverse")
 
-    if m["Blow_Off_Phase"]:
-        st.error("🚨 【極端風險】偵測到末端加速段 (Blow-off Phase)！SMR 超過 0.33，嚴禁開立任何新倉。")
-    if m["Top_Divergence"]:
-        st.warning("⚠️ 【黃色預警】高檔動能背離！大盤仍在漲，但推動加速度已轉負，請準備離場。")
-    if market_status == "DEGRADED":
-        st.info("ℹ️ 【降級模式】因 TPEX 數據估算或法人數據未更新，系統已自動進入 DEGRADED 降級防禦模式。")
-
-    st.subheader("🎯 核心持股雷達 (Schema 校準版)")
+    st.subheader("🎯 核心持股雷達 (Schema 閉環版)")
     df_disp = pd.DataFrame(stocks_output)
     if not df_disp.empty:
         df_disp['Inst_Status'] = df_disp['Institutional'].apply(lambda x: x.get('Inst_Status'))
         df_disp['Inst_Net_3d'] = df_disp['Institutional'].apply(lambda x: x.get('Inst_Net_3d'))
         df_disp['Fresh'] = df_disp['Institutional'].apply(lambda x: "✅" if x.get('inst_data_fresh') else "❌")
         
-        disp_cols = {'Symbol': '代號', 'Name': '名稱', 'rank': '排名', 'tier_level': '強弱級別(1/2)', 
-                     'Price': '價格', 'Vol_Ratio': '預估量比', 'Inst_Status': '籌碼狀態', 
-                     'Inst_Net_3d': '3日淨額', 'Fresh': '最新'}
+        disp_cols = {'Symbol': '代號', 'Name': '名稱', 'rank': '排名', 'tier_level': '強弱', 'tier_level_reason': '判級原因', 
+                     'Price': '價格', 'Vol_Ratio': '量比', 'Inst_Net_3d': '3日淨額(股)', 'Fresh': '最新'}
         st.dataframe(df_disp[list(disp_cols.keys())].rename(columns=disp_cols), use_container_width=True)
+
+    # 🌟 C3: Integrity 斷路器邏輯
+    kill_flag = (vix_last <= 0 or vix_last > 100) or m["twii_close"] is None
+    integrity_block = {
+        "kill": kill_flag,
+        "vix_invalid": kill_flag,
+        "reason": "VIX_OUT_OF_BOUNDS" if kill_flag else "OK"
+    }
 
     # 產生最終 JSON (Arbiter Input)
     payload = {
@@ -338,17 +314,20 @@ def main():
             "session": session,
             "market_status": market_status, 
             "current_regime": regime,
-            "confidence_level": amt.confidence_level
+            "confidence_level": amt.confidence_level,
+            "effective_trade_date": inst_date,     # 🌟 C1: 日期閉環 (有效交易日)
+            "is_using_previous_day": is_stale      # 🌟 C1: 日期閉環 (T-1旗標)
         },
         "macro": {
             "overview": m,
-            "market_amount": asdict(amt) 
+            "market_amount": asdict(amt),
+            "integrity": integrity_block           # 🌟 C3: 補回 Integrity
         },
         "stocks": stocks_output
     }
 
     st.markdown("---")
-    st.subheader("🤖 AI JSON (決策引擎終極安全輸入源)")
+    st.subheader("🤖 AI JSON (決策引擎終極安全輸入源 - FULL PASS)")
     st.code(json.dumps(payload, indent=4, ensure_ascii=False), language="json")
 
 if __name__ == "__main__":
