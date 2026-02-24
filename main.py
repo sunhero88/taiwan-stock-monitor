@@ -1,6 +1,6 @@
 # main.py
 # =========================================================
-# Sunhero｜股市智能超盤中控台（Predator V16.3.38.1 旗艦合憲版）
+# Sunhero｜股市智能超盤中控台（Predator V16.3.38.2 終極防禦版）
 # =========================================================
 # 整合功能：
 #   (1) 修正 yfinance API 改版造成的 MultiIndex (DataFrame) 報錯崩潰問題
@@ -8,7 +8,8 @@
 #   (3) 盤中量能預估歸一化 (Time-Weighted Volume)
 #   (4) 雙鴻(3324)等上櫃股 YF 後綴自動切換 (.TW/.TWO)
 #   (5) 籌碼殭屍熔斷：15:00 前強制歸零
-#   (6) 全功能 UI：儀表板、警報區、法人明細、AI JSON 複製
+#   (6) 修正過年期間交易日不足導致 MA20 算不出來的 3.27 異常 (改抓 2mo)
+#   (7) 全功能 UI：儀表板、警報區、法人明細、AI JSON 複製
 # =========================================================
 
 from __future__ import annotations
@@ -34,12 +35,12 @@ warnings.filterwarnings('ignore')
 # 1. 初始化與常數
 # =========================
 st.set_page_config(
-    page_title="Sunhero｜Predator V16.3.38.1",
+    page_title="Sunhero｜Predator V16.3.38.2",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-APP_TITLE = "Sunhero｜股市智能超盤中控台 (Predator V16.3.38.1 最終修復版)"
+APP_TITLE = "Sunhero｜股市智能超盤中控台 (Predator V16.3.38.2 終極防禦版)"
 st.title(APP_TITLE)
 
 EPS = 1e-4
@@ -168,11 +169,11 @@ def fetch_amount_total(trade_date: str) -> MarketAmount:
     return MarketAmount(twse_amt, tpex_amt, total, twse_src, tpex_src, "OK", tpex_sts, conf, "ALL", {"twse": twse_meta})
 
 def _single_fetch_price_vol(sym: str) -> Tuple[Optional[float], Optional[float]]:
-    # 自動補丁：雙鴻等上櫃股如果 .TW 抓不到就換 .TWO
     ticker_base = sym.split(".")[0]
     for suffix in [".TW", ".TWO"]:
         try:
-            df = yf.download(f"{ticker_base}{suffix}", period="1mo", progress=False)
+            # 🔥 修正：從 1mo 改為 2mo，確保無論如何都有 >20 個交易日可算 MA20
+            df = yf.download(f"{ticker_base}{suffix}", period="2mo", progress=False)
             if not df.empty:
                 # 🔥 修復 yfinance MultiIndex 問題
                 c_s = df["Close"].iloc[:, 0] if isinstance(df["Close"], pd.DataFrame) else df["Close"]
@@ -180,8 +181,14 @@ def _single_fetch_price_vol(sym: str) -> Tuple[Optional[float], Optional[float]]
                 
                 c = float(c_s.iloc[-1])
                 v = float(v_s.iloc[-1])
-                ma20 = float(v_s.rolling(20).mean().iloc[-1])
-                return c, float(v/ma20) if ma20 > 0 else 1.0
+                
+                # 確保數值有效
+                if len(v_s) >= 20:
+                    ma20 = float(v_s.rolling(20).mean().iloc[-1])
+                    vr = float(v/ma20) if ma20 > 0 else 1.0
+                else:
+                    vr = 1.0
+                return c, vr
         except: continue
     return None, None
 
