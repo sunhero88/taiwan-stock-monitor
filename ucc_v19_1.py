@@ -1,13 +1,12 @@
 # ucc_v19_1.py
 # =========================================================
-# Predator UCC V19.1 Hardened Final Lockdown (Practical Build)
+# Predator UCC V19.1 Hardened Final Lockdown (Audit-Hardened)
 # - JSON-only
 # - path=value evidence
 # - single-mode output (L1 or L2 or L3)
 # =========================================================
 
 from __future__ import annotations
-import json
 import re
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -15,15 +14,10 @@ Json = Dict[str, Any]
 
 
 def _split_path(path: str) -> List[str]:
-    # split by dot, but keep [idx] parts inside token
     return re.split(r"\.(?![^\[]*\])", path)
 
 
 def jget(d: Any, path: str, default: Any = None) -> Any:
-    """
-    Minimal JSON-path getter supporting dot + [idx].
-    Wildcard [*] is handled by caller.
-    """
     cur = d
     for tok in _split_path(path):
         if not tok:
@@ -93,7 +87,7 @@ class UCCv19_1:
         return (len(reasons) > 0), reasons
 
     # -------------------------
-    # L1 Fatal checks
+    # L1 Fatal checks (per spec)
     # -------------------------
     def l1_fatal_checks(self, j: Json) -> List[str]:
         issues: List[str] = []
@@ -169,6 +163,25 @@ class UCCv19_1:
                 f"meta.effective_trade_date={jget(j,'meta.effective_trade_date')} -> WARNING(using_t_minus_1)"
             )
 
+        # Extra (non-fatal) consistency checks: forensics-friendly
+        regime = jget(j, "meta.current_regime")
+        smr = to_float(jget(j, "macro.overview.SMR"))
+        bop = jget(j, "macro.overview.Blow_Off_Phase")
+        if regime == "DATA_FAILURE" and (smr is not None or bop is True):
+            warnings.append(
+                f"meta.current_regime={regime}, macro.overview.SMR={smr}, macro.overview.Blow_Off_Phase={bop} "
+                f"-> WARNING(regime_vs_macro_inconsistent)"
+            )
+
+        # Exposure lock forensic hint
+        max_eq = to_float(jget(j, "macro.overview.max_equity_allowed_pct"))
+        if max_eq is not None and max_eq == 0.0:
+            lock_reason = jget(j, "meta.max_equity_lock_reason")
+            warnings.append(
+                f"macro.overview.max_equity_allowed_pct={max_eq}, meta.max_equity_lock_reason={lock_reason} "
+                f"-> WARNING(exposure_locked_need_reason)"
+            )
+
         stocks = jget(j, "stocks", [])
         if isinstance(stocks, list) and stocks:
             stale = any(
@@ -179,7 +192,6 @@ class UCCv19_1:
             if stale:
                 warnings.append("stocks[*].Institutional.(Inst_Status/inst_data_fresh) -> WARNING(institutional_not_fresh)")
 
-        # verdict/risk
         if fatal:
             verdict = "FAIL"
             risk_level = "CRITICAL"
@@ -280,16 +292,14 @@ class UCCv19_1:
 
         # V17
         v17_on, v17_reasons = self.v17_triggered(j)
-        if v17_on:
-            max_eq = min(max_eq, 0.05)
-
-        # 注意：UCC 不選股；若你未在 JSON 中提供可執行的 action/signal，則維持 NO TRADE
         rr = []
         rr.extend(ms_reasons)
         if v17_on:
+            max_eq = min(max_eq, 0.05)
             rr.extend([f"{r} -> V17_TRIGGERED" for r in v17_reasons])
             rr.append("V17_RULE: MAX_EQUITY_ALLOWED<=5% AND FORBID_OPEN_ADD")
 
+        # UCC不選股：若 JSON 沒提供可執行 signal/action，維持 NO TRADE（合憲保守）
         return "\n".join([
             "MODE: L2_EXECUTE",
             f"MARKET_STATE: {ms}",
@@ -317,7 +327,10 @@ class UCCv19_1:
             reasons.append(f"MARKET_STATE={market_state} -> L3_TRIGGER(DEFENSIVE)")
 
         if exists(j, "portfolio.performance.consecutive_losses"):
-            cl = to_float(jget(j, "portfolio.performance.consecutive_losses"))
+            try:
+                cl = float(jget(j, "portfolio.performance.consecutive_losses"))
+            except:
+                cl = None
             if cl is not None and cl >= 3:
                 reasons.append(f"portfolio.performance.consecutive_losses={cl} -> L3_TRIGGER(>=3)")
 
@@ -332,7 +345,6 @@ class UCCv19_1:
         ms, ms_reasons = self.market_state(j)
         trig, reasons = self.l3_triggered(j, market_state=ms)
         if not trig:
-            # caller should convert to L1 FAIL (V19)
             return "UNREACHABLE"
 
         dd = to_float(jget(j, "portfolio.performance.drawdown_pct"))
@@ -415,7 +427,7 @@ class UCCv19_1:
 
         if run_mode == "L3":
             ms, _ = self.market_state(j)
-            trig, _reasons = self.l3_triggered(j, market_state=ms)
+            trig, _ = self.l3_triggered(j, market_state=ms)
             if not trig:
                 l1["verdict"] = "FAIL"
                 l1["risk_level"] = "CRITICAL"
@@ -426,5 +438,4 @@ class UCCv19_1:
                 return l1
             return self.run_l3(j)
 
-        # fallback
         return l1
