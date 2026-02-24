@@ -1,15 +1,14 @@
 # main.py
 # =========================================================
-# Sunhero｜股市智能超盤中控台（Predator V16.3.38.2 終極防禦版）
+# Sunhero｜股市智能超盤中控台（Predator V16.3.39 風控旗艦版）
 # =========================================================
 # 整合功能：
-#   (1) 修正 yfinance API 改版造成的 MultiIndex (DataFrame) 報錯崩潰問題
-#   (2) TPEX 官方數據修復 (民國年 115/02/24 格式)
-#   (3) 盤中量能預估歸一化 (Time-Weighted Volume)
-#   (4) 雙鴻(3324)等上櫃股 YF 後綴自動切換 (.TW/.TWO)
-#   (5) 籌碼殭屍熔斷：15:00 前強制歸零
-#   (6) 修正過年期間交易日不足導致 MA20 算不出來的 3.27 異常 (改抓 2mo)
-#   (7) 全功能 UI：儀表板、警報區、法人明細、AI JSON 複製
+#   (1) [NEW] VIX 邊界防護網 (0 < vix <= 100)，異常即觸發 Kill-Switch
+#   (2) 修正 yfinance API MultiIndex (DataFrame) 報錯崩潰問題
+#   (3) TPEX 官方數據修復 (民國年 115/02/24 格式)
+#   (4) 盤中量能歸一化 (Time-Weighted) + 2mo 歷史均量防呆 (修正 3.27 異常)
+#   (5) 雙鴻(3324)等上櫃股 YF 後綴自動切換 (.TW/.TWO)
+#   (6) 籌碼殭屍熔斷：15:00 前強制歸零
 # =========================================================
 
 from __future__ import annotations
@@ -35,12 +34,12 @@ warnings.filterwarnings('ignore')
 # 1. 初始化與常數
 # =========================
 st.set_page_config(
-    page_title="Sunhero｜Predator V16.3.38.2",
+    page_title="Sunhero｜Predator V16.3.39",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-APP_TITLE = "Sunhero｜股市智能超盤中控台 (Predator V16.3.38.2 終極防禦版)"
+APP_TITLE = "Sunhero｜股市智能超盤中控台 (Predator V16.3.39 風控旗艦版)"
 st.title(APP_TITLE)
 
 EPS = 1e-4
@@ -107,7 +106,7 @@ class WarningBus:
 warnings_bus = WarningBus()
 
 # =========================
-# 3. 數據抓取模組 (TPEX & Yahoo API 修復)
+# 3. 數據抓取模組
 # =========================
 @dataclass
 class MarketAmount:
@@ -172,17 +171,16 @@ def _single_fetch_price_vol(sym: str) -> Tuple[Optional[float], Optional[float]]
     ticker_base = sym.split(".")[0]
     for suffix in [".TW", ".TWO"]:
         try:
-            # 🔥 修正：從 1mo 改為 2mo，確保無論如何都有 >20 個交易日可算 MA20
+            # 🔥 修正：使用 2mo 確保過年期間也有充足交易日算 MA20
             df = yf.download(f"{ticker_base}{suffix}", period="2mo", progress=False)
             if not df.empty:
-                # 🔥 修復 yfinance MultiIndex 問題
+                # 防禦 MultiIndex 崩潰
                 c_s = df["Close"].iloc[:, 0] if isinstance(df["Close"], pd.DataFrame) else df["Close"]
                 v_s = df["Volume"].iloc[:, 0] if isinstance(df["Volume"], pd.DataFrame) else df["Volume"]
                 
                 c = float(c_s.iloc[-1])
                 v = float(v_s.iloc[-1])
                 
-                # 確保數值有效
                 if len(v_s) >= 20:
                     ma20 = float(v_s.rolling(20).mean().iloc[-1])
                     vr = float(v/ma20) if ma20 > 0 else 1.0
@@ -193,13 +191,12 @@ def _single_fetch_price_vol(sym: str) -> Tuple[Optional[float], Optional[float]]
     return None, None
 
 # =========================
-# 4. 戰略判定 (Layer A/B/C) 降維防禦版
+# 4. 戰略判定與風控熔斷
 # =========================
 def compute_regime_metrics(market_df: pd.DataFrame) -> dict:
     if market_df is None or market_df.empty or len(market_df) < 200:
         return {"twii_close": None, "SMR": None, "Slope5": None}
     
-    # 🔥 修復 yfinance 新版 MultiIndex 問題：強制降維成 1D Series
     close = market_df["Close"]
     if isinstance(close, pd.DataFrame):
         close = close.iloc[:, 0]
@@ -209,7 +206,6 @@ def compute_regime_metrics(market_df: pd.DataFrame) -> dict:
     smr = (close - ma200) / ma200
     slope5_raw = smr.diff(5).iloc[-1]
     
-    # 確保提煉出純淨的標量數值 (Scalar float)
     slope5_val = float(slope5_raw.iloc[0]) if isinstance(slope5_raw, pd.Series) else float(slope5_raw)
     smr_val = float(smr.iloc[-1].iloc[0]) if isinstance(smr.iloc[-1], pd.Series) else float(smr.iloc[-1])
     
@@ -220,19 +216,38 @@ def compute_regime_metrics(market_df: pd.DataFrame) -> dict:
         "MOMENTUM_LOCK": bool(slope5_val > 0)
     }
 
+def compute_integrity_and_kill(metrics: dict, vix_last: float) -> dict:
+    """ 🔥 新增：核心完整性與異常邊界檢查 (Kill-Switch) """
+    kill = False
+    reasons = []
+    
+    if metrics.get("twii_close") is None:
+        kill = True
+        reasons.append("TWII_CLOSE_MISSING")
+        
+    # 🔥 VIX 異常防護網
+    vix_invalid = (vix_last <= 0 or vix_last > 100)
+    if vix_invalid:
+        kill = True
+        reasons.append(f"VIX_ANOMALY_DETECTED({vix_last})")
+        
+    return {
+        "kill": kill,
+        "vix_invalid": vix_invalid,
+        "reason": ", ".join(reasons) if reasons else "OK"
+    }
+
 def pick_regime(metrics: dict, vix: float) -> Tuple[str, float]:
-    if metrics.get("twii_close") is None: return "DATA_FAILURE", 0.0
     smr = metrics.get("SMR", 0)
-    # 🔥 新增極端過熱判定
+    if vix > 35 and vix <= 100: return "CRASH_RISK", 0.10
     if smr > SMR_CRITICAL: return "CRITICAL_OVERHEAT", 0.10
     if smr > 0.25: return "OVERHEAT", 0.45
     if smr > SMR_WATCH and metrics.get("Slope5", 0) < 0: return "MEAN_REVERSION", 0.55
     return "NORMAL", 0.85
 
 def classify_layer(regime, momentum_lock, vol_ratio, inst_status):
-    # 籌碼殭屍熔斷
     if inst_status == "NO_UPDATE_TODAY": return "NONE"
-    if regime == "CRITICAL_OVERHEAT": return "NONE" # 極端風險下禁止分級
+    if regime in ["CRITICAL_OVERHEAT", "CRASH_RISK", "DATA_FAILURE"]: return "NONE"
     if momentum_lock and vol_ratio and vol_ratio > 1.2: return "B"
     return "NONE"
 
@@ -241,29 +256,40 @@ def classify_layer(regime, momentum_lock, vol_ratio, inst_status):
 # =========================
 def build_arbiter_input(session, account_mode, topn, positions, cash, total_equity):
     now = get_taipei_now()
-    # 時間守衛：盤中強制切換日期
     trade_date = now.strftime("%Y-%m-%d")
     is_using_prev = False
     if session == "EOD" and now.hour < 15:
         trade_date = (now - timedelta(days=1)).strftime("%Y-%m-%d")
         is_using_prev = True
 
-    # 1. 市場指標
+    # 1. 市場指標與 VIX 防護
     twii_df = yf.download(TWII_SYMBOL, period="2y", progress=False)
     metrics = compute_regime_metrics(twii_df)
-    vix_df = yf.download(VIX_SYMBOL, period="1mo", progress=False)
     
-    # 🔥 VIX 同樣需要防禦 MultiIndex
+    vix_df = yf.download(VIX_SYMBOL, period="1mo", progress=False)
     if not vix_df.empty:
         v_close = vix_df["Close"].iloc[:, 0] if isinstance(vix_df["Close"], pd.DataFrame) else vix_df["Close"]
         vix_last = float(v_close.iloc[-1])
     else:
         vix_last = 20.0
+
+    # 執行 Kill-Switch 檢查
+    integrity = compute_integrity_and_kill(metrics, vix_last)
     
-    regime, max_eq = pick_regime(metrics, vix_last)
+    if integrity["kill"]:
+        regime = "DATA_FAILURE"
+        max_eq = 0.0
+        final_confidence = "LOW"
+    else:
+        regime, max_eq = pick_regime(metrics, vix_last)
+        
     amount = fetch_amount_total(trade_date)
     
-    # 2. 個股分析 (含盤中量能歸一化)
+    # 若被 Kill-Switch 觸發，覆寫信心等級
+    if not integrity["kill"]:
+        final_confidence = amount.confidence_level
+
+    # 2. 個股分析
     progress = get_intraday_progress() if session == "INTRADAY" else 1.0
     stocks = []
     symbols = list(STOCK_NAME_MAP.keys())[:topn]
@@ -272,7 +298,6 @@ def build_arbiter_input(session, account_mode, topn, positions, cash, total_equi
         price, vr_raw = _single_fetch_price_vol(sym)
         vr_projected = (vr_raw / progress) if vr_raw else None
         
-        # 籌碼熔斷邏輯
         inst_status = "READY" if now.hour >= 15 else "NO_UPDATE_TODAY"
         inst_net = 0.0
         
@@ -284,20 +309,25 @@ def build_arbiter_input(session, account_mode, topn, positions, cash, total_equi
             "Institutional": {"Inst_Status": inst_status, "Inst_Net_3d": inst_net}
         })
 
+    # 組合警報
+    alerts = []
+    if integrity["vix_invalid"]:
+        alerts.append(f"🚨 CRITICAL: VIX 數值異常 ({vix_last})，已觸發風控強制熔斷！")
+
     payload = {
         "meta": {
-            "timestamp": _now_ts(), "session": session, "market_status": "NORMAL",
-            "current_regime": regime, "confidence_level": amount.confidence_level,
+            "timestamp": _now_ts(), "session": session, "market_status": "NORMAL" if not integrity["kill"] else "SHELTER",
+            "current_regime": regime, "confidence_level": final_confidence,
             "is_using_previous_day": is_using_prev, "account_mode": account_mode
         },
         "macro": {
             "overview": {**metrics, "vix": vix_last, "max_equity_allowed_pct": max_eq, "trade_date": trade_date},
             "market_amount": asdict(amount),
-            "integrity": {"kill": (metrics["twii_close"] is None), "reason": "OK"}
+            "integrity": integrity
         },
         "stocks": stocks,
         "institutional_panel": [{"Symbol": s["Symbol"], "Inst_Status": s["Institutional"]["Inst_Status"], "Inst_Net_3d": s["Institutional"]["Inst_Net_3d"]} for s in stocks],
-        "portfolio": {"total_equity": total_equity, "cash_balance": cash, "active_alerts": []}
+        "portfolio": {"total_equity": total_equity, "cash_balance": cash, "active_alerts": alerts}
     }
     return payload, warnings_bus.latest()
 
@@ -313,7 +343,7 @@ def main():
     equity = st.sidebar.number_input("總權益", value=DEFAULT_EQUITY)
     
     if st.sidebar.button("🚀 啟動 Predator 引擎") or "payload" not in st.session_state:
-        with st.spinner("正在同步全球數據與修復 TPEX 鏈結..."):
+        with st.spinner("正在同步全球數據與執行風控稽核..."):
             payload, warns = build_arbiter_input(session, mode, topn, [], cash, equity)
             st.session_state.payload = payload
             st.session_state.warns = warns
@@ -321,15 +351,20 @@ def main():
     p = st.session_state.payload
     ov = p["macro"]["overview"]
     
-    # 頂部儀表板
+    # 警報區
+    alerts = p["portfolio"].get("active_alerts", [])
+    for alert in alerts:
+        st.error(alert)
+
     if p["meta"]["is_using_previous_day"]:
         st.warning(f"⏰ 開盤保護啟動：盤後數據未更新，目前使用 {ov['trade_date']} 歷史數據。")
 
+    # 頂部儀表板
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("交易日期", ov["trade_date"])
     
     regime = p["meta"]["current_regime"]
-    regime_color = "🔴" if "OVERHEAT" in regime else ("⚠️" if "REVERSION" in regime else "🟢")
+    regime_color = "🔴" if "OVERHEAT" in regime or "FAILURE" in regime else ("⚠️" if "REVERSION" in regime else "🟢")
     c2.metric("策略體制 (Regime)", f"{regime_color} {regime}")
     
     c3.metric("建議持倉上限", f"{ov['max_equity_allowed_pct']*100:.0f}%")
@@ -352,7 +387,6 @@ def main():
     st.subheader("🎯 核心持股雷達 (Tactical Stocks)")
     df = pd.DataFrame(p["stocks"])
     if not df.empty:
-        # 展開 Institutional 字典
         df['籌碼狀態'] = df['Institutional'].apply(lambda x: x.get('Inst_Status', 'N/A'))
         df['3日合計淨額'] = df['Institutional'].apply(lambda x: x.get('Inst_Net_3d', 0.0))
         disp_cols = ["Symbol", "Name", "Price", "Vol_Ratio", "Layer", "籌碼狀態", "3日合計淨額"]
