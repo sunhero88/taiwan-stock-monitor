@@ -1,18 +1,8 @@
-print("======== 我是最新版 V16.3.43 ========")
 # main.py
 # =========================================================
 # Sunhero｜股市智能超盤中控台（Predator V16.3.43 終極架構校準版）
 # =========================================================
-# 終極護城河清單 (一次到位)：
-#   [1] 語意校準：Tier 徹底拆分為 rank (名次) 與 tier_level (1:Strong / 2:Weak)。
-#   [2] 假零防禦：法人數據缺失時強制寫入 null (None)，並標記 inst_data_fresh = False。
-#   [3] 狀態降級：confidence != HIGH 時，market_status 自動從 NORMAL 轉 DEGRADED。
-#   [4] 成交量雙軌：區分 amount_total_raw (確信) 與 amount_total_blended (含估算)。
-#   [5] 動能雷達：二階導數 (Acceleration) 與 末端加速段 (Blow-off) 偵測。
-#   [6] 邊界防護：VIX 0~100 濾錯、yfinance 降維防禦、TPEX 民國日期修復。
-# =========================================================
 
-from __future__ import annotations
 import json
 import os
 import re
@@ -88,14 +78,14 @@ def get_intraday_progress() -> float:
     return max(0.01, (now - start).total_seconds() / (end - start).total_seconds())
 
 # =========================
-# 3. 數據抓取模組 (Volume, Price, Institutional)
+# 3. 數據抓取模組
 # =========================
 @dataclass
 class MarketAmount:
     amount_twse: int
     amount_tpex: int
-    amount_total_raw: int      # 🌟 僅包含可信數據
-    amount_total_blended: int  # 🌟 包含估算數據
+    amount_total_raw: int      
+    amount_total_blended: int  
     source_twse: str
     source_tpex: str
     status_twse: str
@@ -117,11 +107,11 @@ def fetch_blended_amount(trade_date: str) -> MarketAmount:
             twse_src = "TWSE_OK:AUDIT_SUM"
             twse_sts = "OK"
     except:
-        twse_amt = 950_000_000_000 # 備援估算
+        twse_amt = 950_000_000_000 
         twse_src = "TWSE_SAFE_MODE"
         twse_sts = "ESTIMATED"
 
-    # 抓 TPEX (含民國年修正)
+    # 抓 TPEX 
     roc = _to_roc_date(trade_date)
     url_tpex = f"https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw&d={roc}&se=EW"
     tpex_amt = 0
@@ -137,13 +127,11 @@ def fetch_blended_amount(trade_date: str) -> MarketAmount:
     except: 
         pass
 
-    # 若官方失敗，採用常數備援
     if tpex_sts == "FAIL":
         tpex_amt = 200_000_000_000
         tpex_src = "TPEX_SAFE_MODE_200B"
         tpex_sts = "ESTIMATED"
 
-    # 🌟 核心雙軌制邏輯：如果 TPEX 是估算的，Raw 就不要加它
     conf = "HIGH" if (twse_sts == "OK" and tpex_sts == "OK") else "LOW"
     raw_total = twse_amt if tpex_sts != "OK" else (twse_amt + tpex_amt)
     blended_total = twse_amt + tpex_amt
@@ -162,7 +150,6 @@ def _single_fetch_price_vol(sym: str) -> Tuple[Optional[float], Optional[float]]
         try:
             df = yf.download(f"{ticker_base}{suffix}", period="2mo", progress=False)
             if not df.empty:
-                # 降維防禦 MultiIndex
                 c = df["Close"].iloc[:, 0] if isinstance(df["Close"], pd.DataFrame) else df["Close"]
                 v = df["Volume"].iloc[:, 0] if isinstance(df["Volume"], pd.DataFrame) else df["Volume"]
                 
@@ -190,7 +177,6 @@ def fetch_inst_3d(symbols: List[str], target_date: str, token: str) -> pd.DataFr
             if data:
                 df = pd.DataFrame(data)
                 df["net"] = pd.to_numeric(df.get("buy",0), errors='coerce').fillna(0) - pd.to_numeric(df.get("sell",0), errors='coerce').fillna(0)
-                # 確保只取有資料的最後三天
                 net_sum = float(df.tail(3)["net"].sum())
                 rows.append({"symbol": sym, "net_3d": net_sum})
         except: 
@@ -198,7 +184,7 @@ def fetch_inst_3d(symbols: List[str], target_date: str, token: str) -> pd.DataFr
     return pd.DataFrame(rows)
 
 # =========================
-# 4. 戰略與風控引擎 (動能雷達)
+# 4. 戰略與風控引擎
 # =========================
 def compute_regime_metrics(market_df: pd.DataFrame) -> dict:
     if market_df is None or market_df.empty or len(market_df) < 200:
@@ -227,7 +213,6 @@ def compute_regime_metrics(market_df: pd.DataFrame) -> dict:
     }
 
 def pick_regime(m: dict, vix: float) -> Tuple[str, float]:
-    # 邊界防護 (防禦髒數據)
     if vix <= 0 or vix > 100 or m.get("twii_close") is None: 
         return "DATA_FAILURE", 0.0
     
@@ -239,14 +224,13 @@ def pick_regime(m: dict, vix: float) -> Tuple[str, float]:
     return "NORMAL", 0.85
 
 def determine_tier_level(smr: float, vol_ratio: Optional[float], inst_fresh: bool) -> int:
-    """ 🌟 語意校準：強弱分級器 1=Strong, 2=Weak """
-    if smr > 0.25: return 2       # 大盤過熱，所有標的強制降級為 Weak
-    if not inst_fresh: return 2   # 籌碼盲區，強制降級
+    if smr > 0.25: return 2       
+    if not inst_fresh: return 2   
     if vol_ratio and vol_ratio > 1.2: return 1
     return 2
 
 # =========================
-# 5. 中控台主程序 (Arbiter)
+# 5. 中控台主程序
 # =========================
 def main():
     st.title(APP_TITLE)
@@ -268,7 +252,6 @@ def main():
     progress = get_intraday_progress() if session == "INTRADAY" else 1.0
 
     with st.spinner("雷達掃描與終極架構校準中..."):
-        # 1. 宏觀指標與 VIX
         twii_df = yf.download(TWII_SYMBOL, period="2y", progress=False)
         m = compute_regime_metrics(twii_df)
         
@@ -276,17 +259,14 @@ def main():
         v_s = vix_df["Close"].iloc[:, 0] if isinstance(vix_df["Close"], pd.DataFrame) else vix_df["Close"]
         vix_last = float(v_s.iloc[-1]) if not vix_df.empty else 20.0
 
-        # 2. 成交量雙軌與狀態自動降級
         amt = fetch_blended_amount(trade_date)
         
-        # 🌟 核心邏輯：信心不是 HIGH，狀態就必須是 DEGRADED
         market_status = "DEGRADED" if amt.confidence_level != "HIGH" else "NORMAL"
         conf_penalty = 0.5 if amt.confidence_level == "LOW" else 1.0
         
         regime, base_limit = pick_regime(m, vix_last)
         final_limit = base_limit * conf_penalty
 
-        # 3. 籌碼 T-1 繼承邏輯
         inst_date = trade_date
         is_stale = False
         if now.hour < 15:
@@ -297,41 +277,34 @@ def main():
             
         inst_df = fetch_inst_3d(list(STOCK_NAME_MAP.keys())[:topn], inst_date, token)
 
-        # 4. 個股處理 (Schema 終極校準)
         stocks_output = []
         for i, sym in enumerate(list(STOCK_NAME_MAP.keys())[:topn], 1):
             price, vr_raw = _single_fetch_price_vol(sym)
             vr = vr_raw / progress if vr_raw else None
             
-            # 法人數據處理 (防禦假零)
             has_inst = not inst_df.empty and sym in inst_df["symbol"].values
             inst_fresh = has_inst and not is_stale
             
-            # 🌟 核心邏輯：如果沒數據，強制設為 None (null)，絕不使用 0.0
             net_val = float(inst_df[inst_df["symbol"]==sym]["net_3d"].iloc[0]) if has_inst else None
             
             inst_status = "USING_T_MINUS_1" if (has_inst and is_stale) else ("READY" if inst_fresh else "NO_UPDATE_TODAY")
-            
-            # 強弱分級判定
             t_level = determine_tier_level(m["SMR"], vr, inst_fresh)
 
             stocks_output.append({
                 "Symbol": sym,
                 "Name": STOCK_NAME_MAP[sym],
-                "rank": i,             # 🌟 修正 1：明確定義為排名
-                "tier_level": t_level, # 🌟 修正 2：明確定義為強弱(1/2)
+                "rank": i,             
+                "tier_level": t_level, 
                 "Price": price,
                 "Vol_Ratio": vr,
                 "Institutional": {
                     "Inst_Status": inst_status,
-                    "Inst_Net_3d": net_val, # 🌟 修正 3：嚴禁假零，必定為數值或 null
-                    "inst_data_fresh": inst_fresh # 🌟 修正 4：明確標示新鮮度
+                    "Inst_Net_3d": net_val, 
+                    "inst_data_fresh": inst_fresh 
                 }
             })
 
-    # =========================
     # UI 呈現區
-    # =========================
     st.subheader("📡 宏觀體制與動能雷達")
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("市場狀態", market_status, delta="信心降級" if market_status=="DEGRADED" else "數據完備", delta_color="off")
@@ -358,20 +331,18 @@ def main():
                      'Inst_Net_3d': '3日淨額', 'Fresh': '最新'}
         st.dataframe(df_disp[list(disp_cols.keys())].rename(columns=disp_cols), use_container_width=True)
 
-    # =========================
     # 產生最終 JSON (Arbiter Input)
-    # =========================
     payload = {
         "meta": {
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
             "session": session,
-            "market_status": market_status, # 🌟 自動降級結果
+            "market_status": market_status, 
             "current_regime": regime,
             "confidence_level": amt.confidence_level
         },
         "macro": {
             "overview": m,
-            "market_amount": asdict(amt) # 🌟 雙軌制成交量 (raw vs blended)
+            "market_amount": asdict(amt) 
         },
         "stocks": stocks_output
     }
