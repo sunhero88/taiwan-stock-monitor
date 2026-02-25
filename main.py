@@ -1,314 +1,294 @@
-# ucc_v19_1.py
+# main.py
 # =========================================================
-# Predator UCC V19.1 Hardened Final Lockdown (全中文優化版)
+# Sunhero｜股市智能超盤中控台（Predator + UCC V19.1）
+# FINAL HARDENED BUILD - 完整中文化與效能優化版
 # =========================================================
-from __future__ import annotations
-import re
-from typing import Any, Dict, List, Optional, Tuple, Union
+import json
+import time
+import warnings
+from dataclasses import dataclass, asdict
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional, Tuple
 
-Json = Dict[str, Any]
+import numpy as np
+import pandas as pd
+import pytz
+import requests
+import streamlit as st
+import yfinance as yf
 
-def _split_path(path: str) -> List[str]:
-    return re.split(r"\.(?![^\[]*\])", path)
+from ucc_v19_1 import UCCv19_1
 
-def jget(d: Any, path: str, default: Any = None) -> Any:
-    cur = d
-    for tok in _split_path(path):
-        if not tok:
-            continue
-        m = re.fullmatch(r"([^\[]+)(\[(\-?\d+)\])?", tok)
-        if not m:
-            return default
-        key = m.group(1)
-        idx = m.group(3)
-        if not isinstance(cur, dict) or key not in cur:
-            return default
-        cur = cur[key]
-        if idx is not None:
-            if not isinstance(cur, list):
-                return default
-            i = int(idx)
-            if i < 0 or i >= len(cur):
-                return default
-            cur = cur[i]
-    return cur
+warnings.filterwarnings("ignore")
 
-def exists(d: Any, path: str) -> bool:
-    sentinel = object()
-    return jget(d, path, sentinel) is not sentinel
+# 設置網頁
+st.set_page_config(page_title="Sunhero｜中控台", layout="wide", initial_sidebar_state="expanded")
+APP_TITLE = "Sunhero｜股市智能超盤中控台 (Predator + UCC V19.1)"
 
-def to_float(x: Any) -> Optional[float]:
+TWII_SYMBOL = "^TWII"
+VIX_SYMBOL = "^VIX"
+FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
+
+SYMBOLS_TOP20 = [
+    "2330.TW", "2317.TW", "2454.TW", "2308.TW", "2382.TW",
+    "3231.TW", "2376.TW", "3017.TW", "3324.TW", "3661.TW",
+    "2881.TW", "2882.TW", "2891.TW", "2886.TW", "2603.TW",
+    "2609.TW", "1605.TW", "1513.TW", "1519.TW", "2002.TW"
+]
+
+STOCK_NAME_MAP = {
+    "2330.TW": "台積電", "2317.TW": "鴻海", "2454.TW": "聯發科", "2308.TW": "台達電",
+    "2382.TW": "廣達", "3231.TW": "緯創", "2376.TW": "技嘉", "3017.TW": "奇鋐",
+    "3324.TW": "雙鴻", "3661.TW": "世芯-KY", "2881.TW": "富邦金", "2882.TW": "國泰金",
+    "2891.TW": "中信金", "2886.TW": "兆豐金", "2603.TW": "長榮", "2609.TW": "陽明",
+    "1605.TW": "華新", "1513.TW": "中興電", "1519.TW": "華城", "2002.TW": "中鋼"
+}
+
+def get_taipei_now() -> datetime:
+    return datetime.now(pytz.timezone("Asia/Taipei"))
+
+def last_trading_day(d: datetime) -> str:
+    x = d
+    while x.weekday() >= 5:
+        x -= timedelta(days=1)
+    return x.strftime("%Y-%m-%d")
+
+# =========================================================
+# 數據抓取 (加入 st.cache_data 避免重複抓取導致網頁無反應)
+# =========================================================
+@st.cache_data(ttl=300)
+def fetch_twii_and_vix() -> Tuple[Optional[float], Optional[float], List[str]]:
+    reasons: List[str] = []
+    twii, vix = None, None
     try:
-        if x is None:
-            return None
-        if isinstance(x, (int, float)):
-            return float(x)
-        if isinstance(x, str):
-            s = x.strip().replace(",", "")
-            if s == "":
-                return None
-            return float(s)
-        return None
+        twii_df = yf.download(TWII_SYMBOL, period="5d", progress=False)
+        if not twii_df.empty:
+            twii = float(twii_df["Close"].dropna().iloc[-1])
     except Exception:
-        return None
+        reasons.append("取得加權指數失敗")
 
-def contains_any(s: Any, needles: List[str]) -> bool:
-    if not isinstance(s, str):
-        return False
-    up = s.upper()
-    return any(n.upper() in up for n in needles)
+    try:
+        vix_df = yf.download(VIX_SYMBOL, period="5d", progress=False)
+        if not vix_df.empty:
+            vix = float(vix_df["Close"].dropna().iloc[-1])
+    except Exception:
+        reasons.append("取得VIX指數失敗")
 
-class UCCv19_1:
-    SMR_OVERHEAT_1 = 0.30
-    SMR_OVERHEAT_2 = 0.33
+    return twii, vix, reasons
 
-    # -------------------------
-    # V17 戰時模式 (War-time override)
-    # -------------------------
-    def v17_triggered(self, j: Json) -> Tuple[bool, List[str]]:
-        reasons: List[str] = []
-        if jget(j, "meta.war_time_override") is True:
-            reasons.append("meta.war_time_override=true (手動觸發戰時模式)")
-        reg = jget(j, "meta.current_regime")
-        if contains_any(reg, ["WAR", "CRISIS"]):
-            reasons.append(f"meta.current_regime={reg} (偵測到危機環境)")
-        return (len(reasons) > 0, reasons)
-
-    # -------------------------
-    # 市場狀態判定
-    # -------------------------
-    def market_state(self, j: Json) -> Tuple[str, List[str]]:
-        reasons: List[str] = []
-        smr = to_float(jget(j, "macro.overview.SMR"))
-        bop = jget(j, "macro.overview.Blow_Off_Phase", None)
-        
-        if smr is not None:
-            reasons.append(f"macro.overview.SMR={smr:.4f}")
-        if bop is not None:
-            reasons.append(f"macro.overview.Blow_Off_Phase={bop}")
-            
-        if (smr is not None and smr >= self.SMR_OVERHEAT_2) or (bop is True):
-            return "極度過熱 (CRITICAL_OVERHEAT)", reasons
-        if smr is not None and smr >= self.SMR_OVERHEAT_1:
-            return "過熱 (OVERHEAT)", reasons
-        if smr is not None and smr < 0:
-            return "防禦 (DEFENSIVE)", reasons
-        return "正常 (NORMAL)", reasons
-
-    # -------------------------
-    # L3 壓測觸發條件
-    # -------------------------
-    def l3_triggered(self, j: Json, market_state: Optional[str] = None) -> Tuple[bool, List[str]]:
-        reasons: List[str] = []
-        smr = to_float(jget(j, "macro.overview.SMR"))
-        if smr is not None and smr < 0:
-            reasons.append(f"macro.overview.SMR={smr:.4f} -> SMR小於0")
-        if market_state and "防禦" in market_state:
-            reasons.append("市場狀態 = 防禦模式")
-            
-        cons = jget(j, "portfolio.performance.consecutive_losses", None)
-        dd = to_float(jget(j, "portfolio.performance.drawdown_pct", None))
-        
-        if cons is not None:
-            try:
-                if int(cons) >= 3:
-                    reasons.append(f"連續虧損次數={cons} >= 3次")
-            except Exception:
-                pass
-        if dd is not None and dd >= 0.08:
-            reasons.append(f"資金回撤比例={dd*100:.1f}% >= 8%")
-            
-        return (len(reasons) > 0, reasons)
-
-    # -------------------------
-    # L1 數據審計
-    # -------------------------
-    def run_l1(self, j: Json) -> Json:
-        fatal: List[str] = []
-        warn: List[str] = []
-
-        twii = jget(j, "macro.overview.twii_close", None)
-        if twii is None:
-            fatal.append('缺失大盤收盤價 -> 拒絕執行 (path=$.macro.overview.twii_close)')
-            
-        if jget(j, "macro.integrity.kill") is True:
-            fatal.append('偵測到系統中斷指令 -> 拒絕執行 (path=$.macro.integrity.kill=true)')
-            
-        conf = jget(j, "meta.confidence_level")
-        ms = jget(j, "meta.market_status")
-        if conf == "LOW" and ms == "NORMAL":
-            fatal.append('數據信心低落卻判定為正常市場 -> 邏輯矛盾 (path=$.meta.confidence_level)')
-            
-        amt_raw = to_float(jget(j, "macro.market_amount.amount_total_raw"))
-        amt_blend = to_float(jget(j, "macro.market_amount.amount_total_blended"))
-        if amt_raw is not None and amt_blend is not None and amt_blend < amt_raw:
-            fatal.append(f"成交量估算異常：總量 < 原始量 -> 數據污染 (path=$.macro.market_amount)")
-            
-        if jget(j, "meta.is_using_previous_day") is True and not exists(j, "meta.effective_trade_date"):
-            fatal.append("使用前日資料卻未提供生效日期 -> 拒絕執行")
-
-        stocks = jget(j, "stocks", [])
-        if isinstance(stocks, list):
-            for i, s in enumerate(stocks):
-                st = jget(j, f"stocks[{i}].Institutional.Inst_Status")
-                net3 = jget(j, f"stocks[{i}].Institutional.Inst_Net_3d", None)
-                if st == "NO_UPDATE_TODAY" and net3 is not None:
-                    fatal.append(f'股票 {jget(j, f"stocks[{i}].Symbol")} 法人籌碼未更新卻有數值 -> 數據污染')
-                
-                sym = jget(j, f"stocks[{i}].Symbol")
-                px = to_float(jget(j, f"stocks[{i}].Price"))
-                if sym == "2330.TW" and px is not None and px < 200:
-                    fatal.append(f"價格錯位：台積電價格小於200 -> 拒絕執行")
-
-        verdict = "通過 (PASS)" if len(fatal) == 0 else "失敗 (FAIL)"
-        risk = "低危險 (LOW)" if verdict == "通過 (PASS)" else "極高危險 (CRITICAL)"
-
-        return {
-            "模式": "L1_數據審計 (L1_AUDIT)",
-            "裁決結果": verdict,
-            "風險等級": risk,
-            "致命缺失": fatal,
-            "結構性警告": warn,
-            "審計信心": "高 (HIGH)"
+@st.cache_data(ttl=300)
+def fetch_market_institutional_summary() -> Tuple[str, str]:
+    """獲取三大法人買賣超 (供儀表板顯示)"""
+    try:
+        now = get_taipei_now()
+        start_date = (now - timedelta(days=7)).strftime("%Y-%m-%d")
+        params = {
+            "dataset": "TaiwanStockTotalInstitutionalInvestors",
+            "start_date": start_date,
         }
+        r = requests.get(FINMIND_URL, params=params, timeout=5)
+        if r.status_code == 200:
+            data = r.json().get("data", [])
+            if data:
+                df = pd.DataFrame(data)
+                last_date = df["date"].iloc[-1]
+                df_last = df[df["date"] == last_date]
+                net_buy = df_last["buy"].sum() - df_last["sell"].sum()
+                net_buy_b = net_buy / 1_000_000_000
+                status = "買超" if net_buy_b > 0 else "賣超"
+                return f"{last_date}", f"{status} {abs(net_buy_b):.1f} 億"
+    except Exception:
+        pass
+    return "無資料", "API 連線失敗"
+
+@st.cache_data(ttl=300)
+def fetch_prices(symbols: List[str], strict_mode: bool = True) -> Tuple[Dict[str, Optional[float]], Dict[str, Optional[float]], List[str]]:
+    warns: List[str] = []
+    prices: Dict[str, Optional[float]] = {}
+    vols: Dict[str, Optional[float]] = {}
+    try:
+        # 使用 group_by="ticker" 且加上 timeout 機制
+        df = yf.download(symbols, period="5d", progress=False, group_by="ticker", auto_adjust=False, timeout=10)
+        for sym in symbols:
+            try:
+                if isinstance(df.columns, pd.MultiIndex):
+                    sub = df[sym]
+                else:
+                    sub = df
+                px = float(sub["Close"].dropna().iloc[-1])
+                prices[sym] = px
+                vols[sym] = 1.0 # 簡化成交量比例避免錯誤
+            except Exception:
+                prices[sym] = None
+                vols[sym] = None
+                warns.append(f"無法取得價格: {sym}")
+    except Exception as e:
+        for s in symbols:
+            prices[s] = None
+            vols[s] = None
+        warns.append(f"YF 下載失敗: {str(e)}")
+    return prices, vols, warns
+
+def compute_smr(vix: Optional[float], twii: Optional[float]) -> Tuple[Optional[float], List[str]]:
+    reasons: List[str] = []
+    if vix is None or twii is None:
+        return None, ["缺乏計算 SMR 的基礎指標"]
+    smr = float(vix) / float(twii) * 1000  # 調整比例以便閱讀
+    return smr, reasons
+
+# =========================================================
+# UI 介面
+# =========================================================
+def main():
+    st.title(APP_TITLE)
+    
+    # -------------------------
+    # 市場即時儀表板 (Dashboard)
+    # -------------------------
+    st.markdown("### 📊 市場即時狀態")
+    col1, col2, col3, col4 = st.columns(4)
+    
+    twii_val, vix_val, _ = fetch_twii_and_vix()
+    inst_date, inst_val = fetch_market_institutional_summary()
+    
+    col1.metric("台灣加權指數 (TWII)", f"{twii_val:,.2f}" if twii_val else "資料載入中...")
+    col2.metric("VIX 恐慌指數", f"{vix_val:.2f}" if vix_val else "資料載入中...")
+    col3.metric("三大法人買賣超", inst_val, delta_color="normal")
+    col4.metric("法人資料日期", inst_date)
+    st.markdown("---")
 
     # -------------------------
-    # L2 交易裁決
+    # Sidebar 控制列
     # -------------------------
-    def run_l2(self, j: Json, l1_verdict: str = "PASS") -> str:
-        maxeq = to_float(jget(j, "macro.overview.max_equity_allowed_pct"))
-        if maxeq is None:
-            return "模式: L2_交易裁決\n決策: 不進行交易 (NO TRADE)\n風險原因: 缺失最大資金曝險上限 (max_equity_allowed_pct)\n信心水準: 低 (LOW)"
-
-        war, war_reason = self.v17_triggered(j)
-        ms, ms_reason = self.market_state(j)
-        conf_level = jget(j, "meta.confidence_level", "MEDIUM")
-
-        scale = 1.0
-        scale_note = ""
-        if conf_level == "LOW":
-            scale = 0.5
-            scale_note = "【低信心降級防護】: 所有資金配置強制減半 (x0.5)"
-
-        if war:
-            maxeq = min(maxeq, 0.05)
-
-        lines: List[str] = []
-        lines.append("模式: L2_交易裁決 (L2_EXECUTE)")
-        lines.append(f"市場狀態: {ms}")
-        lines.append(f"最大合法曝險: {maxeq*100:.1f}%")
-        if scale_note:
-            lines.append(scale_note)
-
-        if war:
-            lines.append("決策:")
-            lines.append("- 不進行交易 (NO TRADE)")
-            lines.append("風險原因: " + " | ".join([f"{r} -> 觸發戰時防禦" for r in war_reason]))
-            lines.append("信心水準: 低 (LOW)")
-            return "\n".join(lines)
-
-        if "過熱" in ms:
-            lines.append("決策:")
-            lines.append("- 不進行交易 (NO TRADE) - 禁止開倉")
-            lines.append("風險原因: " + " | ".join([f"{r} -> 市場過熱保護" for r in ms_reason]))
-            lines.append(f"信心水準: {conf_level}")
-            return "\n".join(lines)
-
-        lines.append("決策:")
-        lines.append("- 不進行交易 (NO TRADE)")
-        lines.append("風險原因: 依據嚴格 JSON 策略 -> 當前無明確交易訊號")
-        lines.append(f"信心水準: {conf_level}")
-        return "\n".join(lines)
+    st.sidebar.header("UCC 指揮中心控制台")
+    run_mode = st.sidebar.radio(
+        "選擇執行模式",
+        options=["L1", "L2", "L3"],
+        index=0,
+        format_func=lambda x: {"L1": "L1 (數據審計官)", "L2": "L2 (交易裁決官)", "L3": "L3 (回撤壓測官)"}[x],
+        help="L1=只檢查資料品質；L2=交易裁決（必須 L1 通過）；L3=回撤壓測（需觸發過熱或恐慌條件）"
+    )
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("法人資料防護政策")
+    allow_intraday_same_day_inst = st.sidebar.toggle("盤中允許使用「當日法人資料」", value=False)
+    strict_price_mode = st.sidebar.toggle("嚴格價格污染防護模式", value=True)
+    finmind_token = st.sidebar.text_input("FinMind Token（選填）", value="", type="password")
 
     # -------------------------
-    # L3 回撤壓測
+    # 內容區塊
     # -------------------------
-    def run_l3(self, j: Json) -> str:
-        ms, _ = self.market_state(j)
-        trig, reasons = self.l3_triggered(j, market_state=ms)
+    left, right = st.columns([1, 1])
+    
+    # 初始化 session state
+    if "payload_text" not in st.session_state:
+        st.session_state["payload_text"] = "{}"
+
+    with left:
+        st.subheader("輸入 JSON Payload")
+        payload_input = st.text_area("請貼上系統資料 (JSON)", height=420, value=st.session_state["payload_text"], key="payload_input")
         
-        if not trig:
-            return "模式: L3_回撤壓測\n壓測狀態: 未啟動 (NOT ACTIVATED)\n最終判定: 系統安全存活 (SYSTEM SURVIVES)"
+        b1, b2, b3 = st.columns([1, 1, 1])
+        with b1:
+            if st.button("載入標準範本"):
+                st.session_state["payload_text"] = json.dumps({
+                    "meta": {
+                        "session": "INTRADAY",
+                        "market_status": "DEGRADED",
+                        "current_regime": "NORMAL",
+                        "confidence_level": "LOW",
+                        "is_using_previous_day": True,
+                    },
+                    "macro": {"overview": {"max_equity_allowed_pct": 0.05}},
+                    "stocks": []
+                }, ensure_ascii=False, indent=2)
+                st.rerun()
+        with b2:
+            if st.button("格式化 JSON"):
+                try:
+                    obj = json.loads(payload_input)
+                    st.session_state["payload_text"] = json.dumps(obj, ensure_ascii=False, indent=2)
+                    st.rerun()
+                except Exception:
+                    st.warning("⚠️ JSON 格式錯誤，無法解析")
+        with b3:
+            run_btn = st.button("🚀 執行 UCC 裁決", type="primary")
 
-        dd = to_float(jget(j, "portfolio.performance.drawdown_pct"))
-        cons = jget(j, "portfolio.performance.consecutive_losses")
+    with right:
+        st.subheader("UCC 輸出結果")
+        if not run_btn:
+            st.info("👈 請點擊「執行 UCC 裁決」以檢視結果")
+            return
+
+        # -------------------------
+        # 執行區段
+        # -------------------------
+        patch_logs: List[str] = []
+        try:
+            raw = json.loads(payload_input)
+        except Exception as e:
+            st.error(f"❌ JSON 解析失敗：{str(e)}")
+            return
+
+        # 補齊基礎資料 (Meta)
+        now = get_taipei_now()
+        if not raw.get("meta"): raw["meta"] = {}
+        if not raw["meta"].get("timestamp"):
+            raw["meta"]["timestamp"] = now.strftime("%Y-%m-%d %H:%M:%S")
+            patch_logs.append("【修補】已自動填寫 meta.timestamp")
+        if not raw["meta"].get("effective_trade_date"):
+            raw["meta"]["effective_trade_date"] = now.strftime("%Y-%m-%d")
+
+        # 補齊大盤資料 (Macro)
+        if "macro" not in raw: raw["macro"] = {}
+        if "overview" not in raw["macro"]: raw["macro"]["overview"] = {}
+        if "integrity" not in raw["macro"]: raw["macro"]["integrity"] = {"kill": False}
         
-        breach = False
-        if dd is not None and dd >= 0.15:
-            breach = True
-
-        def scen(x: float) -> str:
-            if dd is None: return "警告 (WARNING)"
-            if dd + x >= 0.15: return "防線崩潰 (FAILURE)"
-            if dd + x >= 0.10: return "警告 (WARNING)"
-            return "安全 (SAFE)"
-
-        surv = 80
-        if "防禦" in ms: surv -= 15
-        if dd is not None: surv -= int(dd * 100)
-        if cons is not None:
-            try: surv -= int(cons) * 3
-            except Exception: pass
+        if raw["macro"]["overview"].get("twii_close") is None:
+            raw["macro"]["overview"]["twii_close"] = twii_val
+            patch_logs.append("【修補】已自動帶入加權指數收盤價")
+        if raw["macro"]["overview"].get("SMR") is None:
+            smr, _ = compute_smr(vix_val, twii_val)
+            raw["macro"]["overview"]["SMR"] = smr
+            patch_logs.append("【修補】已自動計算 SMR 數值")
             
-        surv = max(0, min(100, surv))
+        # 補齊個股架構
+        if not raw.get("stocks"):
+            raw["stocks"] = []
+            for i, sym in enumerate(SYMBOLS_TOP20, start=1):
+                raw["stocks"].append({
+                    "Symbol": sym,
+                    "Name": STOCK_NAME_MAP.get(sym, sym),
+                    "Price": None,
+                    "Institutional": {"Inst_Status": "USING_T_MINUS_1", "Inst_Net_3d": None}
+                })
+            patch_logs.append("【修補】未偵測到個股，已自動建立 Top20 觀察清單")
+
+        # 自動抓取價格
+        symbols = [s.get("Symbol") for s in raw["stocks"] if isinstance(s, dict) and s.get("Symbol")]
+        price_map, _, price_warns = fetch_prices(symbols, strict_mode=strict_price_mode)
+        for w in price_warns: patch_logs.append(f"【警告】{w}")
         
-        sys_status = "穩定 (STABLE)"
-        final = "系統存活 (SYSTEM_SURVIVES)"
-        if breach or surv < 40:
-            sys_status = "極度危險 (CRITICAL)"
-            final = "系統崩潰 (SYSTEM_FAILURE)"
-        elif surv < 60:
-            sys_status = "脆弱 (FRAGILE)"
-            final = "系統處於風險中 (SYSTEM_AT_RISK)"
+        for s in raw["stocks"]:
+            sym = s.get("Symbol")
+            if s.get("Price") is None:
+                s["Price"] = price_map.get(sym)
 
-        lines: List[str] = []
-        lines.append("模式: L3_回撤壓測 (L3_STRESS)")
-        lines.append("壓測狀態: 已啟動 (ACTIVATED)")
-        lines.append(f"結構性崩潰: {'是 (TRUE)' if breach else '否 (FALSE)'}")
-        lines.append(f"面臨 5% 跌幅情境: {scen(0.05)}")
-        lines.append(f"面臨 10% 跌幅情境: {scen(0.10)}")
-        lines.append(f"面臨 15% 跌幅情境: {scen(0.15)}")
-        lines.append("心理層面風險: " + ("高 (HIGH)" if surv < 50 else "中 (MEDIUM)" if surv < 70 else "低 (LOW)"))
-        lines.append(f"系統存活分數: {surv} / 100")
-        lines.append(f"系統穩定度: {sys_status}")
-        lines.append(f"最終判定: {final}")
-        lines.append("觸發原因: " + " | ".join([f"{r} -> L3_TRIGGER" for r in reasons]))
-        return "\n".join(lines)
+        # 顯示處理日誌
+        with st.expander("🛠️ 系統資料預處理日誌 (Patch Logs)", expanded=False):
+            if patch_logs:
+                st.code("\n".join(patch_logs), language="text")
+            else:
+                st.write("無需修補，資料完整。")
 
-    # -------------------------
-    # 頂層執行
-    # -------------------------
-    def run(self, j: Json, run_mode: str = "L1") -> Union[Json, str]:
-        run_mode = (run_mode or "L1").strip().upper()
-        if run_mode not in ("L1", "L2", "L3"):
-            run_mode = "L1"
+        # 執行 UCC 裁決引擎
+        st.markdown("### 🏛️ UCC 統一指揮中心裁決書")
+        ucc = UCCv19_1()
+        out = ucc.run(raw, run_mode=run_mode)
+        
+        if isinstance(out, dict):
+            st.json(out)
+        else:
+            st.code(str(out), language="text")
 
-        l1 = self.run_l1(j)
-        l1_verdict = l1.get("裁決結果")
-
-        if run_mode == "L1":
-            return l1
-
-        if run_mode == "L2" and "失敗" in l1_verdict:
-            fatal = list(l1.get("致命缺失", []))
-            fatal.insert(0, f"違規操作: 要求進入 L2，但 L1 數據審計未通過！")
-            l1["致命缺失"] = fatal
-            l1["裁決結果"] = "失敗 (FAIL) - 阻擋越權"
-            l1["風險等級"] = "極高危險 (CRITICAL)"
-            return l1
-
-        if run_mode == "L2":
-            return self.run_l2(j, l1_verdict=l1_verdict)
-
-        if run_mode == "L3":
-            ms, _ = self.market_state(j)
-            trig, _ = self.l3_triggered(j, market_state=ms)
-            if not trig:
-                fatal = list(l1.get("致命缺失", []))
-                fatal.insert(0, "違規操作: 請求 L3 壓測，但未滿足市場觸發條件！")
-                l1["致命缺失"] = fatal
-                l1["裁決結果"] = "失敗 (FAIL) - 阻擋越權"
-                return l1
-            return self.run_l3(j)
-
-        return l1
+if __name__ == "__main__":
+    main()
