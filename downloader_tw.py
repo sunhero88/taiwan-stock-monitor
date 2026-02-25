@@ -3,6 +3,7 @@ import json
 import time
 import logging
 import hashlib
+import statistics
 import requests
 import pandas as pd
 from datetime import datetime, timedelta, timezone
@@ -17,6 +18,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 TZ_TPE = timezone(timedelta(hours=8))
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
+
+TPEX_RATIO_CACHE_PATH = os.path.join(DATA_DIR, "tpex_ratio_cache.json")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
@@ -35,9 +38,6 @@ def today_tpe() -> datetime:
 
 def yyyymmdd(dt: datetime) -> str:
     return dt.strftime("%Y%m%d")
-
-def yyyy_mm_dd(dt: datetime) -> str:
-    return dt.strftime("%Y-%m-%d")
 
 def safe_int(x, default=None):
     try:
@@ -71,6 +71,12 @@ def is_finite_number(x) -> bool:
 def hash_text(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16]
 
+def clamp(lo, hi, x):
+    try:
+        return max(lo, min(hi, float(x)))
+    except:
+        return lo
+
 # =========================
 # Market Guard（EOD 00:00~15:30 -> 前一日）
 # =========================
@@ -79,21 +85,16 @@ def is_market_guard_window(now_tpe: datetime) -> bool:
     return (h < 15) or (h == 15 and m < 30)
 
 def effective_trade_date_for_eod(target_dt: datetime, now_tpe: datetime):
-    """
-    回傳：
-      effective_dt, is_using_previous_day, previous_trade_date_iso, recency_reason
-    """
     if is_market_guard_window(now_tpe):
         prev = target_dt - timedelta(days=1)
         return prev, True, prev.strftime("%Y-%m-%d"), "MARKET_GUARD_EOD_BEFORE_1530"
     return target_dt, False, None, None
 
 # =========================
-# 0) TWSE 指數（TWII close / change / pct）
+# 通用 JSON fetch（可稽核）
 # =========================
-def _fetch_twse_json(url: str, params: dict, timeout: int = 20):
+def _fetch_json(url: str, params: dict, timeout: int = 20):
     meta = {
-        "source_name": None,
         "url": url,
         "params": params,
         "status_code": None,
@@ -116,19 +117,16 @@ def _fetch_twse_json(url: str, params: dict, timeout: int = 20):
 
         txt = r.text or ""
         meta["raw_hash"] = hash_text(txt[:5000])
-        j = r.json()
-        return j, meta
+        return r.json(), meta
     except Exception as e:
         meta["latency_ms"] = int((time.time() - t0) * 1000)
         meta["error_code"] = type(e).__name__
         return None, meta
 
-def _parse_twii_from_data_fields(j: dict, name_keywords=None):
-    """
-    解析 TWSE 常見 JSON： fields + data
-    會嘗試找「加權股價指數/發行量加權股價指數/TWII」相關列
-    回傳：close(float|None), change(float|None)
-    """
+# =========================
+# 0) TWSE 指數（TWII close / change / pct）
+# =========================
+def _parse_twii_from_fields_data(j: dict, name_keywords=None):
     if name_keywords is None:
         name_keywords = ["加權", "發行量加權", "TWII", "TAIEX", "加權股價指數"]
 
@@ -137,7 +135,6 @@ def _parse_twii_from_data_fields(j: dict, name_keywords=None):
     if not fields or not data:
         return None, None
 
-    # 找「名稱/指數」欄位
     name_col_idx = None
     for i, f in enumerate(fields):
         fs = str(f)
@@ -145,7 +142,6 @@ def _parse_twii_from_data_fields(j: dict, name_keywords=None):
             name_col_idx = i
             break
 
-    # 找「收盤」與「漲跌」欄位
     close_idx = None
     chg_idx = None
     for i, f in enumerate(fields):
@@ -155,7 +151,6 @@ def _parse_twii_from_data_fields(j: dict, name_keywords=None):
         if chg_idx is None and ("漲跌" in fs or "增減" in fs or "漲跌點數" in fs):
             chg_idx = i
 
-    # 若找不到 close 欄位，就先放棄
     if close_idx is None:
         return None, None
 
@@ -163,7 +158,6 @@ def _parse_twii_from_data_fields(j: dict, name_keywords=None):
         s = str(x)
         return any(k in s for k in name_keywords)
 
-    # 先挑最像加權指數的列
     best_row = None
     if name_col_idx is not None:
         for row in data:
@@ -173,9 +167,8 @@ def _parse_twii_from_data_fields(j: dict, name_keywords=None):
                 best_row = row
                 break
 
-    # 若沒有名稱欄位或沒命中，就退而求其次：直接取第一列（有些 endpoint 只有加權）
-    if best_row is None and len(data) >= 1:
-        best_row = data[0]
+    if best_row is None:
+        best_row = data[0] if len(data) >= 1 else None
 
     if best_row is None or len(best_row) <= close_idx:
         return None, None
@@ -186,26 +179,18 @@ def _parse_twii_from_data_fields(j: dict, name_keywords=None):
 
 @st.cache_data(ttl=60)
 def fetch_twii_from_twse(trade_date_yyyymmdd: str):
-    """
-    依序嘗試多個 TWSE 指數 endpoint，成功即回傳：
-      twii = {last_dt, close, change, pct}
-      meta = {source_name, ...}
-    """
     candidates = [
-        # 1) FMTQIK（常見可拿到指數資訊）
         ("TWSE_FMTQIK", "https://www.twse.com.tw/exchangeReport/FMTQIK", {"response": "json", "date": trade_date_yyyymmdd}),
-        # 2) MI_5MINS_HIST（當日 5 分鐘歷史，常可推收盤/變動）
         ("TWSE_MI_5MINS_HIST", "https://www.twse.com.tw/indicesReport/MI_5MINS_HIST", {"response": "json", "date": trade_date_yyyymmdd}),
-        # 3) 另外一個常見路徑（若未來你要擴充可再加）
     ]
 
     for source_name, url, params in candidates:
-        j, meta = _fetch_twse_json(url, params, timeout=20)
+        j, meta = _fetch_json(url, params, timeout=20)
         meta["source_name"] = source_name
         if j is None:
             continue
 
-        close, chg = _parse_twii_from_data_fields(j)
+        close, chg = _parse_twii_from_fields_data(j)
         if close is None:
             meta["error_code"] = meta.get("error_code") or "PARSE_NO_CLOSE"
             continue
@@ -220,7 +205,6 @@ def fetch_twii_from_twse(trade_date_yyyymmdd: str):
         meta["error_code"] = None
         return twii, meta
 
-    # 全部失敗
     return None, {
         "source_name": "TWSE_INDEX_ALL_CANDIDATES",
         "url": None,
@@ -234,10 +218,6 @@ def fetch_twii_from_twse(trade_date_yyyymmdd: str):
     }
 
 def find_prev_trade_date_for_twii(effective_dt: datetime, max_lookback_days: int = 14):
-    """
-    往回找一個能成功拿到 TWII close 的日期
-    回傳：yyyymmdd 或 None
-    """
     cur = effective_dt - timedelta(days=1)
     for _ in range(max_lookback_days):
         d = yyyymmdd(cur)
@@ -296,12 +276,7 @@ def _twse_stock_day_all(trade_date_yyyymmdd: str):
 def fetch_twse_amount_audit_sum(trade_date_yyyymmdd: str):
     df, meta0 = _twse_stock_day_all(trade_date_yyyymmdd)
     meta = {**meta0}
-    meta.update({
-        "amount_sum": 0,
-        "ok_rows": 0,
-        "module_status": "FAIL",
-        "confidence": "LOW",
-    })
+    meta.update({"amount_sum": 0, "ok_rows": 0, "module_status": "FAIL", "confidence": "LOW"})
     if df is None or df.empty:
         return None, meta
 
@@ -321,7 +296,7 @@ def fetch_twse_amount_audit_sum(trade_date_yyyymmdd: str):
     meta["amount_sum"] = amount_sum
     meta["ok_rows"] = ok_rows
 
-    if amount_sum < 100_000_000_000:
+    if amount_sum < 100_000_000_000:  # 1,000 億底線
         meta["error_code"] = "AMOUNT_TOO_LOW"
         return None, meta
 
@@ -380,13 +355,7 @@ def fetch_twse_topn_by_amount(trade_date_yyyymmdd: str, top_n: int = 20):
     return rows, meta
 
 # =========================
-# 2) TPEX 成交額：Safe Mode（暫留）
-# =========================
-def tpex_safe_mode_amount():
-    return 200_000_000_000, "TPEX_SAFE_MODE_200B"
-
-# =========================
-# 3) TWSE T86：三大法人（單日）
+# 2) TWSE T86：三大法人
 # =========================
 @st.cache_data(ttl=60)
 def fetch_twse_t86(trade_date_yyyymmdd: str, select_type: str = "ALL"):
@@ -492,9 +461,244 @@ def build_t86_net_3d_map(effective_dt: datetime, n_days: int = 3):
     return per_code_sum, meta
 
 # =========================
+# 3) TPEX 成交額：分層備援（Tier-1/2 官方、Tier-3 ratio 估算、Tier-4 常數）
+# =========================
+def _load_tpex_ratio_cache():
+    if not os.path.exists(TPEX_RATIO_CACHE_PATH):
+        return {"samples": []}
+    try:
+        with open(TPEX_RATIO_CACHE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f) or {"samples": []}
+    except:
+        return {"samples": []}
+
+def _save_tpex_ratio_cache(cache: dict):
+    try:
+        with open(TPEX_RATIO_CACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logging.warning(f"save_tpex_ratio_cache fail: {type(e).__name__}")
+
+def _cache_hash(cache: dict) -> str:
+    try:
+        s = json.dumps(cache, ensure_ascii=False, sort_keys=True)
+        return hash_text(s)
+    except:
+        return None
+
+def _parse_amount_from_any_json(j: dict):
+    """
+    盡量從 TPEX 可能的 JSON 結構抓出「成交金額」(int)。
+    規則：優先找 key 包含 '成交金額'/'成交金額(元)'/'成交金額(千元)'，或 data/fields 中對應欄位。
+    """
+    # 1) 直接 key
+    for k in ["amount", "成交金額", "成交金額(元)", "成交金額(千元)", "totalAmount", "total_amount"]:
+        if k in j:
+            v = safe_int(j.get(k), default=None)
+            if v is not None and v > 0:
+                return v
+
+    # 2) fields + data
+    fields = j.get("fields", []) or []
+    data = j.get("data", []) or []
+    if fields and data:
+        amt_idx = None
+        unit_thousand = False
+        for i, f in enumerate(fields):
+            fs = str(f)
+            if "成交金額" in fs or "交易金額" in fs:
+                amt_idx = i
+                if "千元" in fs:
+                    unit_thousand = True
+                break
+        if amt_idx is not None:
+            # 若是統計表通常只有一列（或第一列為總計）
+            row0 = data[0] if len(data) >= 1 else None
+            if row0 and len(row0) > amt_idx:
+                v = safe_int(row0[amt_idx], default=None)
+                if v is not None and v > 0:
+                    return v * 1000 if unit_thousand else v
+
+    # 3) fallback：從所有數字中取「最大」整數（避免抓到筆數/家數）
+    best = None
+    def walk(x):
+        nonlocal best
+        if isinstance(x, dict):
+            for vv in x.values():
+                walk(vv)
+        elif isinstance(x, list):
+            for vv in x:
+                walk(vv)
+        else:
+            v = safe_int(x, default=None)
+            if v is not None and v > 0:
+                if best is None or v > best:
+                    best = v
+    walk(j)
+    return best
+
+@st.cache_data(ttl=60)
+def fetch_tpex_amount_official(trade_date_yyyymmdd: str):
+    """
+    Tier-1/2：兩個候選 endpoint（你先前抓不到，這裡仍保留作備援）
+    成功判定：amount >= floor
+    """
+    candidates = [
+        # NOTE：TPEX endpoint 實務上可能變動，此處採「兩候選 + 解析容錯 + 明確稽核」
+        ("TPEX_OFFICIAL_A", "https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php", {"l": "zh-tw", "d": trade_date_yyyymmdd}),
+        ("TPEX_OFFICIAL_B", "https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php", {"l": "zh-tw", "d": trade_date_yyyymmdd, "o": "json"}),
+    ]
+
+    for source_name, url, params in candidates:
+        j, meta = _fetch_json(url, params, timeout=20)
+        meta["source_name"] = source_name
+        if j is None:
+            continue
+
+        amount = _parse_amount_from_any_json(j)
+        if amount is None or amount <= 0:
+            meta["error_code"] = meta.get("error_code") or "PARSE_NO_AMOUNT"
+            continue
+
+        return int(amount), meta
+
+    return None, {
+        "source_name": "TPEX_ALL_CANDIDATES",
+        "url": None,
+        "params": {"date": trade_date_yyyymmdd},
+        "status_code": None,
+        "asof_ts": today_tpe().strftime("%Y-%m-%d %H:%M:%S%z"),
+        "latency_ms": None,
+        "final_url": None,
+        "raw_hash": None,
+        "error_code": "ALL_ENDPOINTS_FAILED",
+    }
+
+def compute_ratio_from_cache(cache: dict, lookback: int):
+    samples = cache.get("samples", []) or []
+    # 取最近 lookback 筆（由新到舊）
+    recent = samples[-lookback:] if len(samples) > lookback else samples
+    ratios = []
+    for s in recent:
+        r = safe_float(s.get("ratio"), default=None)
+        if r is not None and r > 0:
+            ratios.append(r)
+    return ratios
+
+def fetch_tpex_amount_with_fallback(
+    trade_date_yyyymmdd: str,
+    amount_twse: int,
+    system_params: dict
+):
+    """
+    回傳：
+      amount_tpex (int), meta(dict)
+    meta 會包含 tier/method/confidence/ratio_used/sample_count/cache_hash 等關鍵稽核欄位
+    """
+    floor_amt = safe_int(system_params.get("tpex_amount_floor"), default=30_000_000_000)  # 300 億
+    lookback = safe_int(system_params.get("tpex_ratio_lookback_days"), default=20)
+    min_samples = safe_int(system_params.get("tpex_ratio_min_samples"), default=5)
+
+    ratio_default = safe_float(system_params.get("tpex_ratio_default"), default=0.35)
+    ratio_floor = safe_float(system_params.get("tpex_ratio_floor"), default=0.15)
+    ratio_cap = safe_float(system_params.get("tpex_ratio_cap"), default=0.70)
+
+    safe_const = safe_int(system_params.get("tpex_safe_const_amount"), default=200_000_000_000)  # 2,000 億
+
+    meta = {
+        "tier": None,
+        "method": None,
+        "confidence": None,
+        "amount_floor": floor_amt,
+        "ratio_used": None,
+        "ratio_samples_used": 0,
+        "ratio_lookback": lookback,
+        "ratio_min_samples": min_samples,
+        "cache_hash": None,
+        "official_meta": None,
+        "note": None,
+    }
+
+    # -------- Tier-1/2：官方抓取 --------
+    amt_official, official_meta = fetch_tpex_amount_official(trade_date_yyyymmdd)
+    meta["official_meta"] = official_meta
+
+    if amt_official is not None and amt_official >= floor_amt:
+        # 更新 ratio cache（以 TWSE 金額為分母）
+        ratio = None
+        if amount_twse is not None and amount_twse > 0:
+            ratio = float(amt_official) / float(amount_twse)
+
+        cache = _load_tpex_ratio_cache()
+        if ratio is not None and is_finite_number(ratio) and ratio > 0:
+            cache.setdefault("samples", [])
+            cache["samples"].append({
+                "trade_date": trade_date_yyyymmdd,
+                "amount_twse": int(amount_twse),
+                "amount_tpex": int(amt_official),
+                "ratio": float(ratio),
+                "source_name": official_meta.get("source_name"),
+                "status_code": official_meta.get("status_code"),
+                "raw_hash": official_meta.get("raw_hash"),
+                "final_url": official_meta.get("final_url"),
+                "asof_ts": official_meta.get("asof_ts"),
+            })
+            # 只保留最近 60 筆（避免檔案膨脹；可回測但不會無限長）
+            if len(cache["samples"]) > 60:
+                cache["samples"] = cache["samples"][-60:]
+            _save_tpex_ratio_cache(cache)
+
+        meta["tier"] = 1
+        meta["method"] = "OFFICIAL"
+        meta["confidence"] = "HIGH"
+        meta["cache_hash"] = _cache_hash(_load_tpex_ratio_cache())
+        return int(amt_official), meta
+
+    # -------- Tier-3：ratio 中位數估算 --------
+    cache = _load_tpex_ratio_cache()
+    meta["cache_hash"] = _cache_hash(cache)
+
+    ratios = compute_ratio_from_cache(cache, lookback=lookback)
+    meta["ratio_samples_used"] = len(ratios)
+
+    if len(ratios) >= min_samples and amount_twse is not None and amount_twse > 0:
+        r_med = statistics.median(ratios)
+        r_used = clamp(ratio_floor, ratio_cap, r_med)
+        est = int(float(amount_twse) * float(r_used))
+
+        meta["tier"] = 3
+        meta["method"] = "EST_RATIO_MEDIAN"
+        meta["confidence"] = "LOW"
+        meta["ratio_used"] = float(r_used)
+        meta["note"] = f"ratio_median={r_med:.4f} clamped_to [{ratio_floor:.2f},{ratio_cap:.2f}]"
+        return est, meta
+
+    # -------- Tier-3B：冷啟動 default ratio --------
+    if amount_twse is not None and amount_twse > 0:
+        r_used = clamp(ratio_floor, ratio_cap, ratio_default)
+        est = int(float(amount_twse) * float(r_used))
+
+        meta["tier"] = 3
+        meta["method"] = "EST_RATIO_DEFAULT_COLDSTART"
+        meta["confidence"] = "LOW"
+        meta["ratio_used"] = float(r_used)
+        meta["note"] = f"cache_samples={len(ratios)} < min_samples={min_samples}"
+        return est, meta
+
+    # -------- Tier-4：最後保命常數（2,000 億） --------
+    meta["tier"] = 4
+    meta["method"] = "SAFE_CONST_200B"
+    meta["confidence"] = "LOW"
+    meta["note"] = "amount_twse missing -> cannot estimate ratio; fallback const"
+    return int(safe_const), meta
+
+# =========================
 # 4) 組合：市場概況 + TopN stocks（TWSE）
 # =========================
-def build_market_snapshot(target_date: datetime, top_n: int = 20):
+def build_market_snapshot(target_date: datetime, top_n: int = 20, system_params: dict = None):
+    if system_params is None:
+        system_params = {}
+
     now = today_tpe()
     effective_dt, is_prev, prev_iso, rec_reason = effective_trade_date_for_eod(target_date, now)
     trade_date = yyyymmdd(effective_dt)
@@ -503,7 +707,6 @@ def build_market_snapshot(target_date: datetime, top_n: int = 20):
     twii, twii_meta = fetch_twii_from_twse(trade_date)
     twii_ok = (twii is not None) and (twii_meta.get("error_code") is None)
 
-    # 前一有效交易日 TWII（用於 daily_return_pct_prev）
     prev_trade_yyyymmdd = find_prev_trade_date_for_twii(effective_dt)
     prev_twii = None
     prev_twii_meta = None
@@ -514,12 +717,12 @@ def build_market_snapshot(target_date: datetime, top_n: int = 20):
     twse_amt, twse_amt_meta = fetch_twse_amount_audit_sum(trade_date)
     twse_ok = twse_amt is not None
 
+    # TPEX amount with fallback
+    tpex_amt, tpex_meta = fetch_tpex_amount_with_fallback(trade_date, twse_amt or 0, system_params)
+
     # TopN
     top_rows, top_meta = fetch_twse_topn_by_amount(trade_date, top_n=top_n)
     top_ok = (top_meta.get("module_status") == "OK") and (len(top_rows) > 0)
-
-    # TPEX safe
-    tpex_amt, tpex_src = tpex_safe_mode_amount()
 
     # T86 今日（摘要 + UI 明細）
     t86_df, t86_sum, t86_meta = fetch_twse_t86(trade_date, "ALL")
@@ -553,13 +756,18 @@ def build_market_snapshot(target_date: datetime, top_n: int = 20):
             "amount_twse": twse_amt,
             "amount_tpex": tpex_amt,
             "amount_total": (twse_amt or 0) + (tpex_amt or 0),
+
             "source_twse": "TWSE_STOCK_DAY_ALL_AUDIT_SUM" if twse_ok else f"TWSE_FAIL:{twse_amt_meta.get('error_code')}",
-            "source_tpex": tpex_src,
+            "source_tpex": f"TPEX_TIER_{tpex_meta.get('tier')}:{tpex_meta.get('method')}",
+
             "status_twse": "OK" if twse_ok else "FAIL",
-            "status_tpex": "ESTIMATED",
+            "status_tpex": "OK" if (tpex_meta.get("tier") in (1, 2)) else "ESTIMATED",
+
             "confidence_twse": "HIGH" if twse_ok else "LOW",
-            "confidence_tpex": "LOW",
+            "confidence_tpex": tpex_meta.get("confidence", "LOW"),
+
             "twse_amount_meta": twse_amt_meta,
+            "tpex_amount_meta": tpex_meta,  # 關鍵：tier/method/ratio/cache_hash/official_meta
         },
 
         "top": {
@@ -580,9 +788,9 @@ def build_market_snapshot(target_date: datetime, top_n: int = 20):
         "integrity": {
             "twii_ok": twii_ok,
             "twse_amount_ok": twse_ok,
+            "tpex_tier": tpex_meta.get("tier"),
             "top_ok": top_ok,
             "t86_ok": t86_ok,
-            "tpex_mode": "SAFE_MODE",
         },
     }
     return snapshot
@@ -630,6 +838,27 @@ def build_v203_min_json(snapshot: dict, system_params: dict, portfolio: dict, mo
         "final_url": amt_meta.get("final_url"),
     })
 
+    # ---- modules: TPEX amount (tiered)
+    tpex_meta = ma.get("tpex_amount_meta") or {}
+    modules.append({
+        "name": "TPEX_AMOUNT_TIERED",
+        "status": "OK" if tpex_meta.get("tier") in (1, 2) else "ESTIMATED",
+        "confidence": tpex_meta.get("confidence", "LOW"),
+        "asof": snapshot.get("trade_date_iso"),
+        "tier": tpex_meta.get("tier"),
+        "method": tpex_meta.get("method"),
+        "ratio_used": tpex_meta.get("ratio_used"),
+        "ratio_samples_used": tpex_meta.get("ratio_samples_used"),
+        "cache_hash": tpex_meta.get("cache_hash"),
+        "official_error": (tpex_meta.get("official_meta") or {}).get("error_code"),
+        "official_status_code": (tpex_meta.get("official_meta") or {}).get("status_code"),
+        "official_raw_hash": (tpex_meta.get("official_meta") or {}).get("raw_hash"),
+        "official_final_url": (tpex_meta.get("official_meta") or {}).get("final_url"),
+        "note": tpex_meta.get("note"),
+    })
+    if tpex_meta.get("tier") in (3, 4):
+        warnings.append(f"market_amount.amount_tpex is ESTIMATED tier={tpex_meta.get('tier')} method={tpex_meta.get('method')} ratio_used={tpex_meta.get('ratio_used')} samples={tpex_meta.get('ratio_samples_used')}")
+
     # ---- modules: TopN
     top_meta = top.get("meta") or {}
     modules.append({
@@ -642,15 +871,6 @@ def build_v203_min_json(snapshot: dict, system_params: dict, portfolio: dict, mo
         "status_code": top_meta.get("status_code"),
         "raw_hash": top_meta.get("raw_hash"),
         "final_url": top_meta.get("final_url"),
-    })
-
-    # ---- modules: TPEX safe
-    modules.append({
-        "name": "TPEX_SAFE_MODE",
-        "status": "ESTIMATED",
-        "confidence": "LOW",
-        "asof": snapshot.get("trade_date_iso"),
-        "error": "SAFE_MODE_200B",
     })
 
     # ---- modules: T86
@@ -688,7 +908,7 @@ def build_v203_min_json(snapshot: dict, system_params: dict, portfolio: dict, mo
     twii_close = safe_float(twii.get("close"), default=None)
     daily_return_pct = safe_float(twii.get("pct"), default=None)
 
-    # ---- daily_return_pct_prev：用前一有效交易日 close 推算（若能取到）
+    # ---- daily_return_pct_prev：用前一有效交易日 close 推算（最長回看 14 天）
     daily_return_pct_prev = None
     prev_trade_yyyymmdd = twii_pack.get("prev_trade_yyyymmdd")
     prev_twii = twii_pack.get("prev_data") or {}
@@ -836,7 +1056,7 @@ def fmt_num(n):
 # =========================
 def app():
     st.set_page_config(page_title="Sunhero 的股市智能超盤", layout="wide")
-    st.title("Sunhero 的股市智能超盤（TWSE-only / V20.3 JSON Export + TWII Endpoint）")
+    st.title("Sunhero 的股市智能超盤（TPEX Tiered Fallback / V20.3 JSON Export）")
 
     with st.sidebar:
         st.subheader("更新設定")
@@ -850,12 +1070,51 @@ def app():
             st.rerun()
 
         st.divider()
-        st.caption("規則：TWSE 指數 endpoint 取 TWII；STOCK_DAY_ALL 取成交額 + TopN；T86 取三大法人；TPEX 成交額暫用 Safe Mode 200B。")
+        st.caption("新增：TPEX 成交額 Tiered Fallback（OFFICIAL → ratio median(20) → default ratio → const 200B）")
+
+    # system_params（鎖死 + 含 TPEX 備援參數）
+    system_params_v203 = {
+        "k_regime": 1.2,
+        "lambda_drawdown": 2.0,
+        "max_loss_per_trade_pct": 0.02,
+        "stress_drawdown_trigger": 0.10,
+        "max_equity_allowed_pct": 0.55,
+
+        "min_trades_for_trust": 8,
+        "trust_default_when_insufficient": 0.49,
+        "trust_attack_scale_low": 0.30,
+        "trust_coldstart_ramp_trades": 20,
+
+        "l1_price_min": 1,
+        "l1_price_max": 5000,
+        "l1_price_median_mult_hi": 50,
+        "l1_price_pair_ratio_hi": 200,
+
+        "prev_day_allocation_scale": 0.70,
+
+        "smr_deadzone": 0.05,
+        "smr_smoothing_alpha": 0.3,
+
+        "min_effective_trades": 5,
+        "effective_trade_winrate_floor": 0.45,
+        "effective_trade_lookback": 10,
+
+        "default_stop_distance_pct": 0.06,
+
+        # ===== TPEX 備援（全部鎖死，可回測）=====
+        "tpex_amount_floor": 30_000_000_000,          # 300 億（避免抓到錯誤日）
+        "tpex_ratio_lookback_days": 20,               # ratio 取最近 20 筆樣本
+        "tpex_ratio_min_samples": 5,                  # 少於 5 筆視為冷啟動
+        "tpex_ratio_default": 0.35,                   # 冷啟動 default
+        "tpex_ratio_floor": 0.15,                     # ratio 下界
+        "tpex_ratio_cap": 0.70,                       # ratio 上界
+        "tpex_safe_const_amount": 200_000_000_000,    # 最後保命 2,000 億
+    }
 
     target_dt = datetime(d.year, d.month, d.day, tzinfo=TZ_TPE)
-    snap = build_market_snapshot(target_dt, top_n=int(top_n))
+    snap = build_market_snapshot(target_dt, top_n=int(top_n), system_params=system_params_v203)
 
-    # ====== 第一列：TWII / 成交額 / 法人 ======
+    # ====== 第一列：TWII / 成交額（含 TPEX tier） ======
     c1, c2, c3, c4 = st.columns(4)
 
     twii_pack = snap["twii"]
@@ -875,7 +1134,8 @@ def app():
 
     with c3:
         st.metric("上櫃成交額（TPEX）", fmt_money(ma.get("amount_tpex")))
-        st.caption(f"來源：{ma.get('source_tpex')}｜信心：{ma.get('confidence_tpex')}（估算）")
+        tpex_a = ma.get("tpex_amount_meta") or {}
+        st.caption(f"{ma.get('source_tpex')}｜tier={tpex_a.get('tier')}｜samples={tpex_a.get('ratio_samples_used')}｜ratio={tpex_a.get('ratio_used')}")
 
     rec = snap["recency"]
     with c4:
@@ -915,37 +1175,7 @@ def app():
     st.divider()
 
     # ====== 輸出 V20.3 JSON ======
-    st.subheader("輸出：Predator Apex V20.3 最小可運行 JSON（TWSE-only）")
-
-    system_params_v203 = {
-        "k_regime": 1.2,
-        "lambda_drawdown": 2.0,
-        "max_loss_per_trade_pct": 0.02,
-        "stress_drawdown_trigger": 0.10,
-        "max_equity_allowed_pct": 0.55,
-
-        "min_trades_for_trust": 8,
-        "trust_default_when_insufficient": 0.49,
-        "trust_attack_scale_low": 0.30,
-        "trust_coldstart_ramp_trades": 20,
-
-        "l1_price_min": 1,
-        "l1_price_max": 5000,
-        "l1_price_median_mult_hi": 50,
-        "l1_price_pair_ratio_hi": 200,
-
-        "prev_day_allocation_scale": 0.70,
-
-        "smr_deadzone": 0.05,
-        "smr_smoothing_alpha": 0.3,
-
-        "min_effective_trades": 5,
-        "effective_trade_winrate_floor": 0.45,
-        "effective_trade_lookback": 10,
-
-        "default_stop_distance_pct": 0.06,
-    }
-
+    st.subheader("輸出：Predator Apex V20.3 最小可運行 JSON")
     v203_json = build_v203_min_json(
         snapshot=snap,
         system_params=system_params_v203,
@@ -953,7 +1183,6 @@ def app():
         monitoring={},
         session="EOD"
     )
-
     st.json(v203_json)
 
     v203_str = json.dumps(v203_json, ensure_ascii=False, indent=2)
@@ -973,10 +1202,14 @@ def app():
         "recency_reason": snap["recency"].get("recency_reason"),
         "twii_ok": snap["integrity"].get("twii_ok"),
         "twse_amount_ok": snap["integrity"].get("twse_amount_ok"),
+        "tpex_tier": snap["integrity"].get("tpex_tier"),
         "top_ok": snap["integrity"].get("top_ok"),
         "t86_ok": snap["integrity"].get("t86_ok"),
         "kill_switch": v203_json["macro"]["integrity"]["kill"],
     })
+
+    with st.expander("查看 TPEX amount meta（含 tier/ratio/cache/official）", expanded=False):
+        st.json(snap["market_amount"].get("tpex_amount_meta"))
 
     with st.expander("查看 TWII meta", expanded=False):
         st.json(snap["twii"].get("meta"))
