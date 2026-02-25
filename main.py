@@ -1,309 +1,350 @@
-# main.py
+# ucc_v19_1.py
 # =========================================================
-# Streamlit UI for Predator UCC V19.1
-# - RUN L1/L2/L3 selector
-# - 「盤中是否允許當日法人資料」開關
-# - payload patch（補欄位/寫政策/統計缺漏）
+# Predator UCC V19.1 Hardened Final Lockdown (Audit-Hardened)
+# - JSON-only
+# - path=value evidence
+# - single-mode output (L1 or L2 or L3)
 # =========================================================
 
-import json
-import math
-from copy import deepcopy
-from datetime import datetime
-import streamlit as st
+from __future__ import annotations
+import re
+from typing import Any, Dict, List, Optional, Tuple, Union
 
-from ucc_v19_1 import UCCv19_1
+Json = Dict[str, Any]
 
 
-APP_TITLE = "Predator UCC V19.1 — Streamlit Console"
-
-DEFAULT_PAYLOAD = {
-    "meta": {
-        "timestamp": "",
-        "session": "INTRADAY",
-        "market_status": "DEGRADED",
-        "market_status_reason": [],
-        "current_regime": "DATA_FAILURE",
-        "confidence_level": "LOW",
-        "is_using_previous_day": True,
-        "effective_trade_date": "",
-        "max_equity_lock_reason": [],
-        "confidence": {"price": "LOW", "volume": "LOW", "institutional": "LOW"},
-        "intraday_institutional_policy": {
-            "allow_same_day": False,
-            "enforce_token_when_same_day": True,
-            "resolved_use_same_day": False,
-            "inst_effective_date": ""
-        }
-    },
-    "macro": {
-        "overview": {
-            "twii_close": None,
-            "SMR": None,
-            "Slope5": None,
-            "Acceleration": None,
-            "Top_Divergence": False,
-            "Blow_Off_Phase": False,
-            "MOMENTUM_LOCK": False,
-            "vix": None,
-            "max_equity_allowed_pct": 0.0,
-            "calc_version": "V16.3.x+UCC_PATCH_UI",
-            "slope5_def": "diff5_of_SMR"
-        },
-        "market_amount": {
-            "amount_twse": None,
-            "amount_tpex": None,
-            "amount_total_raw": None,
-            "amount_total_blended": None,
-            "source_twse": "",
-            "source_tpex": "",
-            "status_twse": "",
-            "status_tpex": "",
-            "confidence_level": "LOW"
-        },
-        "integrity": {
-            "kill": False,
-            "vix_invalid": False,
-            "reason": "OK"
-        }
-    },
-    "stocks": []
-}
+def _split_path(path: str) -> List[str]:
+    return re.split(r"\.(?![^\[]*\])", path)
 
 
-def _now_str() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
-def _is_nan(x) -> bool:
-    try:
-        return isinstance(x, float) and math.isnan(x)
-    except Exception:
-        return False
-
-
-def normalize_json(obj):
-    """遞迴把 NaN 轉 None，避免 JSON 序列化/比較問題。"""
-    if isinstance(obj, dict):
-        return {k: normalize_json(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [normalize_json(v) for v in obj]
-    if _is_nan(obj):
-        return None
-    return obj
-
-
-def ensure_path(d: dict, keys: list):
+def jget(d: Any, path: str, default: Any = None) -> Any:
     cur = d
-    for k in keys:
-        if k not in cur or not isinstance(cur[k], dict):
-            cur[k] = {}
-        cur = cur[k]
-    return d
-
-
-def count_missing_prices(payload: dict) -> int:
-    n = 0
-    for s in payload.get("stocks", []) or []:
-        if (s or {}).get("Price", None) is None:
-            n += 1
-    return n
-
-
-def patch_payload(payload_in: dict,
-                  allow_same_day_inst: bool,
-                  enforce_token_when_same_day: bool,
-                  inst_effective_date_override: str | None):
-    """
-    送入 UCC 前的 deterministic patch：
-    - 補齊 meta/macro 結構
-    - 補 max_equity_allowed_pct（缺就設 0.0 + lock_reason）
-    - UI 法人政策寫入 meta.intraday_institutional_policy
-    - allow_same_day_inst=false 時，強制全股 Inst_Status=USING_T_MINUS_1, inst_data_fresh=false
-    - 追加 PRICE_MISSING_X_OF_N 到 market_status_reason
-    """
-    payload = deepcopy(payload_in)
-    notes = []
-
-    ensure_path(payload, ["meta"])
-    ensure_path(payload, ["macro"])
-    ensure_path(payload, ["macro", "overview"])
-    ensure_path(payload, ["macro", "market_amount"])
-    ensure_path(payload, ["macro", "integrity"])
-
-    meta = payload["meta"]
-    ov = payload["macro"]["overview"]
-
-    if not meta.get("timestamp"):
-        meta["timestamp"] = _now_str()
-        notes.append("PATCH: $.meta.timestamp filled with now()")
-
-    if not meta.get("effective_trade_date"):
-        meta["effective_trade_date"] = meta["timestamp"][:10]
-        notes.append("PATCH: $.meta.effective_trade_date filled from timestamp")
-
-    if "max_equity_allowed_pct" not in ov or ov.get("max_equity_allowed_pct") is None:
-        ov["max_equity_allowed_pct"] = 0.0
-        if not isinstance(meta.get("max_equity_lock_reason"), list):
-            meta["max_equity_lock_reason"] = []
-        meta["max_equity_lock_reason"].append("MAX_EQUITY_MISSING_DEFAULT_0")
-        notes.append("PATCH: $.macro.overview.max_equity_allowed_pct missing -> set 0.0 + lock_reason")
-
-    if "market_status_reason" not in meta or not isinstance(meta.get("market_status_reason"), list):
-        meta["market_status_reason"] = []
-        notes.append("PATCH: $.meta.market_status_reason initialized []")
-
-    payload = normalize_json(payload)
-
-    ensure_path(meta, ["intraday_institutional_policy"])
-    pol = meta["intraday_institutional_policy"]
-    pol["allow_same_day"] = bool(allow_same_day_inst)
-    pol["enforce_token_when_same_day"] = bool(enforce_token_when_same_day)
-
-    inst_eff = inst_effective_date_override or meta.get("effective_trade_date")
-    pol["inst_effective_date"] = inst_eff
-    pol["resolved_use_same_day"] = bool(allow_same_day_inst)
-
-    stocks = payload.get("stocks", []) or []
-    for s in stocks:
-        if not isinstance(s, dict):
+    for tok in _split_path(path):
+        if not tok:
             continue
-        inst = s.get("Institutional")
-        if not isinstance(inst, dict):
-            inst = {}
-            s["Institutional"] = inst
+        m = re.fullmatch(r"([^\[]+)(\[(\-?\d+)\])?", tok)
+        if not m:
+            return default
+        key = m.group(1)
+        idx = m.group(3)
 
-        if allow_same_day_inst:
-            inst.setdefault("Inst_Status", "READY")
-            inst.setdefault("inst_data_fresh", True)
-            inst["inst_effective_date"] = inst_eff
-        else:
-            inst["Inst_Status"] = "USING_T_MINUS_1"
-            inst["inst_data_fresh"] = False
-            inst["inst_effective_date"] = inst_eff
+        if not isinstance(cur, dict) or key not in cur:
+            return default
+        cur = cur[key]
 
-    missing = count_missing_prices(payload)
-    total = len(payload.get("stocks", []) or [])
-    if total > 0 and missing > 0:
-        reason = f"PRICE_MISSING_{missing}_OF_{total}"
-        if reason not in meta["market_status_reason"]:
-            meta["market_status_reason"].append(reason)
-            notes.append(f"PATCH: $.meta.market_status_reason add {reason}")
-
-    return payload, notes
+        if idx is not None:
+            if not isinstance(cur, list):
+                return default
+            i = int(idx)
+            if i < 0 or i >= len(cur):
+                return default
+            cur = cur[i]
+    return cur
 
 
-# -------------------------
-# UI
-# -------------------------
-st.set_page_config(page_title=APP_TITLE, layout="wide")
-st.title(APP_TITLE)
+def exists(d: Any, path: str) -> bool:
+    sentinel = object()
+    return jget(d, path, sentinel) is not sentinel
 
-with st.sidebar:
-    st.header("UCC 控制台")
 
-    run_mode = st.radio(
-        "RUN 模式（一次只輸出一層）",
-        options=["L1", "L2", "L3"],
-        index=0,
-        help="L1=只做資料稽核；L2=交易裁決（需 L1=PASS）；L3=回撤壓測（需觸發條件）"
-    )
+def to_float(x: Any) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        if isinstance(x, (int, float)):
+            return float(x)
+        if isinstance(x, str):
+            s = x.strip().replace(",", "")
+            if s == "":
+                return None
+            return float(s)
+        return None
+    except Exception:
+        return None
 
-    st.divider()
-    st.subheader("法人資料政策（UI 開關）")
-    allow_same_day_inst = st.toggle(
-        "盤中是否允許「當日法人資料」",
-        value=False,
-        help="關閉：強制 USING_T_MINUS_1 + inst_data_fresh=false。開啟：允許 READY + inst_data_fresh=true。"
-    )
-    enforce_token_when_same_day = st.toggle(
-        "允許當日法人時：是否強制 Token？（寫入 policy 欄位）",
-        value=True
-    )
-    inst_effective_date_override = st.text_input(
-        "法人資料有效日（不填=用 effective_trade_date）",
-        value="",
-        help="YYYY-MM-DD；不填則自動取 meta.effective_trade_date"
-    ).strip() or None
 
-col1, col2 = st.columns(2)
+def contains_any(s: Any, needles: List[str]) -> bool:
+    if not isinstance(s, str):
+        return False
+    up = s.upper()
+    return any(n.upper() in up for n in needles)
 
-with col1:
-    st.subheader("輸入 Payload（JSON）")
 
-    if "payload_text" not in st.session_state:
-        st.session_state.payload_text = json.dumps(DEFAULT_PAYLOAD, ensure_ascii=False, indent=2)
+class UCCv19_1:
+    SMR_OVERHEAT_1 = 0.30
+    SMR_OVERHEAT_2 = 0.33
 
-    payload_text = st.text_area(
-        "貼上你的 payload JSON",
-        value=st.session_state.payload_text,
-        height=520
-    )
+    # -------------------------
+    # V17 War-time override
+    # -------------------------
+    def v17_triggered(self, j: Json) -> Tuple[bool, List[str]]:
+        reasons: List[str] = []
+        if jget(j, "meta.war_time_override") is True:
+            reasons.append("meta.war_time_override=true")
+        reg = jget(j, "meta.current_regime")
+        if contains_any(reg, ["WAR", "CRISIS"]):
+            reasons.append(f"meta.current_regime={reg}")
+        return (len(reasons) > 0, reasons)
 
-    b1, b2, b3 = st.columns(3)
-    with b1:
-        if st.button("載入範本", use_container_width=True):
-            st.session_state.payload_text = json.dumps(DEFAULT_PAYLOAD, ensure_ascii=False, indent=2)
-            st.rerun()
-    with b2:
-        if st.button("格式化 JSON", use_container_width=True):
+    # -------------------------
+    # Market state (JSON-only)
+    # -------------------------
+    def market_state(self, j: Json) -> Tuple[str, List[str]]:
+        reasons: List[str] = []
+        smr = to_float(jget(j, "macro.overview.SMR"))
+        bop = jget(j, "macro.overview.Blow_Off_Phase", None)
+        if smr is not None:
+            reasons.append(f"macro.overview.SMR={smr}")
+        if bop is not None:
+            reasons.append(f"macro.overview.Blow_Off_Phase={bop}")
+
+        if (smr is not None and smr >= self.SMR_OVERHEAT_2) or (bop is True):
+            return "OVERHEAT", reasons
+        if smr is not None and smr >= self.SMR_OVERHEAT_1:
+            return "OVERHEAT", reasons
+        if smr is not None and smr < 0:
+            return "DEFENSIVE", reasons
+        return "NORMAL", reasons
+
+    # -------------------------
+    # L3 trigger gate
+    # -------------------------
+    def l3_triggered(self, j: Json, market_state: Optional[str] = None) -> Tuple[bool, List[str]]:
+        reasons: List[str] = []
+        smr = to_float(jget(j, "macro.overview.SMR"))
+        if smr is not None and smr < 0:
+            reasons.append(f"macro.overview.SMR={smr} -> SMR<0")
+        if market_state == "DEFENSIVE":
+            reasons.append("MARKET_STATE=DEFENSIVE")
+
+        cons = jget(j, "portfolio.performance.consecutive_losses", None)
+        dd = to_float(jget(j, "portfolio.performance.drawdown_pct", None))
+        if cons is not None:
             try:
-                obj = json.loads(payload_text)
-                st.session_state.payload_text = json.dumps(obj, ensure_ascii=False, indent=2)
-                st.rerun()
-            except Exception as e:
-                st.error(f"JSON 格式錯誤：{e}")
-    with b3:
-        run_clicked = st.button("執行 UCC", type="primary", use_container_width=True)
+                if int(cons) >= 3:
+                    reasons.append(f"portfolio.performance.consecutive_losses={cons} >= 3")
+            except Exception:
+                pass
+        if dd is not None and dd >= 0.08:
+            reasons.append(f"portfolio.performance.drawdown_pct={dd} >= 0.08")
 
-with col2:
-    st.subheader("UCC 輸出結果")
-    st.caption("會先做 payload patch（補欄位/法人政策/缺漏統計），再送進 UCC。")
+        return (len(reasons) > 0, reasons)
 
-    if "last_output" not in st.session_state:
-        st.session_state.last_output = None
-    if "last_patch_notes" not in st.session_state:
-        st.session_state.last_patch_notes = []
-    if "last_payload_patched" not in st.session_state:
-        st.session_state.last_payload_patched = None
+    # -------------------------
+    # L1 audit rules
+    # -------------------------
+    def run_l1(self, j: Json) -> Json:
+        fatal: List[str] = []
+        warn: List[str] = []
 
-    if run_clicked:
-        try:
-            payload_obj = json.loads(payload_text)
-        except Exception as e:
-            st.error(f"JSON 解析失敗：{e}")
-            st.stop()
+        # 3.1 fatal conditions
+        twii = jget(j, "macro.overview.twii_close", None)
+        if twii is None:
+            fatal.append('macro.overview.twii_close is null/missing -> FAIL (path=$.macro.overview.twii_close)')
 
-        patched, notes = patch_payload(
-            payload_obj,
-            allow_same_day_inst=allow_same_day_inst,
-            enforce_token_when_same_day=enforce_token_when_same_day,
-            inst_effective_date_override=inst_effective_date_override
-        )
+        if jget(j, "macro.integrity.kill") is True:
+            fatal.append('macro.integrity.kill=true -> FAIL (path=$.macro.integrity.kill=true)')
 
-        ucc = UCCv19_1()
-        out = ucc.run(patched, run_mode=run_mode)
+        conf = jget(j, "meta.confidence_level")
+        ms = jget(j, "meta.market_status")
+        if conf == "LOW" and ms == "NORMAL":
+            fatal.append('meta.confidence_level="LOW" but meta.market_status="NORMAL" -> FAIL (path=$.meta.confidence_level, $.meta.market_status)')
 
-        st.session_state.last_output = out
-        st.session_state.last_patch_notes = notes
-        st.session_state.last_payload_patched = patched
+        amt_raw = to_float(jget(j, "macro.market_amount.amount_total_raw"))
+        amt_blend = to_float(jget(j, "macro.market_amount.amount_total_blended"))
+        if amt_raw is not None and amt_blend is not None and amt_blend < amt_raw:
+            fatal.append(f"macro.market_amount.amount_total_blended < amount_total_raw -> FAIL (path=$.macro.market_amount.amount_total_blended={amt_blend}, $.macro.market_amount.amount_total_raw={amt_raw})")
 
-    if st.session_state.last_patch_notes:
-        st.markdown("**Patch 紀錄（送入 UCC 前的修補）**")
-        st.code("\n".join(st.session_state.last_patch_notes), language="text")
+        if jget(j, "meta.is_using_previous_day") is True and not exists(j, "meta.effective_trade_date"):
+            fatal.append("meta.is_using_previous_day=true but missing meta.effective_trade_date -> FAIL (path=$.meta.is_using_previous_day, $.meta.effective_trade_date)")
 
-    if st.session_state.last_output is None:
-        st.info("尚未執行。請貼上 JSON 後按「執行 UCC」。")
-    else:
-        out = st.session_state.last_output
-        if isinstance(out, dict):
-            st.json(out)
-        else:
-            st.code(str(out), language="text")
+        # Institutional stale contradiction
+        stocks = jget(j, "stocks", [])
+        if isinstance(stocks, list):
+            for i, s in enumerate(stocks):
+                st = jget(j, f"stocks[{i}].Institutional.Inst_Status")
+                net3 = jget(j, f"stocks[{i}].Institutional.Inst_Net_3d", None)
+                if st == "NO_UPDATE_TODAY" and net3 is not None:
+                    fatal.append(f'stocks[{i}].Institutional.Inst_Status="NO_UPDATE_TODAY" but Inst_Net_3d has value -> FAIL (path=$.stocks[{i}].Institutional.Inst_Status, $.stocks[{i}].Institutional.Inst_Net_3d={net3})')
 
-    st.divider()
-    with st.expander("查看送入 UCC 的最終 Payload（patched）", expanded=False):
-        if st.session_state.last_payload_patched is not None:
-            st.json(st.session_state.last_payload_patched)
-        else:
-            st.caption("尚未產生 patched payload。")
+        # Symbol–Price cross-scale sanity (only apply to 2330.TW per your spec example)
+        if isinstance(stocks, list):
+            for i, s in enumerate(stocks):
+                sym = jget(j, f"stocks[{i}].Symbol")
+                px = to_float(jget(j, f"stocks[{i}].Price"))
+                if sym == "2330.TW" and px is not None and px < 200:
+                    fatal.append(f"Symbol–Price cross-scale mismatch -> FAIL (path=$.stocks[{i}].Symbol={sym}, $.stocks[{i}].Price={px})")
+
+        verdict = "PASS" if len(fatal) == 0 else "FAIL"
+        risk = "LOW" if verdict == "PASS" else "CRITICAL"
+
+        return {
+            "mode": "L1_AUDIT",
+            "verdict": verdict,
+            "risk_level": risk,
+            "fatal_issues": fatal,
+            "structural_warnings": warn,
+            "audit_confidence": "HIGH" if verdict == "PASS" else "HIGH",
+        }
+
+    # -------------------------
+    # L2 execute
+    # -------------------------
+    def run_l2(self, j: Json, l1_verdict: str = "PASS") -> str:
+        # Guard: must have max_equity_allowed_pct
+        maxeq = to_float(jget(j, "macro.overview.max_equity_allowed_pct"))
+        if maxeq is None:
+            return "MODE: L2_EXECUTE\nDECISION: NO TRADE\nRISK_REASON: macro.overview.max_equity_allowed_pct missing -> NO_TRADE\nCONFIDENCE: LOW"
+
+        # V17 war-time override (禁止 OPEN/ADD)
+        war, war_reason = self.v17_triggered(j)
+
+        ms, ms_reason = self.market_state(j)
+        conf_level = jget(j, "meta.confidence_level", "MEDIUM")
+
+        # LOW confidence scaling rule
+        scale = 1.0
+        scale_note = ""
+        if conf_level == "LOW":
+            scale = 0.5
+            scale_note = "LOW_CONF_SCALE: allocation x0.5 (rounded to 0.5%)"
+
+        # War-time clamp
+        if war:
+            maxeq = min(maxeq, 0.05)
+
+        lines: List[str] = []
+        lines.append("MODE: L2_EXECUTE")
+        lines.append(f"MARKET_STATE: {ms}")
+        lines.append(f"MAX_EQUITY_ALLOWED: {maxeq*100:.1f}%")
+        if scale_note:
+            lines.append(scale_note)
+
+        # Decision policy (minimal, JSON-only, conservative)
+        if war:
+            lines.append("DECISION:")
+            lines.append("NO TRADE")
+            lines.append("RISK_REASON:" + " | ".join([f"{r} -> V17_WAR_TIME" for r in war_reason]))
+            lines.append("CONFIDENCE: LOW")
+            return "\n".join(lines)
+
+        # Overheat -> default no open
+        if ms == "OVERHEAT":
+            lines.append("DECISION:")
+            lines.append("NO TRADE")
+            lines.append("RISK_REASON:" + " | ".join([f"{r} -> MARKET_OVERHEAT" for r in ms_reason]))
+            lines.append(f"CONFIDENCE: {conf_level}")
+            return "\n".join(lines)
+
+        lines.append("DECISION:")
+        lines.append("NO TRADE")
+        lines.append("RISK_REASON: JSON_ONLY_POLICY -> NO_MODEL_SIGNAL")
+        lines.append(f"CONFIDENCE: {conf_level}")
+        return "\n".join(lines)
+
+    # -------------------------
+    # L3 stress
+    # -------------------------
+    def run_l3(self, j: Json) -> str:
+        ms, _ = self.market_state(j)
+        trig, reasons = self.l3_triggered(j, market_state=ms)
+        if not trig:
+            return "MODE: L3_STRESS\nSTRESS_TEST: NOT_ACTIVATED\nFINAL_VERDICT: SYSTEM_SURVIVES"
+
+        # Minimal stress model (rule-based)
+        dd = to_float(jget(j, "portfolio.performance.drawdown_pct"))
+        cons = jget(j, "portfolio.performance.consecutive_losses")
+
+        breach = False
+        if dd is not None and dd >= 0.15:
+            breach = True
+
+        def scen(x: float) -> str:
+            if dd is None:
+                return "WARNING"
+            if dd + x >= 0.15:
+                return "FAILURE"
+            if dd + x >= 0.10:
+                return "WARNING"
+            return "SAFE"
+
+        surv = 80
+        if ms == "DEFENSIVE":
+            surv -= 15
+        if dd is not None:
+            surv -= int(dd * 100)
+        if cons is not None:
+            try:
+                surv -= int(cons) * 3
+            except Exception:
+                pass
+        surv = max(0, min(100, surv))
+
+        sys_status = "STABLE"
+        final = "SYSTEM_SURVIVES"
+        if breach or surv < 40:
+            sys_status = "CRITICAL"
+            final = "SYSTEM_FAILURE"
+        elif surv < 60:
+            sys_status = "FRAGILE"
+            final = "SYSTEM_AT_RISK"
+
+        lines: List[str] = []
+        lines.append("MODE: L3_STRESS")
+        lines.append("STRESS_TEST: ACTIVATED")
+        lines.append(f"STRUCTURAL_BREACH: {'TRUE' if breach else 'FALSE'}")
+        lines.append(f"5%_SCENARIO: {scen(0.05)}")
+        lines.append(f"10%_SCENARIO: {scen(0.10)}")
+        lines.append(f"15%_SCENARIO: {scen(0.15)}")
+        lines.append("PSYCHOLOGICAL_RISK: " + ("HIGH" if surv < 50 else "MEDIUM" if surv < 70 else "LOW"))
+        lines.append(f"SURVIVAL_SCORE: {surv}")
+        lines.append(f"SYSTEM_STATUS: {sys_status}")
+        lines.append(f"FINAL_VERDICT: {final}")
+        lines.append("RISK_REASON: " + " | ".join([f"{r} -> L3_TRIGGER" for r in reasons]))
+        return "\n".join(lines)
+
+    # ------------------
+    # Top-level run (V19 enforcement)
+    # -------------------------
+    def run(self, j: Json, run_mode: str = "L1") -> Union[Json, str]:
+        run_mode = (run_mode or "L1").strip().upper()
+        if run_mode not in ("L1", "L2", "L3"):
+            run_mode = "L1"
+
+        # always L1 first（不可跳過）
+        l1 = self.run_l1(j)
+        l1_verdict = l1.get("verdict")
+
+        if run_mode == "L1":
+            return l1
+
+        # V19：防跳關（但保留 L1 原始 fatal_issues，避免只看到「不能跑 L2」卻看不到根因）
+        if run_mode == "L2" and l1_verdict != "PASS":
+            fatal = list(l1.get("fatal_issues", []))
+            fatal.insert(0, f"VIOLATION: RUN:L2 requested but L1.verdict != PASS")
+            fatal.insert(1, f'EVIDENCE: $.mode="L1_AUDIT", $.verdict="{l1_verdict}"')
+            l1["fatal_issues"] = fatal
+            l1["verdict"] = "FAIL"
+            l1["risk_level"] = "CRITICAL"
+            return l1
+
+        if run_mode == "L2":
+            return self.run_l2(j, l1_verdict=l1_verdict)
+
+        if run_mode == "L3":
+            ms, _ = self.market_state(j)
+            trig, _ = self.l3_triggered(j, market_state=ms)
+            if not trig:
+                fatal = list(l1.get("fatal_issues", []))
+                fatal.insert(0, "VIOLATION: RUN:L3 requested but L3 not triggered")
+                fatal.insert(1, f"EVIDENCE: MARKET_STATE={ms}")
+                l1["fatal_issues"] = fatal
+                l1["verdict"] = "FAIL"
+                l1["risk_level"] = "CRITICAL"
+                l1.setdefault("structural_warnings", []).append(f"macro.overview.SMR={jget(j,'macro.overview.SMR')} -> L3_NOT_TRIGGERED")
+                l1.setdefault("structural_warnings", []).append(f"portfolio.performance.drawdown_pct={jget(j,'portfolio.performance.drawdown_pct')} -> L3_NOT_TRIGGERED")
+                l1.setdefault("structural_warnings", []).append(f"portfolio.performance.consecutive_losses={jget(j,'portfolio.performance.consecutive_losses')} -> L3_NOT_TRIGGERED")
+                return l1
+            return self.run_l3(j)
+
+        return l1
