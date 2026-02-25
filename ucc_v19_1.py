@@ -28,8 +28,30 @@ class UCCv19_1:
         l1 = self._l1_audit(payload)
 
         # V19：防跳關
-        if run_mode in ("L2", "L3") and l1["verdict"] != "PASS":
-            return self._l1_fail_constitution(
+def run(self, payload: Dict[str, Any], run_mode: str = "L1") -> Any:
+    run_mode = (run_mode or "L1").strip().upper()
+    if run_mode not in ("L1", "L2", "L3"):
+        run_mode = "L1"
+
+    l1 = self._l1_audit(payload)
+
+    # V19：防跳關（但要保留 L1 原始 fatal_issues，避免使用者不知道哪裡壞）
+    if run_mode in ("L2", "L3") and l1["verdict"] != "PASS":
+        # 直接在 L1 的 fatal_issues 前面加上違憲提示
+        l1 = dict(l1)  # shallow copy
+        fatal = list(l1.get("fatal_issues", []))
+        fatal.insert(0, f'VIOLATION: RUN:{run_mode} requested but L1.verdict != PASS')
+        fatal.insert(1, f'EVIDENCE: $.mode="L1_AUDIT", $.verdict="{l1.get("verdict")}"')
+        l1["fatal_issues"] = fatal
+        # 風險等級維持 CRITICAL
+        l1["risk_level"] = "CRITICAL"
+        return l1
+
+    if run_mode == "L1":
+        return l1
+    if run_mode == "L2":
+        return self._l2_execute(payload, l1)
+    return self._l3_stress(payload, l1)
                 fatal=[
                     f'VIOLATION: RUN:{run_mode} requested but L1.verdict != PASS',
                     f'EVIDENCE: $.mode="L1_AUDIT", $.verdict="{l1["verdict"]}"'
