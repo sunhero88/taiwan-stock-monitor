@@ -64,3 +64,23 @@ with right:
             result = UCCv19_1().run(data, run_mode=run_mode)
             st.json(result) if isinstance(result, dict) else st.code(result)
         except Exception as e: st.error(f"解析錯誤: {str(e)}")
+
+# 新增在 main.py 的儀表板區塊下方
+def get_plain_language_report(smr, vix):
+    if smr > 0.33:
+        status = "🔴 市場極度過熱"
+        advice = "目前就像在懸崖邊跳舞，大家都在搶最後一塊肉。AI 建議「絕對不要追高」，請把手收起來，守住現金。"
+    elif smr < 0:
+        status = "🔵 市場極度悲觀 (機會出現)"
+        advice = "大家都在逃命，但這正是掠食者出動的時候。AI 正在掃描超跌的績優股，準備進行抄底。"
+    else:
+        status = "🟢 市場氣候正常"
+        advice = "現在環境很舒服，適合穩健佈局。只要法人有買、個股動能好，就可以大膽一點。"
+    
+    vix_advice = "（目前大家警覺心極低，請小心突發性的崩盤）" if vix < 20 else "（市場已有戒心，波動雖大但相對安全）"
+    return status, advice + vix_advice
+
+# 在 UI 顯示
+st.markdown("---")
+status_title, plain_text = get_plain_language_report(tw_p, vix_p) # 這裡傳入您的 SMR 與 VIX
+st.info(f"### 🛡️ 指揮官戰情週報：{status_title}\n\n**{plain_text}**")
