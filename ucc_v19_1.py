@@ -1,418 +1,350 @@
 # ucc_v19_1.py
 # =========================================================
-# Predator UCC V19.1 Hardened Final Lockdown (Standalone)
-# - 禁止 self-import（最重要）
-# - JSON-only evidence: path=value
-# - 一次只輸出 L1 或 L2 或 L3
+# Predator UCC V19.1 Hardened Final Lockdown (Audit-Hardened)
+# - JSON-only
+# - path=value evidence
+# - single-mode output (L1 or L2 or L3)
 # =========================================================
 
 from __future__ import annotations
-from typing import Any, Dict, List, Tuple
+import re
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+Json = Dict[str, Any]
+
+
+def _split_path(path: str) -> List[str]:
+    return re.split(r"\.(?![^\[]*\])", path)
+
+
+def jget(d: Any, path: str, default: Any = None) -> Any:
+    cur = d
+    for tok in _split_path(path):
+        if not tok:
+            continue
+        m = re.fullmatch(r"([^\[]+)(\[(\-?\d+)\])?", tok)
+        if not m:
+            return default
+        key = m.group(1)
+        idx = m.group(3)
+
+        if not isinstance(cur, dict) or key not in cur:
+            return default
+        cur = cur[key]
+
+        if idx is not None:
+            if not isinstance(cur, list):
+                return default
+            i = int(idx)
+            if i < 0 or i >= len(cur):
+                return default
+            cur = cur[i]
+    return cur
+
+
+def exists(d: Any, path: str) -> bool:
+    sentinel = object()
+    return jget(d, path, sentinel) is not sentinel
+
+
+def to_float(x: Any) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        if isinstance(x, (int, float)):
+            return float(x)
+        if isinstance(x, str):
+            s = x.strip().replace(",", "")
+            if s == "":
+                return None
+            return float(s)
+        return None
+    except Exception:
+        return None
+
+
+def contains_any(s: Any, needles: List[str]) -> bool:
+    if not isinstance(s, str):
+        return False
+    up = s.upper()
+    return any(n.upper() in up for n in needles)
 
 
 class UCCv19_1:
-    VERSION = "UCC_V19.1_HARDENED_FINAL_LOCKDOWN"
+    SMR_OVERHEAT_1 = 0.30
+    SMR_OVERHEAT_2 = 0.33
 
     # -------------------------
-    # Public entry
+    # V17 War-time override
     # -------------------------
-    def run(self, payload: Dict[str, Any], run_mode: str = "L1") -> Any:
-        """
-        run_mode: "L1" | "L2" | "L3"
-        憲法：不可跳過 L1。若 L1 != PASS 仍要求 L2/L3 -> 直接回 L1 FAIL（違憲）
-        """
-        run_mode = (run_mode or "L1").strip().upper()
-        if run_mode not in ("L1", "L2", "L3"):
-            run_mode = "L1"
-
-        l1 = self._l1_audit(payload)
-
-        # V19：防跳關
-def run(self, payload: Dict[str, Any], run_mode: str = "L1") -> Any:
-    run_mode = (run_mode or "L1").strip().upper()
-    if run_mode not in ("L1", "L2", "L3"):
-        run_mode = "L1"
-
-    l1 = self._l1_audit(payload)
-
-    # V19：防跳關（但要保留 L1 原始 fatal_issues，避免使用者不知道哪裡壞）
-    if run_mode in ("L2", "L3") and l1["verdict"] != "PASS":
-        # 直接在 L1 的 fatal_issues 前面加上違憲提示
-        l1 = dict(l1)  # shallow copy
-        fatal = list(l1.get("fatal_issues", []))
-        fatal.insert(0, f'VIOLATION: RUN:{run_mode} requested but L1.verdict != PASS')
-        fatal.insert(1, f'EVIDENCE: $.mode="L1_AUDIT", $.verdict="{l1.get("verdict")}"')
-        l1["fatal_issues"] = fatal
-        # 風險等級維持 CRITICAL
-        l1["risk_level"] = "CRITICAL"
-        return l1
-
-    if run_mode == "L1":
-        return l1
-    if run_mode == "L2":
-        return self._l2_execute(payload, l1)
-    return self._l3_stress(payload, l1)
-                fatal=[
-                    f'VIOLATION: RUN:{run_mode} requested but L1.verdict != PASS',
-                    f'EVIDENCE: $.mode="L1_AUDIT", $.verdict="{l1["verdict"]}"'
-                ],
-                structural=[]
-            )
-
-        if run_mode == "L1":
-            return l1
-        if run_mode == "L2":
-            return self._l2_execute(payload, l1)
-        return self._l3_stress(payload, l1)
+    def v17_triggered(self, j: Json) -> Tuple[bool, List[str]]:
+        reasons: List[str] = []
+        if jget(j, "meta.war_time_override") is True:
+            reasons.append("meta.war_time_override=true")
+        reg = jget(j, "meta.current_regime")
+        if contains_any(reg, ["WAR", "CRISIS"]):
+            reasons.append(f"meta.current_regime={reg}")
+        return (len(reasons) > 0, reasons)
 
     # -------------------------
-    # Helpers
+    # Market state (JSON-only)
     # -------------------------
-    def _get(self, obj: Any, path: List[str]) -> Any:
-        cur = obj
-        for k in path:
-            if not isinstance(cur, dict) or k not in cur:
-                return None
-            cur = cur[k]
-        return cur
+    def market_state(self, j: Json) -> Tuple[str, List[str]]:
+        reasons: List[str] = []
+        smr = to_float(jget(j, "macro.overview.SMR"))
+        bop = jget(j, "macro.overview.Blow_Off_Phase", None)
+        if smr is not None:
+            reasons.append(f"macro.overview.SMR={smr}")
+        if bop is not None:
+            reasons.append(f"macro.overview.Blow_Off_Phase={bop}")
 
-    def _evi(self, jpath: str, value: Any) -> str:
-        return f"{jpath}={value}"
+        if (smr is not None and smr >= self.SMR_OVERHEAT_2) or (bop is True):
+            return "OVERHEAT", reasons
+        if smr is not None and smr >= self.SMR_OVERHEAT_1:
+            return "OVERHEAT", reasons
+        if smr is not None and smr < 0:
+            return "DEFENSIVE", reasons
+        return "NORMAL", reasons
 
-    def _contains(self, s: Any, token: str) -> bool:
-        if s is None:
-            return False
-        return token.upper() in str(s).upper()
+    # -------------------------
+    # L3 trigger gate
+    # -------------------------
+    def l3_triggered(self, j: Json, market_state: Optional[str] = None) -> Tuple[bool, List[str]]:
+        reasons: List[str] = []
+        smr = to_float(jget(j, "macro.overview.SMR"))
+        if smr is not None and smr < 0:
+            reasons.append(f"macro.overview.SMR={smr} -> SMR<0")
+        if market_state == "DEFENSIVE":
+            reasons.append("MARKET_STATE=DEFENSIVE")
 
-    # =========================================================
-    # L1: Data Integrity Arbiter
-    # =========================================================
-    def _l1_audit(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        cons = jget(j, "portfolio.performance.consecutive_losses", None)
+        dd = to_float(jget(j, "portfolio.performance.drawdown_pct", None))
+        if cons is not None:
+            try:
+                if int(cons) >= 3:
+                    reasons.append(f"portfolio.performance.consecutive_losses={cons} >= 3")
+            except Exception:
+                pass
+        if dd is not None and dd >= 0.08:
+            reasons.append(f"portfolio.performance.drawdown_pct={dd} >= 0.08")
+
+        return (len(reasons) > 0, reasons)
+
+    # -------------------------
+    # L1 audit rules
+    # -------------------------
+    def run_l1(self, j: Json) -> Json:
         fatal: List[str] = []
         warn: List[str] = []
 
-        meta = payload.get("meta", {}) or {}
-        overview = self._get(payload, ["macro", "overview"]) or {}
-        market_amount = self._get(payload, ["macro", "market_amount"]) or {}
-        integrity = self._get(payload, ["macro", "integrity"]) or {}
-        stocks = payload.get("stocks", []) or []
+        # 3.1 fatal conditions
+        twii = jget(j, "macro.overview.twii_close", None)
+        if twii is None:
+            fatal.append('macro.overview.twii_close is null/missing -> FAIL (path=$.macro.overview.twii_close)')
 
-        # 3.1 Fatal conditions
+        if jget(j, "macro.integrity.kill") is True:
+            fatal.append('macro.integrity.kill=true -> FAIL (path=$.macro.integrity.kill=true)')
 
-        # (1) twii_close null/missing
-        twii_close = overview.get("twii_close", None)
-        if twii_close is None:
-            fatal.append("FATAL: twii_close missing/null -> FAIL")
-            fatal.append("EVIDENCE: " + self._evi("$.macro.overview.twii_close", twii_close))
+        conf = jget(j, "meta.confidence_level")
+        ms = jget(j, "meta.market_status")
+        if conf == "LOW" and ms == "NORMAL":
+            fatal.append('meta.confidence_level="LOW" but meta.market_status="NORMAL" -> FAIL (path=$.meta.confidence_level, $.meta.market_status)')
 
-        # (2) integrity.kill=true
-        kill = integrity.get("kill", False)
-        if kill is True:
-            fatal.append("FATAL: integrity.kill=true -> FAIL")
-            fatal.append("EVIDENCE: " + self._evi("$.macro.integrity.kill", kill))
+        amt_raw = to_float(jget(j, "macro.market_amount.amount_total_raw"))
+        amt_blend = to_float(jget(j, "macro.market_amount.amount_total_blended"))
+        if amt_raw is not None and amt_blend is not None and amt_blend < amt_raw:
+            fatal.append(f"macro.market_amount.amount_total_blended < amount_total_raw -> FAIL (path=$.macro.market_amount.amount_total_blended={amt_blend}, $.macro.market_amount.amount_total_raw={amt_raw})")
 
-        # (3) NO_UPDATE_TODAY but Inst_Net_3d present
-        for i, s in enumerate(stocks):
-            inst = (s or {}).get("Institutional", {}) or {}
-            st = inst.get("Inst_Status", None)
-            net3d = inst.get("Inst_Net_3d", None)
-            if st == "NO_UPDATE_TODAY" and net3d is not None:
-                fatal.append("FATAL: NO_UPDATE_TODAY but Inst_Net_3d present -> ZOMBIE_DATA")
-                fatal.append("EVIDENCE: " + self._evi(f"$.stocks[{i}].Institutional.Inst_Status", st))
-                fatal.append("EVIDENCE: " + self._evi(f"$.stocks[{i}].Institutional.Inst_Net_3d", net3d))
-                break
+        if jget(j, "meta.is_using_previous_day") is True and not exists(j, "meta.effective_trade_date"):
+            fatal.append("meta.is_using_previous_day=true but missing meta.effective_trade_date -> FAIL (path=$.meta.is_using_previous_day, $.meta.effective_trade_date)")
 
-        # (4) confidence_level=LOW but market_status=NORMAL
-        conf_level = meta.get("confidence_level", None)
-        market_status = meta.get("market_status", None)
-        if conf_level == "LOW" and market_status == "NORMAL":
-            fatal.append("FATAL: confidence_level=LOW but market_status=NORMAL -> INCONSISTENT")
-            fatal.append("EVIDENCE: " + self._evi("$.meta.confidence_level", conf_level))
-            fatal.append("EVIDENCE: " + self._evi("$.meta.market_status", market_status))
+        # Institutional stale contradiction
+        stocks = jget(j, "stocks", [])
+        if isinstance(stocks, list):
+            for i, s in enumerate(stocks):
+                st = jget(j, f"stocks[{i}].Institutional.Inst_Status")
+                net3 = jget(j, f"stocks[{i}].Institutional.Inst_Net_3d", None)
+                if st == "NO_UPDATE_TODAY" and net3 is not None:
+                    fatal.append(f'stocks[{i}].Institutional.Inst_Status="NO_UPDATE_TODAY" but Inst_Net_3d has value -> FAIL (path=$.stocks[{i}].Institutional.Inst_Status, $.stocks[{i}].Institutional.Inst_Net_3d={net3})')
 
-        # (5) 2330.TW price < 200
-        for i, s in enumerate(stocks):
-            sym = (s or {}).get("Symbol", "")
-            price = (s or {}).get("Price", None)
-            if sym == "2330.TW" and price is not None:
-                try:
-                    if float(price) < 200:
-                        fatal.append("FATAL: 2330.TW price < 200 -> CROSS_SCALE_MISMATCH")
-                        fatal.append("EVIDENCE: " + self._evi(f"$.stocks[{i}].Symbol", sym))
-                        fatal.append("EVIDENCE: " + self._evi(f"$.stocks[{i}].Price", price))
-                        break
-                except Exception:
-                    fatal.append("FATAL: 2330.TW price not numeric -> INVALID")
-                    fatal.append("EVIDENCE: " + self._evi(f"$.stocks[{i}].Price", price))
-                    break
+        # Symbol–Price cross-scale sanity (only apply to 2330.TW per your spec example)
+        if isinstance(stocks, list):
+            for i, s in enumerate(stocks):
+                sym = jget(j, f"stocks[{i}].Symbol")
+                px = to_float(jget(j, f"stocks[{i}].Price"))
+                if sym == "2330.TW" and px is not None and px < 200:
+                    fatal.append(f"Symbol–Price cross-scale mismatch -> FAIL (path=$.stocks[{i}].Symbol={sym}, $.stocks[{i}].Price={px})")
 
-        # (6) amount_total_blended < amount_total_raw
-        raw_total = market_amount.get("amount_total_raw", None)
-        blended = market_amount.get("amount_total_blended", None)
-        if raw_total is not None and blended is not None:
-            try:
-                if int(blended) < int(raw_total):
-                    fatal.append("FATAL: amount_total_blended < amount_total_raw -> BROKEN_AMOUNT")
-                    fatal.append("EVIDENCE: " + self._evi("$.macro.market_amount.amount_total_raw", raw_total))
-                    fatal.append("EVIDENCE: " + self._evi("$.macro.market_amount.amount_total_blended", blended))
-            except Exception:
-                warn.append("WARN: amount_total_raw/blended not comparable (non-int)")
-
-        # (7) is_using_previous_day=true but effective_trade_date missing
-        is_prev = meta.get("is_using_previous_day", False)
-        eff_date = meta.get("effective_trade_date", None)
-        if is_prev is True and not eff_date:
-            fatal.append("FATAL: is_using_previous_day=true but effective_trade_date missing")
-            fatal.append("EVIDENCE: " + self._evi("$.meta.is_using_previous_day", is_prev))
-            fatal.append("EVIDENCE: " + self._evi("$.meta.effective_trade_date", eff_date))
-
-        # Structural warnings
-        conf_obj = meta.get("confidence", {}) or {}
-        if market_status == "DEGRADED":
-            if conf_obj.get("price") == "HIGH" and conf_obj.get("volume") == "HIGH" and conf_obj.get("institutional") == "HIGH":
-                warn.append("WARN: market_status=DEGRADED but confidence all HIGH (possible mismatch)")
-                warn.append("EVIDENCE: " + self._evi("$.meta.market_status", market_status))
-                warn.append("EVIDENCE: " + self._evi("$.meta.confidence", conf_obj))
-
-        vix_invalid = integrity.get("vix_invalid", None)
-        if vix_invalid is True:
-            warn.append("WARN: vix_invalid=true -> macro risk metrics may be compromised")
-            warn.append("EVIDENCE: " + self._evi("$.macro.integrity.vix_invalid", vix_invalid))
-
-        if fatal:
-            return {
-                "mode": "L1_AUDIT",
-                "verdict": "FAIL",
-                "risk_level": "CRITICAL",
-                "fatal_issues": fatal,
-                "structural_warnings": warn,
-                "audit_confidence": "HIGH"
-            }
-
-        verdict = "PASS" if not warn else "PARTIAL_PASS"
-        risk = "LOW" if verdict == "PASS" else "MEDIUM"
-        audit_conf = "HIGH" if verdict == "PASS" else "MEDIUM"
+        verdict = "PASS" if len(fatal) == 0 else "FAIL"
+        risk = "LOW" if verdict == "PASS" else "CRITICAL"
 
         return {
             "mode": "L1_AUDIT",
             "verdict": verdict,
             "risk_level": risk,
-            "fatal_issues": [],
-            "structural_warnings": warn,
-            "audit_confidence": audit_conf
-        }
-
-    def _l1_fail_constitution(self, fatal: List[str], structural: List[str]) -> Dict[str, Any]:
-        return {
-            "mode": "L1_AUDIT",
-            "verdict": "FAIL",
-            "risk_level": "CRITICAL",
             "fatal_issues": fatal,
-            "structural_warnings": structural,
-            "audit_confidence": "HIGH"
+            "structural_warnings": warn,
+            "audit_confidence": "HIGH" if verdict == "PASS" else "HIGH",
         }
 
-    # =========================================================
-    # Market State + V17 War-Time (enforced in L2)
-    # =========================================================
-    def _market_state(self, payload: Dict[str, Any]) -> Tuple[str, List[str]]:
-        ov = self._get(payload, ["macro", "overview"]) or {}
-        smr = ov.get("SMR", None)
-        bop = ov.get("Blow_Off_Phase", None)
+    # -------------------------
+    # L2 execute
+    # -------------------------
+    def run_l2(self, j: Json, l1_verdict: str = "PASS") -> str:
+        # Guard: must have max_equity_allowed_pct
+        maxeq = to_float(jget(j, "macro.overview.max_equity_allowed_pct"))
+        if maxeq is None:
+            return "MODE: L2_EXECUTE\nDECISION: NO TRADE\nRISK_REASON: macro.overview.max_equity_allowed_pct missing -> NO_TRADE\nCONFIDENCE: LOW"
 
-        if smr is None:
-            return "UNKNOWN", ["RISK_REASON: $.macro.overview.SMR=None → MARKET_STATE_UNKNOWN"]
+        # V17 war-time override (禁止 OPEN/ADD)
+        war, war_reason = self.v17_triggered(j)
 
-        try:
-            smr_f = float(smr)
-        except Exception:
-            return "UNKNOWN", [f"RISK_REASON: $.macro.overview.SMR={smr} → not numeric"]
+        ms, ms_reason = self.market_state(j)
+        conf_level = jget(j, "meta.confidence_level", "MEDIUM")
 
-        if bop is True and smr_f >= 0.33:
-            return "OVERHEAT", [
-                f"RISK_REASON: {self._evi('$.macro.overview.Blow_Off_Phase', bop)} → OVERHEAT",
-                f"RISK_REASON: {self._evi('$.macro.overview.SMR', smr_f)} → OVERHEAT"
-            ]
-        if smr_f >= 0.30:
-            return "OVERHEAT", [f"RISK_REASON: {self._evi('$.macro.overview.SMR', smr_f)} → OVERHEAT"]
-        if smr_f < 0:
-            return "DEFENSIVE", [f"RISK_REASON: {self._evi('$.macro.overview.SMR', smr_f)} → DEFENSIVE"]
-        return "NORMAL", [f"RISK_REASON: {self._evi('$.macro.overview.SMR', smr_f)} → NORMAL"]
+        # LOW confidence scaling rule
+        scale = 1.0
+        scale_note = ""
+        if conf_level == "LOW":
+            scale = 0.5
+            scale_note = "LOW_CONF_SCALE: allocation x0.5 (rounded to 0.5%)"
 
-    def _v17_war_time(self, payload: Dict[str, Any]) -> Tuple[bool, List[str]]:
-        meta = payload.get("meta", {}) or {}
-        reasons: List[str] = []
-        if meta.get("war_time_override", False) is True:
-            reasons.append("RISK_REASON: " + self._evi("$.meta.war_time_override", True))
-            return True, reasons
-        if self._contains(meta.get("current_regime"), "WAR") or self._contains(meta.get("current_regime"), "CRISIS"):
-            reasons.append("RISK_REASON: " + self._evi("$.meta.current_regime", meta.get("current_regime")))
-            return True, reasons
-        return False, reasons
-
-    # =========================================================
-    # L2: Execution Arbiter (no signal invention → default NO TRADE)
-    # =========================================================
-    def _l2_execute(self, payload: Dict[str, Any], l1: Dict[str, Any]) -> str:
-        integrity = self._get(payload, ["macro", "integrity"]) or {}
-        if integrity.get("kill", False) is True:
-            return "\n".join([
-                "MODE: L2_EXECUTE",
-                "MARKET_STATE: UNKNOWN",
-                "MAX_EQUITY_ALLOWED: 0%",
-                "DECISION:",
-                "NO TRADE",
-                "",
-                "RISK_REASON: $.macro.integrity.kill=true → rule_triggered",
-                "CONFIDENCE: LOW"
-            ])
-
-        ov = self._get(payload, ["macro", "overview"]) or {}
-        max_eq = ov.get("max_equity_allowed_pct", None)
-        if max_eq is None:
-            return "\n".join([
-                "MODE: L2_EXECUTE",
-                "MARKET_STATE: UNKNOWN",
-                "MAX_EQUITY_ALLOWED: N/A",
-                "DECISION:",
-                "NO TRADE",
-                "",
-                "RISK_REASON: $.macro.overview.max_equity_allowed_pct missing → NO TRADE",
-                "CONFIDENCE: LOW"
-            ])
-
-        try:
-            max_eq_f = float(max_eq)
-        except Exception:
-            max_eq_f = 0.0
-
-        market_state, ms_reasons = self._market_state(payload)
-
-        # V17 War-Time override
-        war, war_reasons = self._v17_war_time(payload)
+        # War-time clamp
         if war:
-            cap = min(max_eq_f, 0.05)
-            lines = [
-                "MODE: L2_EXECUTE",
-                f"MARKET_STATE: {market_state}",
-                f"MAX_EQUITY_ALLOWED: {cap*100:.1f}%",
-                "DECISION:",
-                "HOLD: []",
-                "REDUCE: []",
-                "CLOSE: []",
-                "NO TRADE",
-                "",
-            ]
-            lines.extend(war_reasons)
-            lines.extend(ms_reasons)
+            maxeq = min(maxeq, 0.05)
+
+        lines: List[str] = []
+        lines.append("MODE: L2_EXECUTE")
+        lines.append(f"MARKET_STATE: {ms}")
+        lines.append(f"MAX_EQUITY_ALLOWED: {maxeq*100:.1f}%")
+        if scale_note:
+            lines.append(scale_note)
+
+        # Decision policy (minimal, JSON-only, conservative)
+        if war:
+            lines.append("DECISION:")
+            lines.append("NO TRADE")
+            lines.append("RISK_REASON:" + " | ".join([f"{r} -> V17_WAR_TIME" for r in war_reason]))
             lines.append("CONFIDENCE: LOW")
             return "\n".join(lines)
 
-        meta = payload.get("meta", {}) or {}
-        conf_level = meta.get("confidence_level", None)
+        # Overheat -> default no open
+        if ms == "OVERHEAT":
+            lines.append("DECISION:")
+            lines.append("NO TRADE")
+            lines.append("RISK_REASON:" + " | ".join([f"{r} -> MARKET_OVERHEAT" for r in ms_reason]))
+            lines.append(f"CONFIDENCE: {conf_level}")
+            return "\n".join(lines)
 
-        low_conf_note = []
-        if conf_level == "LOW":
-            low_conf_note.append("RISK_REASON: $.meta.confidence_level=LOW → OPEN/ADD allocation ×0.5 (0.5% step)")
-
-        lines = [
-            "MODE: L2_EXECUTE",
-            f"MARKET_STATE: {market_state}",
-            f"MAX_EQUITY_ALLOWED: {max_eq_f*100:.1f}%",
-            "DECISION:",
-            "NO TRADE",
-            "",
-        ]
-        lines.extend(ms_reasons)
-        lines.extend(low_conf_note)
-        lines.append("CONFIDENCE: " + ("LOW" if conf_level == "LOW" else "MEDIUM"))
+        lines.append("DECISION:")
+        lines.append("NO TRADE")
+        lines.append("RISK_REASON: JSON_ONLY_POLICY -> NO_MODEL_SIGNAL")
+        lines.append(f"CONFIDENCE: {conf_level}")
         return "\n".join(lines)
 
-    # =========================================================
-    # L3: Stress Arbiter
-    # =========================================================
-    def _l3_stress(self, payload: Dict[str, Any], l1: Dict[str, Any]) -> Any:
-        ov = self._get(payload, ["macro", "overview"]) or {}
-        smr = ov.get("SMR", None)
-        market_state, ms_reasons = self._market_state(payload)
+    # -------------------------
+    # L3 stress
+    # -------------------------
+    def run_l3(self, j: Json) -> str:
+        ms, _ = self.market_state(j)
+        trig, reasons = self.l3_triggered(j, market_state=ms)
+        if not trig:
+            return "MODE: L3_STRESS\nSTRESS_TEST: NOT_ACTIVATED\nFINAL_VERDICT: SYSTEM_SURVIVES"
 
-        activated = False
-        triggers: List[str] = []
+        # Minimal stress model (rule-based)
+        dd = to_float(jget(j, "portfolio.performance.drawdown_pct"))
+        cons = jget(j, "portfolio.performance.consecutive_losses")
 
-        if smr is not None:
+        breach = False
+        if dd is not None and dd >= 0.15:
+            breach = True
+
+        def scen(x: float) -> str:
+            if dd is None:
+                return "WARNING"
+            if dd + x >= 0.15:
+                return "FAILURE"
+            if dd + x >= 0.10:
+                return "WARNING"
+            return "SAFE"
+
+        surv = 80
+        if ms == "DEFENSIVE":
+            surv -= 15
+        if dd is not None:
+            surv -= int(dd * 100)
+        if cons is not None:
             try:
-                if float(smr) < 0:
-                    activated = True
-                    triggers.append("TRIGGER: $.macro.overview.SMR<0")
+                surv -= int(cons) * 3
             except Exception:
                 pass
+        surv = max(0, min(100, surv))
 
-        if market_state == "DEFENSIVE":
-            activated = True
-            triggers.append("TRIGGER: MARKET_STATE=DEFENSIVE")
+        sys_status = "STABLE"
+        final = "SYSTEM_SURVIVES"
+        if breach or surv < 40:
+            sys_status = "CRITICAL"
+            final = "SYSTEM_FAILURE"
+        elif surv < 60:
+            sys_status = "FRAGILE"
+            final = "SYSTEM_AT_RISK"
 
-        perf = self._get(payload, ["portfolio", "performance"])
-        if isinstance(perf, dict):
-            cl = perf.get("consecutive_losses", None)
-            dd = perf.get("drawdown_pct", None)
-            if cl is not None and int(cl) >= 3:
-                activated = True
-                triggers.append("TRIGGER: $.portfolio.performance.consecutive_losses>=3")
-            if dd is not None and float(dd) >= 0.08:
-                activated = True
-                triggers.append("TRIGGER: $.portfolio.performance.drawdown_pct>=0.08")
-
-        if not activated:
-            return self._l1_fail_constitution(
-                fatal=[
-                    "VIOLATION: RUN:L3 but no activation trigger satisfied",
-                    "EVIDENCE: " + self._evi("$.macro.overview.SMR", smr),
-                    "EVIDENCE: " + self._evi("MARKET_STATE", market_state)
-                ],
-                structural=ms_reasons
-            )
-
-        max_eq = ov.get("max_equity_allowed_pct", 0.0)
-        try:
-            max_eq_f = float(max_eq)
-        except Exception:
-            max_eq_f = 0.0
-
-        structural_breach = (l1.get("verdict") != "PASS")
-
-        def grade(loss: float) -> str:
-            if max_eq_f <= 0.05:
-                return "SAFE" if loss <= 0.10 else "WARNING"
-            if max_eq_f <= 0.20:
-                return "WARNING" if loss <= 0.10 else "FAILURE"
-            return "FAILURE"
-
-        s5 = grade(0.05)
-        s10 = grade(0.10)
-        s15 = grade(0.15)
-
-        base = 80 if max_eq_f <= 0.05 else (55 if max_eq_f <= 0.20 else 30)
-        if structural_breach:
-            base -= 20
-        base = max(0, min(100, base))
-
-        psycho = "LOW" if base >= 70 else ("MEDIUM" if base >= 45 else "HIGH")
-        status = "STABLE" if base >= 70 else ("FRAGILE" if base >= 45 else "CRITICAL")
-        final = "SYSTEM_SURVIVES" if base >= 70 else ("SYSTEM_AT_RISK" if base >= 45 else "SYSTEM_FAILURE")
-
-        lines = [
-            "MODE: L3_STRESS",
-            "STRESS_TEST: ACTIVATED",
-            f"STRUCTURAL_BREACH: {'TRUE' if structural_breach else 'FALSE'}",
-            f"5%_SCENARIO: {s5}",
-            f"10%_SCENARIO: {s10}",
-            f"15%_SCENARIO: {s15}",
-            f"PSYCHOLOGICAL_RISK: {psycho}",
-            f"SURVIVAL_SCORE: {base}",
-            f"SYSTEM_STATUS: {status}",
-            f"FINAL_VERDICT: {final}",
-            "",
-        ]
-        lines.extend(triggers)
-        lines.extend(ms_reasons)
+        lines: List[str] = []
+        lines.append("MODE: L3_STRESS")
+        lines.append("STRESS_TEST: ACTIVATED")
+        lines.append(f"STRUCTURAL_BREACH: {'TRUE' if breach else 'FALSE'}")
+        lines.append(f"5%_SCENARIO: {scen(0.05)}")
+        lines.append(f"10%_SCENARIO: {scen(0.10)}")
+        lines.append(f"15%_SCENARIO: {scen(0.15)}")
+        lines.append("PSYCHOLOGICAL_RISK: " + ("HIGH" if surv < 50 else "MEDIUM" if surv < 70 else "LOW"))
+        lines.append(f"SURVIVAL_SCORE: {surv}")
+        lines.append(f"SYSTEM_STATUS: {sys_status}")
+        lines.append(f"FINAL_VERDICT: {final}")
+        lines.append("RISK_REASON: " + " | ".join([f"{r} -> L3_TRIGGER" for r in reasons]))
         return "\n".join(lines)
+
+    # ------------------
+    # Top-level run (V19 enforcement)
+    # -------------------------
+    def run(self, j: Json, run_mode: str = "L1") -> Union[Json, str]:
+        run_mode = (run_mode or "L1").strip().upper()
+        if run_mode not in ("L1", "L2", "L3"):
+            run_mode = "L1"
+
+        # always L1 first（不可跳過）
+        l1 = self.run_l1(j)
+        l1_verdict = l1.get("verdict")
+
+        if run_mode == "L1":
+            return l1
+
+        # V19：防跳關（但保留 L1 原始 fatal_issues，避免只看到「不能跑 L2」卻看不到根因）
+        if run_mode == "L2" and l1_verdict != "PASS":
+            fatal = list(l1.get("fatal_issues", []))
+            fatal.insert(0, f"VIOLATION: RUN:L2 requested but L1.verdict != PASS")
+            fatal.insert(1, f'EVIDENCE: $.mode="L1_AUDIT", $.verdict="{l1_verdict}"')
+            l1["fatal_issues"] = fatal
+            l1["verdict"] = "FAIL"
+            l1["risk_level"] = "CRITICAL"
+            return l1
+
+        if run_mode == "L2":
+            return self.run_l2(j, l1_verdict=l1_verdict)
+
+        if run_mode == "L3":
+            ms, _ = self.market_state(j)
+            trig, _ = self.l3_triggered(j, market_state=ms)
+            if not trig:
+                fatal = list(l1.get("fatal_issues", []))
+                fatal.insert(0, "VIOLATION: RUN:L3 requested but L3 not triggered")
+                fatal.insert(1, f"EVIDENCE: MARKET_STATE={ms}")
+                l1["fatal_issues"] = fatal
+                l1["verdict"] = "FAIL"
+                l1["risk_level"] = "CRITICAL"
+                l1.setdefault("structural_warnings", []).append(f"macro.overview.SMR={jget(j,'macro.overview.SMR')} -> L3_NOT_TRIGGERED")
+                l1.setdefault("structural_warnings", []).append(f"portfolio.performance.drawdown_pct={jget(j,'portfolio.performance.drawdown_pct')} -> L3_NOT_TRIGGERED")
+                l1.setdefault("structural_warnings", []).append(f"portfolio.performance.consecutive_losses={jget(j,'portfolio.performance.consecutive_losses')} -> L3_NOT_TRIGGERED")
+                return l1
+            return self.run_l3(j)
+
+        return l1
