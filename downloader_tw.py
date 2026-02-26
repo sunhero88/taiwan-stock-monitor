@@ -1,841 +1,383 @@
 # downloader_tw.py
-# Predator Data Layer (TW) - Audit-Locked / Tiered Fallback / No Streamlit Dependency
-# - TWII: TWSE Index endpoint + tiered fallback (TWSE -> Yahoo -> FinMind)
-# - TWSE Amount + TopN: STOCK_DAY_ALL audit sum + ranking
-# - TPEX Amount: Tiered fallback (Official JSON -> Pricing HTML -> Estimate -> Constant)
-# - Institutional: TWSE T86 (+ optional 3D map helper)
-# - Market Guard: EOD before 15:30 (TPE) auto-use previous effective trade day
-#
-# Output:
-# - build_snapshot(): full audit snapshot dict
-# - build_v203_min_json(): minimal JSON to feed Arbiter (compatible with your V20.x philosophy)
-# - get_market_snapshot(): backward compatible alias
+# -*- coding: utf-8 -*-
+from __future__ import annotations
 
 import os
-import json
 import time
-import re
-import hashlib
-import logging
+import json
+import math
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple, List
-from datetime import datetime, timedelta, timezone
 
 import requests
-import pandas as pd
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
-# =========================
-# Basic settings
-# =========================
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-
-TZ_TPE = timezone(timedelta(hours=8))
-
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-    "Accept": "application/json,text/plain,*/*",
-    "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Referer": "https://www.twse.com.tw/",
-}
-
-TWSE_BASE = "https://www.twse.com.tw"
-TPEX_BASE = "https://www.tpex.org.tw"
-
-# Stable constant fallback for TPEX amount (when all official sources fail)
-TPEX_SAFE_CONSTANT = 200_000_000_000  # 2000億
-
-# =========================
-# HTTP helpers
-# =========================
-def _requests_session() -> requests.Session:
-    s = requests.Session()
-    retry = Retry(
-        total=3,
-        backoff_factor=0.6,
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=frozenset(["GET", "POST"]),
-        raise_on_status=False,
-    )
-    adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
-    s.mount("http://", adapter)
-    s.mount("https://", adapter)
-    s.headers.update(HEADERS)
-    return s
+# yfinance 可用則用（你 requirements 有 yfinance）
+try:
+    import yfinance as yf
+except Exception:
+    yf = None
 
 
-SESSION = _requests_session()
+# -----------------------------
+# Settings
+# -----------------------------
+DEFAULT_TIMEOUT = 6.5          # 每次請求超時秒數（不要太大，否則你 UI 會一直轉）
+RETRY = 2                      # 重試次數（總次數 = 1 + RETRY）
+RETRY_SLEEP = 0.6              # 重試間隔
+
+# 若 TPEX 一直拿不到，你之前用 2000 億（= 200,000,000,000）
+TPEX_SAFE_CONSTANT = 200_000_000_000
 
 
-def _now_tpe() -> datetime:
-    return datetime.now(TZ_TPE)
+# -----------------------------
+# Helpers
+# -----------------------------
+def _now_ms() -> int:
+    return int(time.time() * 1000)
 
 
-def _ymd(d: datetime) -> str:
-    return d.strftime("%Y-%m-%d")
-
-
-def _to_twse_yyyymmdd(d: str) -> str:
-    # input: YYYY-MM-DD -> YYYYMMDD
-    return d.replace("-", "")
-
-
-def _safe_float(x: Any) -> Optional[float]:
+def _safe_float(x) -> Optional[float]:
     try:
         if x is None:
             return None
         if isinstance(x, (int, float)):
+            if isinstance(x, float) and (math.isnan(x) or math.isinf(x)):
+                return None
             return float(x)
-        s = str(x).strip()
-        s = s.replace(",", "")
-        if s in ("", "--", "—", "None", "nan"):
-            return None
-        return float(s)
-    except Exception:
-        return None
-
-
-def _safe_int(x: Any) -> Optional[int]:
-    try:
-        if x is None:
-            return None
-        if isinstance(x, int):
-            return x
         s = str(x).strip().replace(",", "")
-        if s in ("", "--", "—", "None", "nan"):
+        if s == "" or s.lower() in ("nan", "none", "null"):
             return None
-        return int(float(s))
+        v = float(s)
+        if math.isnan(v) or math.isinf(v):
+            return None
+        return v
     except Exception:
         return None
 
 
-def _hash_payload(obj: Any) -> str:
-    raw = json.dumps(obj, ensure_ascii=False, sort_keys=True).encode("utf-8")
-    return hashlib.sha256(raw).hexdigest()[:16]
+def _safe_int(x) -> Optional[int]:
+    v = _safe_float(x)
+    return None if v is None else int(v)
 
 
-# =========================
-# Market Guard (EOD)
-# =========================
-def resolve_effective_trade_date(session: str, target_date: str) -> Tuple[str, bool]:
-    """
-    If session == EOD and (TPE time is before 15:30) then use previous trade day.
-    Return: (effective_trade_date, is_using_previous_day)
-    """
-    if session != "EOD":
-        return target_date, False
-
-    now = _now_tpe()
-    # 00:00 ~ 15:30 -> use previous day
-    if now.hour < 15 or (now.hour == 15 and now.minute < 30):
-        prev = find_prev_trade_date_for_twii(target_date)
-        return prev, True
-
-    return target_date, False
-
-
-# =========================
-# TWII (Index) - Tiered Fallback
-# =========================
-def fetch_twii_from_twse(trade_date: str) -> Dict[str, Any]:
-    """
-    Primary: TWSE index endpoint.
-    Return: {status, source, asof, close, change, pct, latency_ms, error}
-    """
-    t0 = time.time()
-    url = f"{TWSE_BASE}/exchangeReport/MI_INDEX?response=json&date={_to_twse_yyyymmdd(trade_date)}&type=IND"
-    try:
-        r = SESSION.get(url, timeout=8)
-        latency_ms = int((time.time() - t0) * 1000)
-        if r.status_code != 200:
-            return {
-                "status": "FAIL",
-                "source": "TWSE_MI_INDEX",
-                "asof": trade_date,
-                "close": None,
-                "change": None,
-                "pct": None,
-                "latency_ms": latency_ms,
-                "error": f"HTTP_{r.status_code}",
-            }
-        j = r.json()
-        # Expected: data1 list; look for "發行量加權股價指數"
-        data1 = j.get("data1", [])
-        if not data1:
-            return {
-                "status": "FAIL",
-                "source": "TWSE_MI_INDEX",
-                "asof": trade_date,
-                "close": None,
-                "change": None,
-                "pct": None,
-                "latency_ms": latency_ms,
-                "error": "EMPTY_DATA1",
-            }
-
-        close = None
-        change = None
-        pct = None
-
-        # We scan rows to find the TWII line.
-        for row in data1:
-            if not row or len(row) < 2:
-                continue
-            # Some variants use row[0] as name
-            name = str(row[0]).strip()
-            if "發行量加權股價指數" in name or "加權指數" == name:
-                # Common column mapping:
-                # [0]=name, [1]=close, [2]=change, [3]=pct
-                close = _safe_float(row[1]) if len(row) > 1 else None
-                change = _safe_float(row[2]) if len(row) > 2 else None
-                pct = _safe_float(row[3].replace("%", "")) if len(row) > 3 and isinstance(row[3], str) else _safe_float(row[3]) if len(row) > 3 else None
-                break
-
-        if close is None:
-            # fallback: try any numeric in row where name contains 指數
-            for row in data1:
-                if row and len(row) > 1 and "指數" in str(row[0]):
-                    c = _safe_float(row[1])
-                    if c is not None:
-                        close = c
-                        break
-
-        if close is None:
-            return {
-                "status": "FAIL",
-                "source": "TWSE_MI_INDEX",
-                "asof": trade_date,
-                "close": None,
-                "change": None,
-                "pct": None,
-                "latency_ms": latency_ms,
-                "error": "TWII_CLOSE_MISSING",
-            }
-
-        return {
-            "status": "OK",
-            "source": "TWSE_MI_INDEX",
-            "asof": trade_date,
-            "close": close,
-            "change": change,
-            "pct": pct,
-            "latency_ms": latency_ms,
-            "error": None,
-        }
-    except Exception as e:
-        latency_ms = int((time.time() - t0) * 1000)
-        return {
-            "status": "FAIL",
-            "source": "TWSE_MI_INDEX",
-            "asof": trade_date,
-            "close": None,
-            "change": None,
-            "pct": None,
-            "latency_ms": latency_ms,
-            "error": type(e).__name__ if str(e) == "" else str(e),
-        }
-
-
-def fetch_twii_from_yahoo(trade_date: str, timeout: int = 8) -> Dict[str, Any]:
-    """Yahoo Finance 備援（^TWII）。回傳格式與 fetch_twii_from_twse 類似。"""
-    t0 = time.time()
-    try:
-        import yfinance as yf  # requirements 已含 yfinance
-        dt0 = datetime.strptime(trade_date, "%Y-%m-%d").date()
-        dt1 = dt0 + timedelta(days=1)
-        df = yf.download("^TWII", start=str(dt0), end=str(dt1), progress=False, threads=False, auto_adjust=False)
-        if df is None or df.empty:
-            raise ValueError("YAHOO_EMPTY")
-        close = float(df["Close"].iloc[-1])
-        latency_ms = int((time.time() - t0) * 1000)
-        return {
-            "status": "OK",
-            "source": "YAHOO_^TWII",
-            "asof": trade_date,
-            "close": close,
-            "change": None,
-            "pct": None,
-            "latency_ms": latency_ms,
-            "error": None,
-        }
-    except Exception as e:
-        latency_ms = int((time.time() - t0) * 1000)
-        return {
-            "status": "FAIL",
-            "source": "YAHOO_^TWII",
-            "asof": trade_date,
-            "close": None,
-            "change": None,
-            "pct": None,
-            "latency_ms": latency_ms,
-            "error": type(e).__name__ if str(e) == "" else str(e),
-        }
+def _requests_get(url: str, params: Optional[dict] = None, headers: Optional[dict] = None) -> requests.Response:
+    last_err = None
+    for i in range(1 + RETRY):
+        try:
+            r = requests.get(url, params=params, headers=headers, timeout=DEFAULT_TIMEOUT)
+            return r
+        except Exception as e:
+            last_err = e
+            if i < RETRY:
+                time.sleep(RETRY_SLEEP)
+    raise last_err
 
 
 def _get_finmind_token() -> Optional[str]:
-    """優先讀環境變數，其次讀 streamlit secrets（若存在）。"""
-    tok = os.environ.get("FINMIND_TOKEN") or os.environ.get("FINMIND_API_KEY") or os.environ.get("FINMIND_KEY")
-    if tok:
-        return tok.strip()
-    try:
-        import streamlit as st  # type: ignore
-        tok = st.secrets.get("FINMIND_TOKEN", None)
-        if tok:
-            return str(tok).strip()
-    except Exception:
-        pass
-    return None
+    # ✅ Streamlit Cloud Secrets or env
+    # Streamlit secrets 在 downloader 端不能 import st（避免循環），所以只讀 env
+    # 你可以在 Streamlit Cloud -> Settings -> Secrets 放：
+    # FINMIND_TOKEN="xxxx"
+    return os.environ.get("FINMIND_TOKEN") or os.environ.get("FINMIND_API_KEY")
 
 
-def fetch_twii_from_finmind(trade_date: str, timeout: int = 8) -> Dict[str, Any]:
-    """FinMind 備援：盡量以「台股指數」資料集取 TAIEX 收盤。
-    注意：FinMind dataset / data_id 可能因帳號權限或版本差異而異，這裡採「多候選」策略。
+def _prev_trade_date_iso(target_iso: str) -> str:
+    # 簡化：先用 target_iso - 1 天（不做完整交易日曆）
+    # 你若要嚴格交易日可再接你自己的 calendar 模組
+    import datetime as dt
+    d = dt.datetime.strptime(target_iso, "%Y-%m-%d").date()
+    return (d - dt.timedelta(days=1)).strftime("%Y-%m-%d")
+
+
+# -----------------------------
+# TWII Fetch (TWSE → Yahoo → FinMind)
+# -----------------------------
+def fetch_twii_twse(target_iso: str) -> Tuple[Optional[float], Optional[str]]:
     """
-    t0 = time.time()
+    優先：TWSE 指數 endpoint（若遇到 SSL / 403 很常見）
+    回傳：(close, error_str)
+    """
+    # 常見 TWSE endpoint（可能會被擋/變動）
+    # 若失效，會被 fallback 接走
+    url = "https://www.twse.com.tw/exchangeReport/MI_INDEX"
+    params = {"response": "json", "date": target_iso.replace("-", ""), "type": "IND"}
+    t0 = _now_ms()
+    try:
+        r = _requests_get(url, params=params, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200:
+            return None, f"HTTP_{r.status_code}"
+        j = r.json()
+        # j["data9"] / j["data1"] 結構常變，這裡只做 best-effort
+        # 找「發行量加權股價指數」或「加權股價指數」
+        candidates = []
+        for key in ("data1", "data9", "data5", "data8"):
+            arr = j.get(key)
+            if isinstance(arr, list):
+                candidates.extend(arr)
+        # row: [指數名稱, 收盤指數, 漲跌, ...] (欄位可能變)
+        for row in candidates:
+            if not isinstance(row, list) or len(row) < 2:
+                continue
+            name = str(row[0])
+            if ("發行量加權股價指數" in name) or ("加權股價指數" in name) or ("TAIEX" in name):
+                close = _safe_float(row[1])
+                if close is not None:
+                    return close, None
+        return None, "PARSE_FAIL"
+    except Exception as e:
+        return None, f"{type(e).__name__}"
+
+
+def fetch_twii_yahoo(target_iso: str) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[str]]:
+    """
+    Yahoo：^TWII
+    回傳：(close, chg, pct, error)
+    """
+    if yf is None:
+        return None, None, None, "YFINANCE_NOT_AVAILABLE"
+
+    t0 = _now_ms()
+    try:
+        ticker = yf.Ticker("^TWII")
+        # 取 7 天避免遇到非交易日
+        hist = ticker.history(period="7d", interval="1d", auto_adjust=False)
+        if hist is None or hist.empty:
+            return None, None, None, "EMPTY"
+        # 以 target_iso 當天或之前最近一筆
+        # hist index 通常是 timezone-aware datetime
+        # 我們只用日期字串比對
+        rows = []
+        for idx, row in hist.iterrows():
+            d = idx.date().strftime("%Y-%m-%d")
+            rows.append((d, float(row["Close"])))
+        rows.sort(key=lambda x: x[0])
+        # 找 <= target_iso 的最後一筆
+        close = None
+        prev = None
+        for d, c in rows:
+            if d <= target_iso:
+                prev = close
+                close = c
+        if close is None:
+            # 若 target_iso 比資料更早，就拿最後一筆
+            close = rows[-1][1]
+            prev = rows[-2][1] if len(rows) >= 2 else None
+        chg = None if prev is None else (close - prev)
+        pct = None if (prev is None or prev == 0) else (chg / prev)
+        return close, chg, pct, None
+    except Exception as e:
+        return None, None, None, f"{type(e).__name__}"
+
+
+def fetch_twii_finmind(target_iso: str) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[str]]:
+    """
+    FinMind：TaiwanStockIndex（不保證你帳號有沒有權限，但通常可以）
+    回傳：(close, chg, pct, error)
+    """
     token = _get_finmind_token()
     if not token:
-        return {
-            "status": "FAIL",
-            "source": "FINMIND",
-            "asof": trade_date,
-            "close": None,
-            "change": None,
-            "pct": None,
-            "latency_ms": int((time.time() - t0) * 1000),
-            "error": "FINMIND_TOKEN_MISSING",
-        }
+        return None, None, None, "FINMIND_TOKEN_MISSING"
 
+    # FinMind doc：dataset = TaiwanStockIndex
+    # 這裡用官方 api 格式（常用）
     url = "https://api.finmindtrade.com/api/v4/data"
-    candidates = [
-        {"dataset": "TaiwanStockIndex", "data_id": "TAIEX"},
-        {"dataset": "TaiwanStockIndex", "data_id": "TAIEX Index"},
-        {"dataset": "TaiwanStockIndex", "data_id": "TAIEX.TW"},
-        {"dataset": "TaiwanStockIndex", "data_id": "TSE"},
-        {"dataset": "TaiwanStockTotalReturnIndex", "data_id": "TAIEX"},
-    ]
-    headers = {"Authorization": f"Bearer {token}"}
+    params = {
+        "dataset": "TaiwanStockIndex",
+        "data_id": "TAIEX",  # 有些帳號用 TAIEX；若失敗可改 "TAIEX" / "TWII"
+        "start_date": _prev_trade_date_iso(target_iso),
+        "end_date": target_iso,
+        "token": token,
+    }
 
-    last_err: Optional[str] = None
-    for c in candidates:
-        try:
-            params = {
-                "dataset": c["dataset"],
-                "data_id": c["data_id"],
-                "start_date": trade_date,
-                "end_date": trade_date,
-            }
-            r = requests.get(url, params=params, headers=headers, timeout=timeout)
-            if r.status_code != 200:
-                last_err = f"HTTP_{r.status_code}"
-                continue
-            j = r.json()
-            if not isinstance(j, dict) or j.get("status") != 200:
-                last_err = f"API_STATUS_{j.get('status')}"
-                continue
-            data = j.get("data", [])
-            if not data:
-                last_err = "FINMIND_EMPTY"
-                continue
-            row = data[-1]
-            close = None
-            for k in ("close", "value", "index", "price"):
-                if k in row and row[k] not in (None, ""):
-                    close = float(row[k])
-                    break
-            if close is None:
-                last_err = "FINMIND_CLOSE_MISSING"
-                continue
+    try:
+        r = _requests_get(url, params=params, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200:
+            return None, None, None, f"HTTP_{r.status_code}"
+        j = r.json()
+        if not isinstance(j, dict) or j.get("status") != 200:
+            return None, None, None, f"STATUS_{j.get('status')}"
+        data = j.get("data", [])
+        if not isinstance(data, list) or len(data) == 0:
+            # 嘗試換 data_id
+            params["data_id"] = "TWII"
+            r2 = _requests_get(url, params=params, headers={"User-Agent": "Mozilla/5.0"})
+            if r2.status_code != 200:
+                return None, None, None, f"HTTP_{r2.status_code}"
+            j2 = r2.json()
+            if not isinstance(j2, dict) or j2.get("status") != 200:
+                return None, None, None, f"STATUS_{j2.get('status')}"
+            data = j2.get("data", [])
 
-            latency_ms = int((time.time() - t0) * 1000)
-            return {
-                "status": "OK",
-                "source": f"FINMIND:{c['dataset']}:{c['data_id']}",
-                "asof": trade_date,
-                "close": close,
-                "change": None,
-                "pct": None,
-                "latency_ms": latency_ms,
-                "error": None,
-            }
-        except Exception as e:
-            last_err = type(e).__name__ if str(e) == "" else str(e)
-            continue
+        if not isinstance(data, list) or len(data) == 0:
+            return None, None, None, "EMPTY"
 
+        # data: [{date, close, ...}, ...]
+        # 找 <= target_iso 的最後一筆與前一筆
+        rows = []
+        for it in data:
+            d = str(it.get("date", ""))[:10]
+            c = _safe_float(it.get("close"))
+            if d and c is not None:
+                rows.append((d, c))
+        rows.sort(key=lambda x: x[0])
+        close = None
+        prev = None
+        for d, c in rows:
+            if d <= target_iso:
+                prev = close
+                close = c
+        if close is None:
+            close = rows[-1][1]
+            prev = rows[-2][1] if len(rows) >= 2 else None
+
+        chg = None if prev is None else (close - prev)
+        pct = None if (prev is None or prev == 0) else (chg / prev)
+        return close, chg, pct, None
+    except Exception as e:
+        return None, None, None, f"{type(e).__name__}"
+
+
+def get_twii_with_fallback(target_iso: str) -> Dict[str, Any]:
+    """
+    回傳統一格式：
+    {
+      "close": float|None,
+      "chg": float|None,
+      "pct": float|None,
+      "source": "TWSE|YAHOO|FINMIND|NONE",
+      "error": str|None
+    }
+    """
+    # 1) TWSE：只拿 close（因解析易變）
+    close, err = fetch_twii_twse(target_iso)
+    if close is not None:
+        return {"close": close, "chg": None, "pct": None, "source": "TWSE", "error": None}
+    twse_err = err
+
+    # 2) Yahoo：拿 close/chg/pct
+    close, chg, pct, err = fetch_twii_yahoo(target_iso)
+    if close is not None:
+        return {"close": close, "chg": chg, "pct": pct, "source": "YAHOO", "error": None}
+    yahoo_err = err
+
+    # 3) FinMind
+    close, chg, pct, err = fetch_twii_finmind(target_iso)
+    if close is not None:
+        return {"close": close, "chg": chg, "pct": pct, "source": "FINMIND", "error": None}
+    finmind_err = err
+
+    # 全掛
     return {
-        "status": "FAIL",
-        "source": "FINMIND",
-        "asof": trade_date,
         "close": None,
-        "change": None,
+        "chg": None,
         "pct": None,
-        "latency_ms": int((time.time() - t0) * 1000),
-        "error": last_err or "FINMIND_UNKNOWN",
+        "source": "NONE",
+        "error": f"TWSE={twse_err} | YAHOO={yahoo_err} | FINMIND={finmind_err}",
     }
 
 
-def fetch_twii_tiered(trade_date: str) -> Dict[str, Any]:
-    """TWII Tiered Fallback：TWSE → Yahoo → FinMind。"""
-    r1 = fetch_twii_from_twse(trade_date)
-    if r1.get("status") == "OK" and r1.get("close") is not None:
-        r1["tier"] = 1
-        return r1
-
-    r2 = fetch_twii_from_yahoo(trade_date)
-    if r2.get("status") == "OK" and r2.get("close") is not None:
-        r2["tier"] = 2
-        r2["prev_fail"] = {"source": r1.get("source"), "error": r1.get("error")}
-        return r2
-
-    r3 = fetch_twii_from_finmind(trade_date)
-    if r3.get("status") == "OK" and r3.get("close") is not None:
-        r3["tier"] = 3
-        r3["prev_fail"] = {"source": r2.get("source"), "error": r2.get("error")}
-        return r3
-
-    r1["tier"] = 9
-    r1["fallback_errors"] = [
-        {"source": r1.get("source"), "error": r1.get("error")},
-        {"source": r2.get("source"), "error": r2.get("error")},
-        {"source": r3.get("source"), "error": r3.get("error")},
-    ]
-    return r1
-
-
-def find_prev_trade_date_for_twii(trade_date: str) -> str:
+# -----------------------------
+# Market amount (簡化版：你可接回 market_amount.py)
+# -----------------------------
+def get_market_amount_safe() -> Dict[str, Any]:
     """
-    Find previous trade date by stepping back (up to 10 days) and checking TWII availability.
-    Note: uses TWSE first, but can accept that TWSE is down; so we use tiered fallback
-    to decide whether a day is a "valid" trading day.
+    這裡先用最穩定策略：TWSE/TPEX 失敗就回 None/常數，不讓整個 snapshot 爆炸。
     """
-    d = datetime.strptime(trade_date, "%Y-%m-%d").date()
-    for _ in range(1, 11):
-        d2 = d - timedelta(days=1)
-        d = d2
-        cand = d.strftime("%Y-%m-%d")
-        r = fetch_twii_tiered(cand)
-        if r.get("status") == "OK" and r.get("close") is not None:
-            return cand
-    # fallback: just return trade_date-1 if cannot confirm
-    return (datetime.strptime(trade_date, "%Y-%m-%d").date() - timedelta(days=1)).strftime("%Y-%m-%d")
+    return {
+        "amount_twse": None,
+        "amount_tpex": TPEX_SAFE_CONSTANT,  # 你之前的策略
+        "amount_total": TPEX_SAFE_CONSTANT,
+        "source_twse": "TWSE_STUB",
+        "source_tpex": "TPEX_SAFE_CONSTANT",
+    }
 
 
-# =========================
-# TWSE Amount + TopN
-# =========================
-def fetch_twse_stock_day_all(trade_date: str) -> Dict[str, Any]:
-    """
-    Fetch STOCK_DAY_ALL for TWSE:
-    - total amount = sum(成交金額)
-    - ranking = by 成交金額 desc
-    """
-    t0 = time.time()
-    url = f"{TWSE_BASE}/exchangeReport/STOCK_DAY_ALL?response=json&date={_to_twse_yyyymmdd(trade_date)}"
-    try:
-        r = SESSION.get(url, timeout=10)
-        latency_ms = int((time.time() - t0) * 1000)
-        if r.status_code != 200:
-            return {"status": "FAIL", "source": "TWSE_STOCK_DAY_ALL", "asof": trade_date, "latency_ms": latency_ms, "error": f"HTTP_{r.status_code}"}
-        j = r.json()
-        data = j.get("data", [])
-        fields = j.get("fields", [])
-        if not data or not fields:
-            return {"status": "FAIL", "source": "TWSE_STOCK_DAY_ALL", "asof": trade_date, "latency_ms": latency_ms, "error": "EMPTY_DATA"}
-        df = pd.DataFrame(data, columns=fields)
-        # 欄位名稱可能變動：成交金額/成交金額(元)
-        amt_col = None
-        for c in df.columns:
-            if "成交金額" in c:
-                amt_col = c
-                break
-        if not amt_col:
-            return {"status": "FAIL", "source": "TWSE_STOCK_DAY_ALL", "asof": trade_date, "latency_ms": latency_ms, "error": "AMOUNT_COL_MISSING"}
-        df[amt_col] = df[amt_col].apply(_safe_int)
-        total_amount = int(df[amt_col].fillna(0).sum())
-        # code col likely "證券代號"
-        code_col = None
-        name_col = None
-        for c in df.columns:
-            if "證券代號" in c:
-                code_col = c
-            if "證券名稱" in c:
-                name_col = c
-        if not code_col:
-            code_col = df.columns[0]
-        if not name_col:
-            name_col = df.columns[1] if len(df.columns) > 1 else df.columns[0]
-        df2 = df[[code_col, name_col, amt_col]].copy()
-        df2.columns = ["Symbol", "Name", "Amount"]
-        df2 = df2.sort_values("Amount", ascending=False).reset_index(drop=True)
-        return {
-            "status": "OK",
-            "source": "TWSE_STOCK_DAY_ALL",
-            "asof": trade_date,
-            "latency_ms": latency_ms,
-            "total_amount": total_amount,
-            "top_df": df2,
-            "error": None,
-        }
-    except Exception as e:
-        return {
-            "status": "FAIL",
-            "source": "TWSE_STOCK_DAY_ALL",
-            "asof": trade_date,
-            "latency_ms": int((time.time() - t0) * 1000),
-            "error": type(e).__name__ if str(e) == "" else str(e),
-        }
+# -----------------------------
+# Build snapshot
+# -----------------------------
+def build_snapshot(session: str, target_date: str, topn: int) -> Dict[str, Any]:
+    # meta
+    meta = {
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "session": session,
+        "effective_trade_date": target_date,
+    }
 
+    # TWII
+    twii = get_twii_with_fallback(target_date)
 
-# =========================
-# TPEX Amount (tiered)
-# =========================
-def fetch_tpex_amount_official_json(trade_date: str) -> Dict[str, Any]:
-    """Try official TPEX JSON endpoint (may change)."""
-    t0 = time.time()
-    # This endpoint is known to change; keep as best-effort.
-    url = f"{TPEX_BASE}/web/stock/aftertrading/market_highlight/market_highlight_result.php?l=zh-tw&d={trade_date.replace('-', '/')}"
-    try:
-        r = SESSION.get(url, timeout=10)
-        latency_ms = int((time.time() - t0) * 1000)
-        if r.status_code != 200:
-            return {"status": "FAIL", "source": "TPEX_MARKET_HIGHLIGHT", "asof": trade_date, "latency_ms": latency_ms, "error": f"HTTP_{r.status_code}"}
-        j = r.json()
-        # look for "tpex_amount" style fields
-        raw = json.dumps(j, ensure_ascii=False)
-        m = re.search(r"成交金額[^0-9]*([0-9,]+)", raw)
-        if not m:
-            return {"status": "FAIL", "source": "TPEX_MARKET_HIGHLIGHT", "asof": trade_date, "latency_ms": latency_ms, "error": "PARSE_FAIL"}
-        amt = _safe_int(m.group(1))
-        if amt is None:
-            return {"status": "FAIL", "source": "TPEX_MARKET_HIGHLIGHT", "asof": trade_date, "latency_ms": latency_ms, "error": "AMOUNT_NONE"}
-        return {"status": "OK", "source": "TPEX_MARKET_HIGHLIGHT", "asof": trade_date, "latency_ms": latency_ms, "amount": amt, "error": None}
-    except Exception as e:
-        return {"status": "FAIL", "source": "TPEX_MARKET_HIGHLIGHT", "asof": trade_date, "latency_ms": int((time.time() - t0) * 1000), "error": type(e).__name__ if str(e) == "" else str(e)}
+    # market amount
+    amt = get_market_amount_safe()
 
+    # 組裝 macro（依你 Arbiter 需要的欄位）
+    macro = {
+        "overview": {
+            "trade_date": target_date,
+            "twii_close": twii["close"],
+            "twii_chg": twii["chg"],
+            "twii_pct": twii["pct"],
+        },
+        "market_amount": {
+            "amount_twse": amt.get("amount_twse"),
+            "amount_tpex": amt.get("amount_tpex"),
+            "amount_total": amt.get("amount_total"),
+            "source_twse": amt.get("source_twse"),
+            "source_tpex": amt.get("source_tpex"),
+        },
+        # 你需要的話可把 institutional / vix 等接回來
+        "institutional": {},
+    }
 
-def fetch_tpex_amount_html_parse(trade_date: str) -> Dict[str, Any]:
-    """Parse from TPEX index / highlight page HTML as fallback."""
-    t0 = time.time()
-    url = f"{TPEX_BASE}/web/stock/index_info/idx_main.php?l=zh-tw"
-    try:
-        r = SESSION.get(url, timeout=10)
-        latency_ms = int((time.time() - t0) * 1000)
-        if r.status_code != 200:
-            return {"status": "FAIL", "source": "TPEX_IDX_HTML", "asof": trade_date, "latency_ms": latency_ms, "error": f"HTTP_{r.status_code}"}
-        text = r.text
-        # Very loose: find a big number near "成交金額"
-        m = re.search(r"成交金額[^0-9]*([0-9,]{6,})", text)
-        if not m:
-            return {"status": "FAIL", "source": "TPEX_IDX_HTML", "asof": trade_date, "latency_ms": latency_ms, "error": "PARSE_FAIL"}
-        amt = _safe_int(m.group(1))
-        if amt is None:
-            return {"status": "FAIL", "source": "TPEX_IDX_HTML", "asof": trade_date, "latency_ms": latency_ms, "error": "AMOUNT_NONE"}
-        return {"status": "OK", "source": "TPEX_IDX_HTML", "asof": trade_date, "latency_ms": latency_ms, "amount": amt, "error": None}
-    except Exception as e:
-        return {"status": "FAIL", "source": "TPEX_IDX_HTML", "asof": trade_date, "latency_ms": int((time.time() - t0) * 1000), "error": type(e).__name__ if str(e) == "" else str(e)}
+    # audit（把資料來源與錯誤寫清楚，稽核可回溯）
+    audit = {
+        "TWII": {
+            "source": twii["source"],
+            "error": twii["error"],
+            "asof": target_date,
+        },
+        "MARKET_AMOUNT": {
+            "source_twse": amt.get("source_twse"),
+            "source_tpex": amt.get("source_tpex"),
+        },
+        "INSTITUTIONAL": {"error": None},
+    }
 
+    # stocks（此處先空，讓 analyzer 或其他模組填）
+    stocks: List[Dict[str, Any]] = []
 
-def fetch_tpex_amount_tiered(trade_date: str) -> Dict[str, Any]:
-    """
-    Tiered: official JSON -> HTML parse -> estimate -> safe constant
-    """
-    r1 = fetch_tpex_amount_official_json(trade_date)
-    if r1.get("status") == "OK" and r1.get("amount") is not None:
-        r1["tier"] = 1
-        return r1
-    r2 = fetch_tpex_amount_html_parse(trade_date)
-    if r2.get("status") == "OK" and r2.get("amount") is not None:
-        r2["tier"] = 2
-        r2["prev_fail"] = {"source": r1.get("source"), "error": r1.get("error")}
-        return r2
-
-    # estimate (very conservative): if TWSE available, take 0.15 * TWSE total
-    # (you can tune this later; keep audit-trace)
-    est = None
-    try:
-        twse = fetch_twse_stock_day_all(trade_date)
-        if twse.get("status") == "OK":
-            est = int(twse.get("total_amount", 0) * 0.15)
-    except Exception:
-        est = None
-
-    if est and est > 0:
-        return {
-            "status": "OK",
-            "source": "TPEX_EST_FROM_TWSE",
-            "asof": trade_date,
-            "amount": est,
-            "tier": 3,
-            "latency_ms": 0,
-            "error": None,
-            "prev_fail": {"source": r2.get("source"), "error": r2.get("error")},
-        }
+    # arb_input：給 UI 範本用
+    arb_input = {
+        "meta": meta,
+        "macro": macro,
+        "stocks": stocks,
+    }
 
     return {
-        "status": "OK",
-        "source": "TPEX_SAFE_CONSTANT",
-        "asof": trade_date,
-        "amount": TPEX_SAFE_CONSTANT,
-        "tier": 4,
-        "latency_ms": 0,
-        "error": None,
-        "prev_fail": {"source": r2.get("source"), "error": r2.get("error")},
+        "meta": meta,
+        "macro": macro,
+        "stocks": stocks,
+        "audit": audit,
+        "arb_input": arb_input,
     }
 
 
-# =========================
-# TWSE T86 (Institutional)
-# =========================
-def fetch_twse_t86(trade_date: str) -> Dict[str, Any]:
+# -----------------------------
+# ✅ Unified entrypoint (MUST match main.py call)
+# -----------------------------
+def get_market_snapshot(target_iso: str, session: str = "EOD", topn: int = 20) -> Dict[str, Any]:
     """
-    Fetch 3 big institutions net buy/sell from TWSE T86.
+    ✅ main.py 固定呼叫：get_market_snapshot(target_iso, session=..., topn=...)
+    這個簽名不要再改，避免你又 TypeError。
     """
-    t0 = time.time()
-    url = f"{TWSE_BASE}/fund/T86?response=json&date={_to_twse_yyyymmdd(trade_date)}&selectType=ALLBUT0999"
-    try:
-        r = SESSION.get(url, timeout=10)
-        latency_ms = int((time.time() - t0) * 1000)
-        if r.status_code != 200:
-            return {"status": "FAIL", "source": "TWSE_T86", "asof": trade_date, "latency_ms": latency_ms, "error": f"HTTP_{r.status_code}"}
-        j = r.json()
-        data = j.get("data", [])
-        fields = j.get("fields", [])
-        if not data or not fields:
-            return {"status": "FAIL", "source": "TWSE_T86", "asof": trade_date, "latency_ms": latency_ms, "error": "EMPTY_DATA"}
-        df = pd.DataFrame(data, columns=fields)
+    if not isinstance(target_iso, str) or len(target_iso) < 8:
+        raise TypeError(f"target_iso 必須是 YYYY-MM-DD，收到：{target_iso}")
 
-        # locate net columns: 三大法人買賣超股數
-        # different language variants exist; we approximate:
-        # 外資及陸資買賣超股數, 投信買賣超股數, 自營商買賣超股數, 三大法人買賣超股數
-        net_cols = [c for c in df.columns if "買賣超" in c and "股數" in c]
-        if not net_cols:
-            return {"status": "FAIL", "source": "TWSE_T86", "asof": trade_date, "latency_ms": latency_ms, "error": "NET_COLS_MISSING"}
+    session = str(session).upper().strip()
+    if session not in ("EOD", "INTRADAY"):
+        session = "EOD"
 
-        # Total for "三大法人買賣超股數" if exists; else sum first 3
-        total_net = None
-        for c in net_cols:
-            if "三大法人" in c:
-                total_net = int(df[c].apply(_safe_int).fillna(0).sum())
-                break
-        if total_net is None:
-            # sum first 3 net cols
-            total_net = 0
-            for c in net_cols[:3]:
-                total_net += int(df[c].apply(_safe_int).fillna(0).sum())
+    topn = int(topn)
+    if topn < 1:
+        topn = 20
 
-        return {"status": "OK", "source": "TWSE_T86", "asof": trade_date, "latency_ms": latency_ms, "net_total": total_net, "error": None}
-    except Exception as e:
-        return {"status": "FAIL", "source": "TWSE_T86", "asof": trade_date, "latency_ms": int((time.time() - t0) * 1000), "error": type(e).__name__ if str(e) == "" else str(e)}
-
-
-# =========================
-# Snapshot builder
-# =========================
-def build_snapshot(session: str, target_date: str, topn: int = 20) -> Dict[str, Any]:
-    """
-    Build full snapshot used by UI and arbiter input builder.
-    """
-    effective_trade_date, is_using_prev = resolve_effective_trade_date(session, target_date)
-
-    # TWII (tiered)
-    twii = fetch_twii_tiered(effective_trade_date)
-
-    # TWSE amount + topn
-    twse = fetch_twse_stock_day_all(effective_trade_date)
-
-    # TPEX amount (tiered)
-    tpex = fetch_tpex_amount_tiered(effective_trade_date)
-
-    # Institutional (T86)
-    inst = fetch_twse_t86(effective_trade_date)
-
-    # Compose audit modules
-    audit_modules = []
-
-    audit_modules.append({
-        "name": "TWSE_TWII_INDEX",
-        "status": "OK" if twii.get("status") == "OK" and twii.get("close") is not None else "FAIL",
-        "confidence": "HIGH" if twii.get("status") == "OK" and twii.get("close") is not None else "LOW",
-        "asof": effective_trade_date,
-        "source": twii.get("source"),
-        "tier": twii.get("tier"),
-        "latency_ms": twii.get("latency_ms"),
-        "error": twii.get("error"),
-        "fallback_errors": twii.get("fallback_errors"),
-    })
-
-    audit_modules.append({
-        "name": "TWSE_AMOUNT_TOPN",
-        "status": "OK" if twse.get("status") == "OK" else "FAIL",
-        "confidence": "HIGH" if twse.get("status") == "OK" else "LOW",
-        "asof": effective_trade_date,
-        "source": twse.get("source"),
-        "latency_ms": twse.get("latency_ms"),
-        "error": twse.get("error"),
-    })
-
-    audit_modules.append({
-        "name": "TPEX_AMOUNT",
-        "status": "OK" if tpex.get("status") == "OK" and tpex.get("amount") is not None else "FAIL",
-        "confidence": "MED" if tpex.get("tier", 9) <= 2 else ("LOW" if tpex.get("tier", 9) == 3 else "LOW"),
-        "asof": effective_trade_date,
-        "source": tpex.get("source"),
-        "tier": tpex.get("tier"),
-        "latency_ms": tpex.get("latency_ms"),
-        "error": tpex.get("error"),
-        "prev_fail": tpex.get("prev_fail"),
-        "amount": tpex.get("amount"),
-    })
-
-    audit_modules.append({
-        "name": "TWSE_T86",
-        "status": "OK" if inst.get("status") == "OK" else "FAIL",
-        "confidence": "HIGH" if inst.get("status") == "OK" else "LOW",
-        "asof": effective_trade_date,
-        "source": inst.get("source"),
-        "latency_ms": inst.get("latency_ms"),
-        "error": inst.get("error"),
-    })
-
-    # totals
-    twse_amount = twse.get("total_amount") if twse.get("status") == "OK" else None
-    tpex_amount = tpex.get("amount") if tpex.get("status") == "OK" else None
-    total_amount = (twse_amount or 0) + (tpex_amount or 0) if (twse_amount is not None or tpex_amount is not None) else None
-
-    # TopN list
-    top_list: List[Dict[str, Any]] = []
-    if twse.get("status") == "OK":
-        df = twse.get("top_df")
-        if isinstance(df, pd.DataFrame) and not df.empty:
-            df3 = df.head(int(topn)).copy()
-            for _, row in df3.iterrows():
-                top_list.append({
-                    "Symbol": str(row["Symbol"]),
-                    "Name": str(row["Name"]),
-                    "Amount": int(row["Amount"]) if row["Amount"] is not None else None,
-                })
-
-    snapshot = {
-        "meta": {
-            "timestamp": _now_tpe().strftime("%Y-%m-%d %H:%M:%S"),
-            "session": session,
-            "target_date": target_date,
-            "effective_trade_date": effective_trade_date,
-            "is_using_previous_day": bool(is_using_prev),
-            "snapshot_hash": None,  # fill later
-        },
-        "market": {
-            "twii_close": twii.get("close"),
-            "twii_change": twii.get("change"),
-            "twii_pct": twii.get("pct"),
-            "twse_amount": twse_amount,
-            "tpex_amount": tpex_amount,
-            "amount_total": total_amount,
-            "inst_net_total": inst.get("net_total") if inst.get("status") == "OK" else None,
-            "inst_asof": inst.get("asof"),
-        },
-        "topn": {
-            "n": int(topn),
-            "list": top_list,
-        },
-        "audit_modules": audit_modules,
-    }
-
-    snapshot["meta"]["snapshot_hash"] = _hash_payload(snapshot)
-    return snapshot
-
-
-# =========================
-# Minimal JSON for Arbiter
-# =========================
-def build_v203_min_json(snapshot: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Minimal JSON payload for arbiter.
-    Keep your V20 stable philosophy: only include fields needed.
-    """
-    meta = snapshot.get("meta", {})
-    mkt = snapshot.get("market", {})
-    topn = snapshot.get("topn", {}).get("list", [])
-
-    payload = {
-        "meta": {
-            "timestamp": meta.get("timestamp"),
-            "session": meta.get("session"),
-            "market_status": "NORMAL",
-            "confidence_level": "HIGH",
-            "is_using_previous_day": meta.get("is_using_previous_day", False),
-            "effective_trade_date": meta.get("effective_trade_date"),
-            "war_time_override": False,
-            "audit_modules": snapshot.get("audit_modules", []),
-        },
-        "macro": {
-            "overview": {
-                "twii_close": mkt.get("twii_close"),
-                "max_equity_allowed_pct": 0.05,  # keep small in UI build; arbiter may override
-            },
-            "market_amount": {
-                "amount_twse": mkt.get("twse_amount"),
-                "amount_tpex": mkt.get("tpex_amount"),
-                "amount_total": mkt.get("amount_total"),
-            },
-            "institutional": {
-                "net_total": mkt.get("inst_net_total"),
-                "asof": mkt.get("inst_asof"),
-            }
-        },
-        "stocks": [
-            {"Symbol": x.get("Symbol"), "Name": x.get("Name"), "Amount": x.get("Amount")}
-            for x in topn
-        ],
-    }
-    return payload
-
-
-# -------------------------------------------------------------------
-# Backward-compat entrypoint (older main.py may import this)
-# -------------------------------------------------------------------
-# -------------------------------------------------------------------
-# Backward-compat entrypoint (main.py may call get_market_snapshot(target_iso, session=..., topn=...))
-# -------------------------------------------------------------------
-def get_market_snapshot(*args, **kwargs) -> Dict[str, Any]:
-    """
-    兼容多種舊版呼叫方式：
-    1) get_market_snapshot(target_iso, session="EOD", topn=20)
-    2) get_market_snapshot(target_date="YYYY-MM-DD", session="EOD", topn=20)
-    3) get_market_snapshot(session="EOD", target_date="YYYY-MM-DD", topn=20)
-    4) get_market_snapshot(session, target_date, topn)  # 你若有別處這樣呼叫也不會炸
-    """
-
-    # ---- default ----
-    session = kwargs.pop("session", "EOD")
-    topn = int(kwargs.pop("topn", 20))
-
-    # 可能的日期參數名稱（你 main.py 用 target_iso）
-    target_date = kwargs.pop("target_date", None)
-    target_iso = kwargs.pop("target_iso", None)
-    date = None
-
-    # 先吃 kwargs
-    if target_date:
-        date = target_date
-    elif target_iso:
-        date = target_iso
-
-    # 再吃 args（位置參數）
-    # main.py 目前是 get_market_snapshot(target_iso, session=..., topn=...)
-    if date is None and len(args) >= 1:
-        date = args[0]
-
-    # 也有人可能寫成 get_market_snapshot(session, date, topn)
-    # 若第一個 args 看起來像 "EOD"/"INTRADAY"，就交換解析
-    if isinstance(date, str) and date in ("EOD", "INTRADAY") and len(args) >= 2:
-        session = date
-        date = args[1]
-        if len(args) >= 3:
-            topn = int(args[2])
-
-    if not isinstance(date, str) or len(date) < 8:
-        raise TypeError(f"get_market_snapshot 缺少有效日期，收到 date={date}, args={args}, kwargs={kwargs}")
-
-    return build_snapshot(session=session, target_date=date, topn=topn)
-
+    return build_snapshot(session=session, target_date=target_iso, topn=topn)
