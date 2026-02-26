@@ -1,145 +1,251 @@
 # market_amount.py
-# Market Amount Provider (TW) - Audit-Locked / Tiered Fallback / Network-Retry
-# - TWSE amount: STOCK_DAY_ALL audit-sum with sanity floor
-# - TPEX amount: Tiered fallback (Official JSON -> Pricing HTML -> Estimate -> Constant)
-#
-# Output:
-#   provider.fetch_market_amount(trade_dt, trade_yyyymmdd) -> dict
-#
-# Notes:
-# - No yfinance, no pandas required
-# - Designed for GitHub Actions / cloud unstable network
+# -*- coding: utf-8 -*-
+"""
+Market Amount (TWSE / TPEX) - Stable / Tiered Fallback / Auditable
 
+設計目標
+- 不因單一來源（TWSE/TPEX）失效而卡死
+- 每個來源都有 timeout + retry + 明確 audit
+- 允許「降級」但必須留下可稽核證據鏈（audit_modules）
+
+輸出格式（給 Arbiter / Data-Layer）
+{
+  "amount_twse": int|None,
+  "amount_tpex": int|None,
+  "amount_total": int|None,
+  "source_twse": str,
+  "source_tpex": str,
+  "status_twse": "OK"|"FAIL",
+  "status_tpex": "OK"|"FAIL"|"ESTIMATED",
+  "confidence_twse": "HIGH"|"LOW",
+  "confidence_tpex": "HIGH"|"LOW",
+  "audit_modules": [ {module...}, ... ]
+}
+"""
+
+from __future__ import annotations
+
+import os
 import time
-import re
-import hashlib
-import logging
+import json
+import statistics
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Optional, Tuple, List
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 TZ_TPE = timezone(timedelta(hours=8))
 
 
-def now_tpe() -> datetime:
+def _now_tpe() -> datetime:
     return datetime.now(TZ_TPE)
 
 
-def hash_text(txt: str) -> str:
-    return hashlib.sha256((txt or "").encode("utf-8")).hexdigest()[:16]
+def _yyyymmdd(dt: datetime) -> str:
+    return dt.strftime("%Y%m%d")
 
 
-def safe_int(x, default=None):
-    try:
-        if x is None:
-            return default
-        if isinstance(x, (int, float)):
-            return int(x)
-        s = str(x).replace(",", "").strip()
-        if s in ("", "--", "nan", "None"):
-            return default
-        return int(float(s))
-    except:
-        return default
-
-
-def roc_yyy_mm_dd(dt: datetime) -> str:
-    # e.g. 115/02/26
+def _roc_yyy_mm_dd(dt: datetime) -> str:
+    # TPEX 常用民國日期格式：YYY/MM/DD
     return f"{dt.year - 1911}/{dt.strftime('%m/%d')}"
 
 
-def build_session(headers: Dict[str, str]) -> requests.Session:
-    s = requests.Session()
-    retry = Retry(
-        total=3,
-        connect=3,
-        read=3,
-        backoff_factor=0.8,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET"],
-        raise_on_status=False,
-    )
-    s.mount("https://", HTTPAdapter(max_retries=retry))
-    s.headers.update(headers)
-    return s
+def _safe_int(x: Any) -> Optional[int]:
+    try:
+        if x is None:
+            return None
+        if isinstance(x, (int, float)):
+            return int(x)
+        s = str(x).replace(",", "").strip()
+        if s in ("", "--", "None", "null"):
+            return None
+        return int(float(s))
+    except Exception:
+        return None
+
+
+def _ms() -> int:
+    return int(time.time() * 1000)
+
+
+@dataclass
+class FetchResult:
+    ok: bool
+    value: Optional[int]
+    source: str
+    confidence: str  # HIGH/LOW
+    error: Optional[str]
+    latency_ms: int
+    status_code: Optional[int]
+    final_url: Optional[str]
 
 
 class MarketAmountProvider:
     """
-    提供上市/上櫃成交額（全市場）並輸出可稽核 audit meta。
+    只負責成交額（TWSE / TPEX）
+    - TWSE: Tier1 STOCK_DAY_ALL sum, Tier2 FMTQIK
+    - TPEX: Tier1 st43_result, Tier2 ratio estimate, Tier3 SAFE CONSTANT
     """
 
-    def __init__(self):
+    def __init__(
+        self,
+        *,
+        tpex_safe_constant: int = 200_000_000_000,  # 2000億
+        tpex_ratio_default: float = 0.22,           # 你原本用 0.22
+        ratio_cache_path: str = "data/tpex_ratio_cache.json",
+        timeout_sec: int = 12,
+        retries_total: int = 2,
+        backoff_factor: float = 0.8,
+    ):
+        self.tpex_safe_constant = int(tpex_safe_constant)
+        self.tpex_ratio_default = float(tpex_ratio_default)
+        self.ratio_cache_path = ratio_cache_path
+        self.timeout_sec = int(timeout_sec)
+
+        self.session = requests.Session()
+        retry = Retry(
+            total=retries_total,
+            connect=retries_total,
+            read=retries_total,
+            backoff_factor=backoff_factor,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET"],
+            raise_on_status=False,
+        )
+        self.session.mount("https://", HTTPAdapter(max_retries=retry))
+
         self.headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+            ),
             "Accept": "application/json,text/plain,*/*",
             "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Referer": "https://www.twse.com.tw/",
+            "Referer": "https://www.tpex.org.tw/",
         }
-        self.session = build_session(self.headers)
 
-    # -------------------------
-    # TWSE: STOCK_DAY_ALL audit sum
-    # -------------------------
-    def fetch_twse_amount_stock_day_all(self, trade_date_yyyymmdd: str) -> Tuple[Optional[int], Dict[str, Any]]:
+    # -----------------------------
+    # Public API
+    # -----------------------------
+    def fetch(self, dt: Optional[datetime] = None) -> Dict[str, Any]:
         """
-        TWSE 成交額（上市）：
+        回傳：market_amount dict + audit_modules
+        """
+        dt = dt or _now_tpe()
+        trade_date_yyyymmdd = _yyyymmdd(dt)
+        roc_date = _roc_yyy_mm_dd(dt)
+
+        audit: List[Dict[str, Any]] = []
+
+        # ---- TWSE ----
+        twse_r1 = self._fetch_twse_amount_stock_day_all(trade_date_yyyymmdd)
+        audit.append(self._as_audit_module("TWSE_STOCK_DAY_ALL", dt, twse_r1))
+        twse_best = twse_r1
+
+        if not twse_best.ok:
+            twse_r2 = self._fetch_twse_amount_fmtqik(trade_date_yyyymmdd)
+            audit.append(self._as_audit_module("TWSE_FMTQIK", dt, twse_r2))
+            if twse_r2.ok:
+                twse_best = twse_r2
+
+        # ---- TPEX ----
+        tpex_r1 = self._fetch_tpex_amount_st43(roc_date)
+        audit.append(self._as_audit_module("TPEX_ST43", dt, tpex_r1))
+        tpex_best = tpex_r1
+
+        if not tpex_best.ok:
+            # Tier2: ratio estimate
+            ratio = self._load_tpex_ratio_cache() or self.tpex_ratio_default
+            est = None
+            if twse_best.ok and twse_best.value:
+                est = int(twse_best.value * ratio)
+
+            tpex_r2 = FetchResult(
+                ok=est is not None,
+                value=est,
+                source=f"TPEX_RATIO_ESTIMATE_{ratio:.4f}",
+                confidence="LOW",
+                error=None if est is not None else "NO_TWSE_FOR_RATIO_EST",
+                latency_ms=0,
+                status_code=None,
+                final_url=None,
+            )
+            audit.append(self._as_audit_module("TPEX_RATIO_ESTIMATE", dt, tpex_r2))
+            if tpex_r2.ok:
+                tpex_best = tpex_r2
+
+        if not tpex_best.ok:
+            # Tier3: safe constant
+            tpex_r3 = FetchResult(
+                ok=True,
+                value=int(self.tpex_safe_constant),
+                source=f"TPEX_SAFE_CONSTANT_{int(self.tpex_safe_constant/1e9)}B",
+                confidence="LOW",
+                error=None,
+                latency_ms=0,
+                status_code=None,
+                final_url=None,
+            )
+            audit.append(self._as_audit_module("TPEX_SAFE_CONSTANT", dt, tpex_r3))
+            tpex_best = tpex_r3
+
+        amount_twse = twse_best.value if twse_best.ok else None
+        amount_tpex = tpex_best.value if tpex_best.ok else None
+
+        amount_total = None
+        if amount_twse is not None and amount_tpex is not None:
+            amount_total = int(amount_twse + amount_tpex)
+
+        out = {
+            "amount_twse": amount_twse,
+            "amount_tpex": amount_tpex,
+            "amount_total": amount_total,
+            "source_twse": twse_best.source if twse_best.ok else f"TWSE_FAIL:{twse_best.error}",
+            "source_tpex": tpex_best.source if tpex_best.ok else f"TPEX_FAIL:{tpex_best.error}",
+            "status_twse": "OK" if twse_best.ok else "FAIL",
+            "status_tpex": "OK" if (tpex_best.ok and "ST43" in tpex_best.source) else ("ESTIMATED" if tpex_best.ok else "FAIL"),
+            "confidence_twse": twse_best.confidence if twse_best.ok else "LOW",
+            "confidence_tpex": tpex_best.confidence if tpex_best.ok else "LOW",
+            "audit_modules": audit,
+        }
+        return out
+
+    # -----------------------------
+    # TWSE Tiers
+    # -----------------------------
+    def _fetch_twse_amount_stock_day_all(self, yyyymmdd: str) -> FetchResult:
+        """
+        Tier1：逐筆加總 STOCK_DAY_ALL（最抗格式變動）
+        endpoint:
         https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL?response=json&date=YYYYMMDD
-
-        稽核策略：
-        - 對每一列由尾端向前掃描，取第一個可解析正整數視為該列交易金額候選
-        - 全部加總後必須 >= 1000 億（100_000_000_000），否則視為不可信
         """
+        t0 = _ms()
         url = "https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL"
-        params = {"response": "json", "date": trade_date_yyyymmdd}
+        params = {"response": "json", "date": yyyymmdd}
 
-        meta = {
-            "source_name": "TWSE_STOCK_DAY_ALL_AUDIT_SUM",
-            "url": url,
-            "params": params,
-            "status_code": None,
-            "final_url": None,
-            "latency_ms": None,
-            "rows": 0,
-            "ok_rows": 0,
-            "amount_sum": 0,
-            "raw_hash": None,
-            "error_code": None,
-        }
-
-        t0 = time.time()
         try:
-            r = self.session.get(url, params=params, timeout=20)
-            meta["status_code"] = r.status_code
-            meta["final_url"] = r.url
-            meta["latency_ms"] = int((time.time() - t0) * 1000)
-
-            if r.status_code != 200:
-                meta["error_code"] = f"HTTP_{r.status_code}"
-                return None, meta
-
-            txt = r.text or ""
-            meta["raw_hash"] = hash_text(txt[:8000])
+            r = self.session.get(url, params=params, headers=self.headers, timeout=self.timeout_sec)
+            sc = r.status_code
+            final_url = r.url
+            if sc != 200:
+                return FetchResult(False, None, "TWSE_STOCK_DAY_ALL", "LOW", f"HTTP_{sc}", _ms() - t0, sc, final_url)
 
             j = r.json()
             rows = j.get("data", []) or []
-            meta["rows"] = len(rows)
             if not rows:
-                meta["error_code"] = "EMPTY"
-                return None, meta
+                return FetchResult(False, None, "TWSE_STOCK_DAY_ALL", "LOW", "EMPTY", _ms() - t0, sc, final_url)
 
+            # 從每列尾端找可解析整數（保守法）
             amount_sum = 0
             ok_rows = 0
             for row in rows:
                 best = None
                 for cell in reversed(row):
-                    v = safe_int(cell, None)
+                    v = _safe_int(cell)
                     if v is not None and v > 0:
                         best = v
                         break
@@ -147,238 +253,143 @@ class MarketAmountProvider:
                     amount_sum += best
                     ok_rows += 1
 
-            meta["amount_sum"] = int(amount_sum)
-            meta["ok_rows"] = int(ok_rows)
+            # 合理性門檻（避免抓到錯欄位）
+            # 台股上市成交額正常日常見 > 1000億；保守設 800億避免過度誤殺
+            if amount_sum < 80_000_000_000:
+                return FetchResult(False, None, "TWSE_STOCK_DAY_ALL", "LOW", f"AMOUNT_TOO_LOW:{amount_sum}", _ms() - t0, sc, final_url)
 
-            if amount_sum < 100_000_000_000:
-                meta["error_code"] = "AMOUNT_TOO_LOW"
-                return None, meta
-
-            return int(amount_sum), meta
+            return FetchResult(True, int(amount_sum), "TWSE_STOCK_DAY_ALL_SUM", "HIGH", None, _ms() - t0, sc, final_url)
 
         except Exception as e:
-            meta["latency_ms"] = int((time.time() - t0) * 1000)
-            meta["error_code"] = type(e).__name__
-            return None, meta
+            return FetchResult(False, None, "TWSE_STOCK_DAY_ALL", "LOW", type(e).__name__, _ms() - t0, None, None)
 
-    # -------------------------
-    # TPEX: Tiered fallback
-    # -------------------------
-    def fetch_tpex_amount_official_json(self, trade_dt: datetime) -> Tuple[Optional[int], Dict[str, Any]]:
+    def _fetch_twse_amount_fmtqik(self, yyyymmdd: str) -> FetchResult:
         """
-        Tier-1：TPEX 官方 JSON（st43_result）
-        https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw&d=ROC_DATE&se=EW
-        回傳欄位常見包含：集合成交金額
+        Tier2：FMTQIK（有時會被擋/格式變）
+        endpoint:
+        https://www.twse.com.tw/exchangeReport/FMTQIK?response=json&date=YYYYMMDD
         """
-        url = "https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php"
-        params = {"l": "zh-tw", "d": roc_yyy_mm_dd(trade_dt), "se": "EW"}
+        t0 = _ms()
+        url = "https://www.twse.com.tw/exchangeReport/FMTQIK"
+        params = {"response": "json", "date": yyyymmdd}
 
-        meta = {
-            "tier": 1,
-            "source_name": "TPEX_ST43_JSON",
-            "url": url,
-            "params": params,
-            "status_code": None,
-            "final_url": None,
-            "latency_ms": None,
-            "raw_hash": None,
-            "error_code": None,
-        }
-
-        t0 = time.time()
         try:
-            r = self.session.get(url, params=params, timeout=20, allow_redirects=True)
-            meta["status_code"] = r.status_code
-            meta["final_url"] = r.url
-            meta["latency_ms"] = int((time.time() - t0) * 1000)
-
-            if r.status_code != 200:
-                meta["error_code"] = f"HTTP_{r.status_code}"
-                return None, meta
-
-            txt = r.text or ""
-            meta["raw_hash"] = hash_text(txt[:8000])
+            r = self.session.get(url, params=params, headers=self.headers, timeout=self.timeout_sec)
+            sc = r.status_code
+            final_url = r.url
+            if sc != 200:
+                return FetchResult(False, None, "TWSE_FMTQIK", "LOW", f"HTTP_{sc}", _ms() - t0, sc, final_url)
 
             j = r.json()
-            amt = safe_int(j.get("集合成交金額"), None)
-            if amt is None or amt <= 0:
-                meta["error_code"] = "FIELD_MISSING_OR_ZERO"
-                return None, meta
+            data = j.get("data", []) or []
+            if not data:
+                return FetchResult(False, None, "TWSE_FMTQIK", "LOW", "EMPTY", _ms() - t0, sc, final_url)
 
-            return int(amt), meta
+            # 常見：最後一列有總成交金額欄位；但可能變動
+            # 這裡採「整個 data 掃描最大 int」以保守抓取（避免 index out of range）
+            candidates = []
+            for row in data:
+                for cell in row:
+                    v = _safe_int(cell)
+                    if v is not None:
+                        candidates.append(v)
+
+            if not candidates:
+                return FetchResult(False, None, "TWSE_FMTQIK", "LOW", "NO_NUMERIC", _ms() - t0, sc, final_url)
+
+            best = max(candidates)
+            if best < 80_000_000_000:
+                return FetchResult(False, None, "TWSE_FMTQIK", "LOW", f"AMOUNT_TOO_LOW:{best}", _ms() - t0, sc, final_url)
+
+            return FetchResult(True, int(best), "TWSE_FMTQIK_MAXSCAN", "LOW", None, _ms() - t0, sc, final_url)
 
         except Exception as e:
-            meta["latency_ms"] = int((time.time() - t0) * 1000)
-            meta["error_code"] = type(e).__name__
-            return None, meta
+            return FetchResult(False, None, "TWSE_FMTQIK", "LOW", type(e).__name__, _ms() - t0, None, None)
 
-    def fetch_tpex_amount_pricing_html(self) -> Tuple[Optional[int], Dict[str, Any]]:
+    # -----------------------------
+    # TPEX Tiers
+    # -----------------------------
+    def _fetch_tpex_amount_st43(self, roc_date: str) -> FetchResult:
         """
-        Tier-2：TPEX pricing.html（摘要頁）解析「成交金額 xxx 億」
-        來源頁：
-        https://www.tpex.org.tw/zh-tw/mainboard/trading/info/pricing.html
-        注意：這是頁面摘要，通常反映「最近交易日」；若盤中或節假日可能不同步。
+        Tier1：TPEX st43_result（官方 JSON）
+        endpoint:
+        https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php
+          params: l=zh-tw, d=YYY/MM/DD, se=EW
         """
-        url = "https://www.tpex.org.tw/zh-tw/mainboard/trading/info/pricing.html"
-        meta = {
-            "tier": 2,
-            "source_name": "TPEX_PRICING_HTML",
-            "url": url,
-            "params": None,
-            "status_code": None,
-            "final_url": None,
-            "latency_ms": None,
-            "raw_hash": None,
-            "error_code": None,
-        }
+        t0 = _ms()
+        url = "https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php"
+        params = {"l": "zh-tw", "d": roc_date, "se": "EW"}
 
-        t0 = time.time()
         try:
-            r = self.session.get(url, timeout=20)
-            meta["status_code"] = r.status_code
-            meta["final_url"] = r.url
-            meta["latency_ms"] = int((time.time() - t0) * 1000)
+            r = self.session.get(
+                url,
+                params=params,
+                headers=self.headers,
+                timeout=self.timeout_sec,
+                allow_redirects=True,
+            )
+            sc = r.status_code
+            final_url = r.url
+            if sc != 200:
+                return FetchResult(False, None, "TPEX_ST43", "LOW", f"HTTP_{sc}", _ms() - t0, sc, final_url)
 
-            if r.status_code != 200:
-                meta["error_code"] = f"HTTP_{r.status_code}"
-                return None, meta
+            j = r.json()
+            # 常見 key: "集合成交金額"
+            v = _safe_int(j.get("集合成交金額"))
+            if v is None or v <= 0:
+                return FetchResult(False, None, "TPEX_ST43", "LOW", "MISSING_AMOUNT", _ms() - t0, sc, final_url)
 
-            txt = r.text or ""
-            meta["raw_hash"] = hash_text(txt[:8000])
+            # 合理性：上櫃正常通常 > 200億；保守 50億
+            if v < 5_000_000_000:
+                return FetchResult(False, None, "TPEX_ST43", "LOW", f"AMOUNT_TOO_LOW:{v}", _ms() - t0, sc, final_url)
 
-            m = re.search(r"成交金額\s*([\d,]+)\s*億", txt)
-            if not m:
-                meta["error_code"] = "PATTERN_NOT_FOUND"
-                return None, meta
-
-            yi = safe_int(m.group(1), None)
-            if yi is None or yi <= 0:
-                meta["error_code"] = "PARSE_FAIL"
-                return None, meta
-
-            return int(yi) * 100_000_000, meta  # 億 -> NTD
+            return FetchResult(True, int(v), "TPEX_ST43_OFFICIAL", "HIGH", None, _ms() - t0, sc, final_url)
 
         except Exception as e:
-            meta["latency_ms"] = int((time.time() - t0) * 1000)
-            meta["error_code"] = type(e).__name__
-            return None, meta
+            return FetchResult(False, None, "TPEX_ST43", "LOW", type(e).__name__, _ms() - t0, None, None)
 
-    def tpex_estimate_from_twse(self, twse_amount: Optional[int], ratio: float = 0.22) -> Tuple[Optional[int], Dict[str, Any]]:
+    # -----------------------------
+    # Ratio Cache (optional)
+    # -----------------------------
+    def _load_tpex_ratio_cache(self) -> Optional[float]:
         """
-        Tier-3：估算（當 TPEX 伺服器不穩時的可回測固定比率）
-        預設 ratio=0.22（你舊架構已用過）
+        ratio cache 格式建議：
+        {"ratio": 0.22, "asof": "2026-02-25"}
         """
-        meta = {
-            "tier": 3,
-            "source_name": "TPEX_ESTIMATE_FROM_TWSE",
-            "ratio": float(ratio),
-            "error_code": None,
+        try:
+            if not os.path.exists(self.ratio_cache_path):
+                return None
+            with open(self.ratio_cache_path, "r", encoding="utf-8") as f:
+                j = json.load(f)
+            r = j.get("ratio")
+            if r is None:
+                return None
+            r = float(r)
+            if not (0.05 <= r <= 0.60):
+                return None
+            return r
+        except Exception:
+            return None
+
+    # -----------------------------
+    # Audit format helper
+    # -----------------------------
+    def _as_audit_module(self, name: str, dt: datetime, r: FetchResult) -> Dict[str, Any]:
+        return {
+            "name": name,
+            "status": "OK" if r.ok else "FAIL",
+            "confidence": r.confidence,
+            "asof": dt.strftime("%Y-%m-%d"),
+            "error": r.error,
+            "latency_ms": r.latency_ms,
+            "status_code": r.status_code,
+            "final_url": r.final_url,
+            "source": r.source,
         }
-        if twse_amount is None or twse_amount <= 0:
-            meta["error_code"] = "TWSE_AMOUNT_MISSING"
-            return None, meta
-        return int(twse_amount * float(ratio)), meta
-
-    def tpex_constant_safe(self, constant_amt: int = 200_000_000_000) -> Tuple[int, Dict[str, Any]]:
-        """
-        Tier-4：常數保命（最後一層）
-        """
-        return int(constant_amt), {
-            "tier": 4,
-            "source_name": "TPEX_SAFE_CONSTANT",
-            "constant": int(constant_amt),
-            "error_code": None,
-        }
-
-    def fetch_tpex_amount_tiered(self, trade_dt: datetime, twse_amount: Optional[int]) -> Tuple[int, Dict[str, Any]]:
-        # Tier-1
-        a1, m1 = self.fetch_tpex_amount_official_json(trade_dt)
-        if a1 is not None:
-            return int(a1), m1
-
-        # Tier-2
-        a2, m2 = self.fetch_tpex_amount_pricing_html()
-        if a2 is not None:
-            return int(a2), m2
-
-        # Tier-3
-        a3, m3 = self.tpex_estimate_from_twse(twse_amount, ratio=0.22)
-        if a3 is not None:
-            return int(a3), m3
-
-        # Tier-4
-        a4, m4 = self.tpex_constant_safe(200_000_000_000)
-        return int(a4), m4
-
-    # -------------------------
-    # Public API
-    # -------------------------
-    def fetch_market_amount(self, trade_dt: datetime, trade_date_yyyymmdd: str) -> Dict[str, Any]:
-        """
-        回傳結構（建議直接嵌入你的 macro.market_amount）：
-        {
-          "trade_date": "YYYYMMDD",
-          "amount_twse": int|None,
-          "amount_tpex": int,
-          "amount_total": int,
-          "source_twse": "...",
-          "source_tpex": "...",
-          "status_twse": "OK|FAIL",
-          "status_tpex": "OK|ESTIMATED",
-          "confidence_twse": "HIGH|LOW",
-          "confidence_tpex": "HIGH|MED|LOW",
-          "audit": {
-              "twse": {...meta...},
-              "tpex": {...meta...}
-          }
-        }
-        """
-        twse_amt, twse_meta = self.fetch_twse_amount_stock_day_all(trade_date_yyyymmdd)
-        twse_ok = (twse_amt is not None) and (twse_meta.get("error_code") is None)
-
-        tpex_amt, tpex_meta = self.fetch_tpex_amount_tiered(trade_dt, twse_amt)
-
-        # confidence map
-        tpex_tier = tpex_meta.get("tier")
-        if tpex_tier in (1, 2):
-            conf_tpex = "HIGH"
-            status_tpex = "OK"
-        elif tpex_tier == 3:
-            conf_tpex = "MED"
-            status_tpex = "ESTIMATED"
-        else:
-            conf_tpex = "LOW"
-            status_tpex = "ESTIMATED"
-
-        out = {
-            "trade_date": trade_date_yyyymmdd,
-            "amount_twse": int(twse_amt) if twse_amt is not None else None,
-            "amount_tpex": int(tpex_amt) if tpex_amt is not None else None,
-            "amount_total": int((twse_amt or 0) + (tpex_amt or 0)),
-            "source_twse": twse_meta.get("source_name"),
-            "source_tpex": tpex_meta.get("source_name"),
-            "status_twse": "OK" if twse_ok else "FAIL",
-            "status_tpex": status_tpex,
-            "confidence_twse": "HIGH" if twse_ok else "LOW",
-            "confidence_tpex": conf_tpex,
-            "audit": {
-                "twse": twse_meta,
-                "tpex": tpex_meta,
-            },
-        }
-        return out
 
 
-# -------------------------
-# Optional CLI smoke test
-# -------------------------
-def _yyyymmdd(dt: datetime) -> str:
-    return dt.strftime("%Y%m%d")
-
-
+# 便利測試：python market_amount.py
 if __name__ == "__main__":
     p = MarketAmountProvider()
-    dt = now_tpe()
-    trade_yyyymmdd = _yyyymmdd(dt)
-    res = p.fetch_market_amount(dt, trade_yyyymmdd)
-    print(json.dumps(res, ensure_ascii=False, indent=2))
+    out = p.fetch()
+    print(json.dumps(out, ensure_ascii=False, indent=2))
