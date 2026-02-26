@@ -1,10 +1,10 @@
-name: Predator Daily Analysis V16.4
+name: Predator Daily Analysis (Unified Arbiter Entry)
 
 on:
   schedule:
-    - cron: '30 0 * * 1-5' # 08:30 台北
-    - cron: '0 3 * * 1-5'  # 11:00 台北
-    - cron: '30 8 * * 1-5' # 16:30 台北
+    - cron: '30 0 * * 1-5'  # 08:30 台北
+    - cron: '0 3 * * 1-5'   # 11:00 台北
+    - cron: '30 8 * * 1-5'  # 16:30 台北
   workflow_dispatch:
 
 permissions:
@@ -30,43 +30,33 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas yfinance numpy requests beautifulsoup4 resend matplotlib
+          # Prefer repo requirements if present; fallback to minimal set to avoid CI break
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install pandas yfinance numpy requests beautifulsoup4 resend matplotlib lxml html5lib
+          fi
 
-      # ① 執行一體化核心：下載、修復、校驗 (predator_core.py)
-      - name: Data Fetch and Quality Audit
-        id: qc_step
+      # ✅ Single entrypoint (Data-Layer -> Payload -> arbiter_run)
+      - name: Run Unified Workflow Master (arbiter_run)
+        id: unified_run
         run: |
-          # 這裡直接執行我們剛才寫好的整合腳本
-          python predator_core.py
-        # 如果 predator_core.py 裡面 sys.exit(1)，這裡會直接停止，不會往下跑
+          python workflow_master.py --session EOD --run L2 --topn 20
 
-      # ② 數據通過後，才更新原始 CSV（供後續 main.py 使用）
-      - name: Sync CSV Data
-        if: success()
-        run: |
-          # 確保 predator_core.py 產出的數據同步到你的主 CSV 檔案
-          # 假設 predator_core 已更新 data/data_tw-share.csv
-          ls -la data/
-
-      # ③ 跑 CLI 分析（僅在數據 OK 時執行）
-      - name: Run Predator Analysis (CLI)
-        if: success()
-        run: |
-          python main.py --cli --market tw-share --session EOD
-
-      # ④ 最終動作：只有全部成功才 Commit/Push
+      # Only if unified workflow succeeded (no L1 fail / no NO_TRADE)
       - name: Commit and Push Updates
         if: success()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          
-          # 將所有關鍵更新檔案加入
-          git add data/data_tw-share.csv macro.json || true
-          
+
+          # Stage artifacts (best-effort)
+          git add reports/*.json reports/*.txt data/*.json macro.json || true
+          git add data/data_tw-share.csv || true
+
           if git diff --cached --quiet; then
             echo "No changes detected, skipping push."
           else
-            git commit -m "Automated Update: Market Status OK [$(date '+%Y-%m-%d %H:%M')]"
+            git commit -m "Automated Update: Unified Arbiter PASS [$(date '+%Y-%m-%d %H:%M')]"
             git push
           fi
