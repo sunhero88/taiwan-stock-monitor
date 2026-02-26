@@ -1,18 +1,16 @@
 # main.py
-# Sunhero｜中控台 (Data-Layer + L1 Gate + UCC)
+# Sunhero｜中控台 (Data-Layer + Arbiter Orchestrator)
 # - Market data from downloader_tw (TWSE endpoints + tiered fallback + audit)
-# - Pre-run L1 integrity gate from verify_integrity (V20.x)
-# - If L1 FAIL -> block execution (NO_TRADE)
-# - No yfinance dependency
+# - Execution entrypoint unified to arbiter.arbiter_run (L1 Gate -> UCC)
+# - Deterministic output: prevents drift across UI/CLI/workflow
 
 import json
 from datetime import datetime, timedelta, timezone
 
 import streamlit as st
 
-from ucc_v19_1 import UCCv19_1
 from downloader_tw import build_snapshot, build_v203_min_json
-from verify_integrity import l1_gate
+from arbiter import arbiter_run  # ✅ unified entrypoint (L1 -> UCC)
 
 TZ_TPE = timezone(timedelta(hours=8))
 
@@ -21,7 +19,7 @@ TZ_TPE = timezone(timedelta(hours=8))
 # UI config
 # =========================
 st.set_page_config(page_title="Sunhero｜中控台", layout="wide")
-st.title("Sunhero｜股市智能超盤中控台（Data-Layer + L1 Gate）")
+st.title("Sunhero｜股市智能超盤中控台（Data-Layer + Arbiter Orchestrator）")
 
 
 # =========================
@@ -99,7 +97,7 @@ with c1:
         st.caption(f"資料日：{twii.get('date', snap.get('trade_date_iso'))}")
     else:
         st.metric("加權指數 TWII（TWSE）", "—")
-        st.caption("TWII 讀取失敗（L1 會直接 FAIL）")
+        st.caption("TWII 讀取失敗（Arbiter 內部 L1 會直接擋下）")
 
 with c2:
     st.metric("上市成交額（TWSE）", fmt_money(ma.get("amount_twse")))
@@ -131,12 +129,12 @@ else:
     d3.metric("自營商淨買賣超", fmt_num(s.get("自營商")))
     d4.metric("三大法人合計", fmt_num(s.get("合計")))
 
-    with st.expander("查看 T86 明細（records）", expanded=False):
-        st.json((t86.get("df") or [])[:200])  # 避免一次噴太多
+    with st.expander("查看 T86 明細（records，最多 200 列）", expanded=False):
+        st.json((t86.get("df") or [])[:200])
 
 
 # =========================
-# Payload editor + L1 Gate + UCC run
+# Payload editor + arbiter_run
 # =========================
 if "payload_text" not in st.session_state:
     st.session_state["payload_text"] = "{}"
@@ -177,7 +175,6 @@ with left:
             "trade_count_20d": 10,
         }
 
-        # 直接用 snapshot 組 V20.x 兼容 min-json
         payload = build_v203_min_json(
             snapshot=snap,
             system_params=system_params,
@@ -193,32 +190,38 @@ with left:
     st.session_state["payload_text"] = p_input
 
 with right:
-    st.subheader("執行結果（先 L1 Gate，PASS 才允許 UCC）")
+    st.subheader("執行結果（統一入口：arbiter_run）")
 
-    if st.button("🚀 執行（L1 → UCC）", type="primary"):
+    if st.button("🚀 執行（arbiter_run）", type="primary"):
         try:
             payload = json.loads(p_input)
 
-            # 1) L1 Gate
-            report = l1_gate(payload)
+            result = arbiter_run(payload, run_mode=run_mode)
 
-            st.markdown("#### ① L1 稽核結果")
-            st.json(report)
-
-            if report.get("VERDICT") != "PASS":
-                st.error("L1 FAIL：資料完整性不合格 → 已阻止裁決（NO_TRADE）")
+            # ---- show high-level verdict ----
+            verdict = result.get("VERDICT")
+            if verdict == "NO_TRADE":
+                st.error("NO_TRADE：已被 L1 Gate 阻擋（資料不可信）")
             else:
-                # 2) UCC
-                st.markdown("#### ② UCC 裁決結果")
-                result = UCCv19_1().run(payload, run_mode=run_mode)
-                st.json(result) if isinstance(result, dict) else st.code(result)
+                st.success("EXECUTED：已完成裁決（L1 PASS → UCC）")
+
+            # ---- show unified result ----
+            st.markdown("#### ① Arbiter 統一輸出")
+            st.json(result)
+
+            # ---- convenience: split L1 and UCC view ----
+            st.markdown("#### ② L1 稽核報告（AUDIT.L1）")
+            st.json((result.get("AUDIT") or {}).get("L1") or {})
+
+            st.markdown("#### ③ UCC 裁決（若有）")
+            st.json(result.get("UCC") or {})
 
         except Exception as e:
             st.error(f"解析/執行錯誤：{type(e).__name__}: {str(e)}")
 
 
 # =========================
-# Plain-language situation card (NO fake VIX/SMR)
+# Situation card (NO fake VIX/SMR)
 # =========================
 st.markdown("---")
 st.markdown("### 🛡️ 戰情摘要（不造假：僅用已取得的資料）")
@@ -229,7 +232,6 @@ total_amt = ma.get("amount_total")
 if chg_pct is None:
     st.info("目前無法取得 TWII 漲跌幅（TWSE 指數資料失敗或缺漏）。")
 else:
-    # 只用可確定的訊號：大盤漲跌幅 + 成交額量級
     if chg_pct <= -0.02:
         status = "🔵 大盤明顯轉弱（單日跌幅 ≥ 2%）"
         advice = "策略重點：降低新增曝險、嚴格停損，避免在波動擴大時放大倉位。"
