@@ -1,8 +1,95 @@
 # arbiter.py
 # -*- coding: utf-8 -*-
+"""
+Predator Arbiter Facade (V20.x compatible)
+- Single entrypoint for decision execution with deterministic audit chain:
+    Data-Layer -> L1 Integrity Gate -> UCC Engine
+- NO-DRIFT: never补資料，僅依 payload 內容做裁決
+- Backward compatible: keep legacy per-stock arbitrate() for old scripts (deprecated)
+
+Key API:
+    arbiter_run(payload: dict, run_mode: str = "L2") -> dict
+"""
+
 from __future__ import annotations
 
+from typing import Any, Dict, Optional
+import json
 
+from verify_integrity import l1_gate
+from ucc_v19_1 import UCCv19_1
+
+
+# =========================
+# Core Orchestrator (NEW)
+# =========================
+def arbiter_run(payload: Dict[str, Any], run_mode: str = "L2") -> Dict[str, Any]:
+    """
+    Orchestrated arbiter run.
+
+    Behavior:
+    - Always runs L1 gate first (verify_integrity.l1_gate).
+    - If L1 FAIL => block trading (NO_TRADE) and return audit report.
+    - If PASS => call UCC engine and attach L1 audit.
+
+    Output is deterministic and audit-friendly.
+    """
+    run_mode = (run_mode or "L2").upper()
+
+    # ---- L1 Gate ----
+    l1_report = l1_gate(payload)
+
+    if l1_report.get("VERDICT") != "PASS":
+        # Block execution. Keep output shape stable.
+        return {
+            "MODE": "ARBITER_ORCHESTRATOR",
+            "RUN": run_mode,
+            "VERDICT": "NO_TRADE",
+            "NO_TRADE": True,
+            "RISK_REASON": "L1_FAIL_DATA_INTEGRITY",
+            "AUDIT": {
+                "L1": l1_report,
+            },
+            # minimal compatibility fields (some of your reporters expect these keys)
+            "DECISION": {"NO_TRADE": True},
+            "ENGINE": {"name": "UCCv19_1", "executed": False},
+        }
+
+    # ---- Execute UCC (only if PASS) ----
+    ucc = UCCv19_1()
+    ucc_out = ucc.run(payload, run_mode=run_mode)
+
+    # Normalize engine output to dict (some versions might return str)
+    if not isinstance(ucc_out, dict):
+        ucc_out = {"raw": str(ucc_out)}
+
+    return {
+        "MODE": "ARBITER_ORCHESTRATOR",
+        "RUN": run_mode,
+        "VERDICT": "EXECUTED",
+        "NO_TRADE": False,
+        "AUDIT": {
+            "L1": l1_report,
+        },
+        "ENGINE": {
+            "name": "UCCv19_1",
+            "executed": True,
+        },
+        "UCC": ucc_out,
+    }
+
+
+# =========================
+# Utility: stable JSON dump (for logging / reports)
+# =========================
+def dump_json(obj: Any) -> str:
+    return json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True)
+
+
+# =========================
+# LEGACY: per-stock arbiter (DEPRECATED)
+# - kept to avoid breaking old scripts
+# =========================
 def _tech_signals_from_tag(tag: str) -> int:
     tag = (tag or "")
     s = 0
@@ -17,17 +104,14 @@ def _tech_signals_from_tag(tag: str) -> int:
 
 def arbitrate(stock, macro_overview: dict, account="Conservative"):
     """
-    回傳單一股票的最終裁決（支援無法人 / 盤中 / 盤後 / 舊資料 STALE）
-    規則版本：V15.6.3 + data_mode gate
+    DEPRECATED (V15.x legacy per-stock arbiter).
+    Kept for backward compatibility only.
 
-    macro_overview：請傳 macro["overview"]
-      - data_mode: "INTRADAY" | "EOD" | "STALE"
-      - lag_days: int (可選；STALE 時用於說明)
-      - inst_status: "READY" | "PENDING" | "UNAVAILABLE" | ...
-      - degraded_mode / kill_switch / v14_watch: bool
+    NOTE:
+    New pipeline should use arbiter_run(payload) which is:
+        Data-Layer -> L1 Gate -> UCC -> decision
     """
-
-    # ---------- Macro 狀態 ----------
+    # ---- Original legacy code preserved (minimally edited) ----
     inst_status = macro_overview.get("inst_status", "PENDING")
     degraded_mode = bool(macro_overview.get("degraded_mode", inst_status != "READY"))
     kill_switch = bool(macro_overview.get("kill_switch", False))
@@ -36,14 +120,9 @@ def arbitrate(stock, macro_overview: dict, account="Conservative"):
     data_mode = str(macro_overview.get("data_mode", "EOD") or "EOD").upper()
     lag_days = int(macro_overview.get("lag_days", 0) or 0)
 
-    # ---------- 兩階降級（原本精神保留） ----------
-    # Level-2：系統級禁止買（最嚴格）
     degraded_level2 = (kill_switch or v14_watch)
-
-    # Level-1：法人缺失降級（允許小倉位/試單；但仍受 data_mode 約束）
     inst_missing = (inst_status != "READY") or degraded_mode
 
-    # ---------- Stock blocks ----------
     inst = stock.get("Institutional", {}) or {}
     tech = stock.get("Technical", {}) or {}
     struct = stock.get("Structure", {}) or {}
@@ -68,20 +147,10 @@ def arbitrate(stock, macro_overview: dict, account="Conservative"):
     technical_weaken = bool(weaken.get("technical_weaken", False))
     structure_weaken = bool(weaken.get("structure_weaken", False))
 
-    # ---------- 小工具 ----------
     def _cap(sz: int) -> int:
         return min(int(sz), int(position_pct_max))
 
-    # ================
-    # 0) data_mode Gate（新增，最高優先於「是否有法人」）
-    # ================
-    # 原則：
-    # - STALE：資料落後 >= 1 天 → 禁止新倉（BUY/TRIAL），只做持倉風控（HOLD/REDUCE）
-    # - INTRADAY：盤中噪音較大 → Conservative 禁止 BUY；Aggressive 只能 TRIAL（≤5%或≤10%）
-    # - EOD：盤後資料 → 允許完整策略（含 BUY/TRIAL），但仍受法人/弱化/池化等規則約束
-
     if data_mode == "STALE":
-        # STALE 一律不開新倉，避免用舊資料做進場判斷
         if orphan_holding:
             if technical_weaken or structure_weaken:
                 return {
@@ -103,7 +172,6 @@ def arbitrate(stock, macro_overview: dict, account="Conservative"):
                 "reason_inst": f"data_mode=STALE, lag_days={lag_days}, inst_status={inst_status}",
             }
 
-        # 非持倉：不允許進場
         return {
             "Decision": "WATCH" if top20_flag else "IGNORE",
             "action_size_pct": 0,
@@ -114,11 +182,7 @@ def arbitrate(stock, macro_overview: dict, account="Conservative"):
             "reason_inst": f"data_mode=STALE, lag_days={lag_days}, inst_status={inst_status}",
         }
 
-    # ================
-    # 1) Level-2：系統級禁止買（你原本規則）
-    # ================
     if degraded_level2:
-        # 持倉管理：弱化就減碼，否則持有/觀察
         if orphan_holding and (technical_weaken or structure_weaken):
             decision = "REDUCE"
             action_size = 5
@@ -138,9 +202,6 @@ def arbitrate(stock, macro_overview: dict, account="Conservative"):
             "reason_inst": f"data_mode={data_mode} / inst_status={inst_status} / degraded_mode={degraded_mode}",
         }
 
-    # ================
-    # 2) 持倉管理優先（原本規則）
-    # ================
     if orphan_holding:
         if technical_weaken or structure_weaken:
             return {
@@ -162,9 +223,6 @@ def arbitrate(stock, macro_overview: dict, account="Conservative"):
             "reason_inst": f"data_mode={data_mode} / inst_status={inst_status}",
         }
 
-    # ================
-    # 3) 非 Top20 且非持倉：忽略（原本規則）
-    # ================
     if not top20_flag:
         return {
             "Decision": "IGNORE",
@@ -176,37 +234,21 @@ def arbitrate(stock, macro_overview: dict, account="Conservative"):
             "reason_inst": f"data_mode={data_mode} / inst_status={inst_status}",
         }
 
-    # ================
-    # 4) 盤中模式 Gate（新增）
-    # ================
-    # 盤中不把「最大化」用在「加槓桿/重倉」，而是用在「降低誤判率、保留彈性」
-    # 因此：
-    # - Conservative：INTRADAY 不 BUY，只 WATCH/TRIAL（≤5%）
-    # - Aggressive：INTRADAY 允許 TRIAL（≤5%，條件強可到 10%），EOD 才允許 BUY 擴大
     intraday_no_buy_conservative = (data_mode == "INTRADAY" and account == "Conservative")
     intraday_only_trial_aggressive = (data_mode == "INTRADAY" and account == "Aggressive")
 
-    # ================
-    # 5) 法人可用判斷（保留你原本規則）
-    # ================
     inst_ok = (
         inst.get("Inst_Status") == "READY"
         and int(inst.get("Inst_Streak3", 0) or 0) >= 3
         and inst.get("Inst_Dir3") == "POSITIVE"
     )
 
-    # ================
-    # 6) 進場裁決
-    # ================
     decision = "WATCH"
     action_size = 0
     exit_code = "None"
 
-    # --------- Conservative ----------
     if account == "Conservative":
-        # INTRADAY：禁止 BUY（只 TRIAL 或 WATCH）
         if intraday_no_buy_conservative:
-            # 盤中僅允許「明確信號」的 5% 試單
             if (
                 trial_flag
                 and tier == "A"
@@ -222,9 +264,7 @@ def arbitrate(stock, macro_overview: dict, account="Conservative"):
                 decision = "WATCH"
                 action_size = 0
                 exit_code = "INTRADAY_TRIAL_ONLY"
-
         else:
-            # EOD：優先法人；法人缺失就用替代規則（你原本 NA 精神）
             if not inst_missing and inst_ok:
                 if tier == "A" and score >= 50 and rev_growth >= 0:
                     decision = "BUY"
@@ -233,7 +273,6 @@ def arbitrate(stock, macro_overview: dict, account="Conservative"):
                 else:
                     decision = "WATCH"
             else:
-                # 無法人 / 法人未READY：只允許小倉位 BUY（5%）且條件必須更強
                 if (
                     tier == "A"
                     and tech_signals >= 2
@@ -249,9 +288,7 @@ def arbitrate(stock, macro_overview: dict, account="Conservative"):
                     action_size = 0
                     exit_code = "INST_MISSING_MODE"
 
-    # --------- Aggressive ----------
     elif account == "Aggressive":
-        # INTRADAY：只允許 TRIAL（不 BUY）
         if intraday_only_trial_aggressive:
             if (
                 trial_flag
@@ -260,7 +297,6 @@ def arbitrate(stock, macro_overview: dict, account="Conservative"):
                 and rev_growth >= 0
                 and not (technical_weaken or structure_weaken)
             ):
-                # Tier A + 信號強 + 分數高 → 10% 試單；否則 5%
                 action_size = _cap(10 if (tier == "A" and tech_signals >= 2 and score >= 55) else 5)
                 decision = "TRIAL"
                 exit_code = "INTRADAY_TRIAL_ONLY"
@@ -268,9 +304,7 @@ def arbitrate(stock, macro_overview: dict, account="Conservative"):
                 decision = "WATCH"
                 action_size = 0
                 exit_code = "INTRADAY_TRIAL_ONLY"
-
         else:
-            # EOD：有法人且 inst_ok → 允許 BUY/加碼；無法人 → TRIAL 為主或小 BUY
             if not inst_missing and inst_ok:
                 if tier == "A" and score >= 50 and rev_growth >= 0:
                     decision = "BUY"
@@ -298,9 +332,6 @@ def arbitrate(stock, macro_overview: dict, account="Conservative"):
                     action_size = 0
                     exit_code = "INST_MISSING_MODE"
 
-    # ================
-    # 7) 最終硬保護：出現 weaken → 強制不買/不試（你原本規則）
-    # ================
     if decision in ("BUY", "TRIAL") and (technical_weaken or structure_weaken):
         decision = "WATCH"
         action_size = 0
