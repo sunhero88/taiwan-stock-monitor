@@ -794,6 +794,48 @@ def build_v203_min_json(snapshot: Dict[str, Any]) -> Dict[str, Any]:
 # -------------------------------------------------------------------
 # Backward-compat entrypoint (older main.py may import this)
 # -------------------------------------------------------------------
-def get_market_snapshot(session: str, target_date: str, topn: int = 20) -> Dict[str, Any]:
-    """兼容舊版主程式：等同 build_snapshot(session, target_date, topn)。"""
-    return build_snapshot(session=session, target_date=target_date, topn=topn)
+# -------------------------------------------------------------------
+# Backward-compat entrypoint (main.py may call get_market_snapshot(target_iso, session=..., topn=...))
+# -------------------------------------------------------------------
+def get_market_snapshot(*args, **kwargs) -> Dict[str, Any]:
+    """
+    兼容多種舊版呼叫方式：
+    1) get_market_snapshot(target_iso, session="EOD", topn=20)
+    2) get_market_snapshot(target_date="YYYY-MM-DD", session="EOD", topn=20)
+    3) get_market_snapshot(session="EOD", target_date="YYYY-MM-DD", topn=20)
+    4) get_market_snapshot(session, target_date, topn)  # 你若有別處這樣呼叫也不會炸
+    """
+
+    # ---- default ----
+    session = kwargs.pop("session", "EOD")
+    topn = int(kwargs.pop("topn", 20))
+
+    # 可能的日期參數名稱（你 main.py 用 target_iso）
+    target_date = kwargs.pop("target_date", None)
+    target_iso = kwargs.pop("target_iso", None)
+    date = None
+
+    # 先吃 kwargs
+    if target_date:
+        date = target_date
+    elif target_iso:
+        date = target_iso
+
+    # 再吃 args（位置參數）
+    # main.py 目前是 get_market_snapshot(target_iso, session=..., topn=...)
+    if date is None and len(args) >= 1:
+        date = args[0]
+
+    # 也有人可能寫成 get_market_snapshot(session, date, topn)
+    # 若第一個 args 看起來像 "EOD"/"INTRADAY"，就交換解析
+    if isinstance(date, str) and date in ("EOD", "INTRADAY") and len(args) >= 2:
+        session = date
+        date = args[1]
+        if len(args) >= 3:
+            topn = int(args[2])
+
+    if not isinstance(date, str) or len(date) < 8:
+        raise TypeError(f"get_market_snapshot 缺少有效日期，收到 date={date}, args={args}, kwargs={kwargs}")
+
+    return build_snapshot(session=session, target_date=date, topn=topn)
+
